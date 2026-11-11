@@ -3713,6 +3713,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "distill-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "distill-version",
+ "gethostname",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "distill-otel"
 version = "0.1.0"
 dependencies = [

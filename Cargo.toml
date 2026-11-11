@@ -108,6 +108,8 @@ members = [
     "third_party/graphlib_rust",
     "third_party/mermaid-to-svg",
     "third_party/ordered_hashmap",
+    # Postudio (plan/research-base/PLAN.md)
+    "crates/custom/distill-node",
 ]
 
 [workspace.package]
