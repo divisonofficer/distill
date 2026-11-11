@@ -1575,6 +1575,20 @@ fn extract_yolo_mode_change_returns_none_for_other_methods() {
     assert_eq!(extract_yolo_mode_change(&pv(payload)), None);
 }
 
+/// Postudio: a session-scoped toggle (`params.sessionId`) is not a client default.
+/// The leader must not fold it into the connection-level yolo/auto capability.
+#[test]
+fn extract_mode_changes_ignore_session_scoped_notifications() {
+    let payload = r#"{"jsonrpc":"2.0","method":"x.ai/yolo_mode_changed","params":{"yolo_mode":true,"sessionId":"s1"}}"#;
+    assert_eq!(extract_yolo_mode_change(&pv(payload)), None);
+
+    let payload = r#"{"jsonrpc":"2.0","method":"x.ai/yolo_mode_changed","params":{"permission_mode":"auto","sessionId":"s1"}}"#;
+    assert_eq!(extract_auto_mode_change(&pv(payload)), None);
+
+    let payload = r#"{"jsonrpc":"2.0","method":"x.ai/yolo_mode_changed","params":{"auto_mode":false,"sessionId":"s1"}}"#;
+    assert_eq!(extract_auto_mode_change(&pv(payload)), None);
+}
+
 /// Branch 1: an explicit `auto_mode` flag wins, even over `permission_mode`.
 #[test]
 fn extract_auto_mode_change_explicit_flag_wins() {

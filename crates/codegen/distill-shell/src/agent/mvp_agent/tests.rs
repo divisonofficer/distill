@@ -1814,6 +1814,108 @@ async fn yolo_toggle_can_disable_session_started_with_yolo_enabled() {
         "other client's session must keep its previous yolo state"
     );
 }
+/// Drain every command currently queued on a test session mailbox.
+fn drain_session_commands(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::session::SessionCommand>,
+) -> Vec<crate::session::SessionCommand> {
+    let mut cmds = Vec::new();
+    while let Ok(cmd) = rx.try_recv() {
+        cmds.push(cmd);
+    }
+    cmds
+}
+fn yolo_mode_changed(params: serde_json::Value) -> acp::ExtNotification {
+    let raw = serde_json::value::to_raw_value(&params).expect("serialize yolo_mode_changed params");
+    acp::ExtNotification::new("x.ai/yolo_mode_changed", raw.into())
+}
+/// Postudio: a `sessionId` in `x.ai/yolo_mode_changed` scopes the YOLO change to that session.
+/// A multiplexing client owns every session on one connection, so the client-wide scope would flip them all.
+#[tokio::test(flavor = "current_thread")]
+async fn yolo_mode_changed_with_session_id_updates_only_that_session() {
+    use acp::Agent as _;
+    let agent = build_minimal_agent_for_tests();
+    let sid_a = acp::SessionId::new("sess-scope-a");
+    let sid_b = acp::SessionId::new("sess-scope-b");
+    let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    agent
+        .ext_notification(yolo_mode_changed(
+            serde_json::json!({ "yolo_mode": true, "sessionId": "sess-scope-a" }),
+        ))
+        .await
+        .expect("session-scoped yolo notification must be handled");
+    let a = drain_session_commands(&mut rx_a);
+    assert!(
+        matches!(
+            a.as_slice(),
+            [crate::session::SessionCommand::SetYoloMode { enabled: true }]
+        ),
+        "target session must get exactly SetYoloMode(true)"
+    );
+    assert!(
+        drain_session_commands(&mut rx_b).is_empty(),
+        "a session outside the sessionId scope must not be touched"
+    );
+}
+/// Postudio: the auto permission mode (on and back off) honours the same `sessionId` scope.
+#[tokio::test(flavor = "current_thread")]
+async fn auto_mode_changed_with_session_id_updates_only_that_session() {
+    use acp::Agent as _;
+    let agent = build_minimal_agent_for_tests();
+    let sid_a = acp::SessionId::new("sess-auto-a");
+    let sid_b = acp::SessionId::new("sess-auto-b");
+    let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    for (mode, enabled) in [("auto", true), ("ask", false)] {
+        agent
+            .ext_notification(yolo_mode_changed(
+                serde_json::json!({ "permission_mode": mode, "sessionId": "sess-auto-a" }),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("permission_mode={mode} notification failed: {e}"));
+        let a = drain_session_commands(&mut rx_a);
+        assert!(
+            matches!(
+                a.as_slice(),
+                [crate::session::SessionCommand::SetAutoMode { enabled: got }] if *got == enabled
+            ),
+            "permission_mode={mode}: target session must get exactly SetAutoMode({enabled})"
+        );
+        assert!(
+            drain_session_commands(&mut rx_b).is_empty(),
+            "permission_mode={mode}: a session outside the sessionId scope must not be touched"
+        );
+    }
+}
+/// Without `sessionId` the notification keeps its previous client-wide reach.
+#[tokio::test(flavor = "current_thread")]
+async fn yolo_mode_changed_without_session_id_keeps_client_wide_scope() {
+    use acp::Agent as _;
+    let agent = build_minimal_agent_for_tests();
+    let sid_a = acp::SessionId::new("sess-wide-a");
+    let sid_b = acp::SessionId::new("sess-wide-b");
+    let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    agent
+        .ext_notification(yolo_mode_changed(serde_json::json!({ "yolo_mode": false })))
+        .await
+        .expect("client-wide yolo notification must be handled");
+    for (label, rx) in [("a", &mut rx_a), ("b", &mut rx_b)] {
+        assert!(
+            matches!(
+                drain_session_commands(rx).as_slice(),
+                [crate::session::SessionCommand::SetYoloMode { enabled: false }]
+            ),
+            "session {label} must still be updated when no sessionId is given"
+        );
+    }
+}
 /// `drain_old_session_thread` returns immediately when the thread has already finished.
 #[tokio::test]
 async fn drain_finished_thread_returns_immediately() {

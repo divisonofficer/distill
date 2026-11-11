@@ -2383,6 +2383,12 @@ impl acp::Agent for MvpAgent {
             >(args.params.get())
         {
             let sender_id = params.get("clientIdentifier").and_then(|v| v.as_str());
+            // Postudio: optional `sessionId` narrows the change to one session.
+            // Absent keeps the client-wide scope above. A multiplexing client (one ACP connection, many sessions) needs this.
+            let target_session = params.get("sessionId").and_then(|v| v.as_str());
+            let in_scope = |id: &acp::SessionId| -> bool {
+                target_session.is_none_or(|target| id.0.as_ref() == target)
+            };
             let permission_mode = params
                 .get("permission_mode")
                 .and_then(|v| v.as_str())
@@ -2391,7 +2397,10 @@ impl acp::Agent for MvpAgent {
             if let Some(yolo_mode) = yolo_signal {
                 let mut updated_sessions = 0;
                 self.session_registry
-                    .for_each_resident_mut(|_, handle| {
+                    .for_each_resident_mut(|id, handle| {
+                        if !in_scope(id) {
+                            return;
+                        }
                         updated_sessions
                             += apply_yolo_mode_to_matching_sessions(
                                 std::iter::once(handle),
@@ -2402,6 +2411,7 @@ impl acp::Agent for MvpAgent {
                 tracing::info!(
                     yolo_mode,
                     sender = ?sender_id,
+                    session = ?target_session,
                     target_sessions = updated_sessions,
                     total_sessions = self.resident_count(),
                     "Setting YOLO mode for matching sessions"
@@ -2424,8 +2434,8 @@ impl acp::Agent for MvpAgent {
                 let total_sessions = self.resident_count();
                 let mut updated = 0;
                 self.session_registry
-                    .for_each_resident_mut(|_, h| {
-                        if !matches_sender(h) {
+                    .for_each_resident_mut(|id, h| {
+                        if !in_scope(id) || !matches_sender(h) {
                             return;
                         }
                         if h
@@ -2444,6 +2454,7 @@ impl acp::Agent for MvpAgent {
                 tracing::info!(
                     auto_mode = enabled,
                     sender = ?sender_id,
+                    session = ?target_session,
                     target_sessions = updated,
                     total_sessions,
                     "Setting auto permission mode for matching sessions"

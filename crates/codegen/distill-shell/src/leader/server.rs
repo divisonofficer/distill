@@ -801,12 +801,16 @@ fn inject_client_identity_into_initialize(
     (mutated, true)
 }
 /// Extract yolo_mode change from x.ai/yolo_mode_changed notification.
+/// A session-scoped change (`params.sessionId`) is not a client default, so it returns `None`.
 fn extract_yolo_mode_change(json: &serde_json::Value) -> Option<bool> {
     let method = json.get("method")?.as_str()?;
     if method != "x.ai/yolo_mode_changed" {
         return None;
     }
     let params = json.get("params")?;
+    if params.get("sessionId").is_some() {
+        return None;
+    }
     params.get("yolo_mode").and_then(|v| v.as_bool())
 }
 /// Extract the auto-mode intent from an `x.ai/yolo_mode_changed` notification. The leader keeps `ClientCapabilities.auto_mode` fresh the same way it tracks `yolo_mode`.
@@ -817,6 +821,10 @@ fn extract_auto_mode_change(json: &serde_json::Value) -> Option<bool> {
         return None;
     }
     let params = json.get("params")?;
+    // Session-scoped changes must not rewrite the connection-level `auto_mode` capability.
+    if params.get("sessionId").is_some() {
+        return None;
+    }
     if let Some(b) = params.get("auto_mode").and_then(|v| v.as_bool()) {
         return Some(b);
     }
