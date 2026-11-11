@@ -133,7 +133,7 @@ T0.4는 비용이 들지 않는다. 레포의 테스트용 가짜 모델 서버(
 | T0.5 계약 고정 | 완료 | `CONTRACT.md`, `src/sep.rs`, 빈 모듈 파일. 기대 SEP fixture는 트랙 A가 만들고 주 모델이 검토 |
 | 1단계 A1 변환 | 병합 | fixture 7개 일치 |
 | 1단계 B 경계 보안 | 병합 | 테스트 13개. 남음: `/p` WebSocket 프록시(501), `HOME` 없을 때 오류 처리 |
-| 1단계 D Web Push | 진행 중 | 알림 방식 Web Push로 확정 |
+| 1단계 D Web Push | 병합 | RFC 8291 테스트 벡터 일치, 테스트 7개. 구독 파일 0600. 남음: keeper 트리거 연결, guard 뒤에 마운트(A2·통합) |
 | 1단계 E 패치 #2 | 결정 대기 | 모드 변경 알림 발송(distill-shell ~15줄) + TUI 수신(distill-pager ~35줄) |
 
 ## 6. 결정 기록과 남은 질문
