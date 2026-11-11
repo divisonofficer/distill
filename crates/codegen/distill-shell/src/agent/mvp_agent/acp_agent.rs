@@ -50,6 +50,30 @@ pub(super) fn x_ai_capabilities() -> serde_json::Value {
     })
 }
 impl MvpAgent {
+    /// Postudio: echo a session-scoped permission change as agent→client `x.ai/yolo_mode_changed`.
+    /// The leader routes it to that session's subscribers, so other clients attached to the session see the new mode.
+    /// `auto` is `Some` only when this change set auto; the shell keeps no per-session auto flag otherwise.
+    fn emit_session_mode_changed(&self, session_id: &acp::SessionId, auto: Option<bool>) {
+        let Some(handle) = self.resident_handle(session_id) else {
+            return;
+        };
+        let mut params = serde_json::Map::new();
+        params.insert("sessionId".into(), session_id.0.as_ref().into());
+        params.insert("yolo_mode".into(), handle.yolo_mode.into());
+        if let Some(enabled) = auto {
+            params.insert("auto_mode".into(), enabled.into());
+            params.insert(
+                "permission_mode".into(),
+                if enabled { "auto" } else { "ask" }.into(),
+            );
+        }
+        if let Ok(raw) = serde_json::value::to_raw_value(&serde_json::Value::Object(params)) {
+            self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                "x.ai/yolo_mode_changed",
+                raw.into(),
+            ));
+        }
+    }
     pub(crate) async fn set_model_gated(
         &self,
         args: acp::SetSessionModelRequest,
@@ -2394,6 +2418,9 @@ impl acp::Agent for MvpAgent {
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let yolo_signal = params.get("yolo_mode").and_then(|v| v.as_bool());
+            // Auto state this message set on the target session; `None` when it did not touch auto.
+            let mut scoped_auto: Option<bool> = None;
+            let mut scoped_applied = false;
             if let Some(yolo_mode) = yolo_signal {
                 let mut updated_sessions = 0;
                 self.session_registry
@@ -2401,12 +2428,13 @@ impl acp::Agent for MvpAgent {
                         if !in_scope(id) {
                             return;
                         }
-                        updated_sessions
-                            += apply_yolo_mode_to_matching_sessions(
-                                std::iter::once(handle),
-                                sender_id,
-                                yolo_mode,
-                            );
+                        let applied = apply_yolo_mode_to_matching_sessions(
+                            std::iter::once(handle),
+                            sender_id,
+                            yolo_mode,
+                        );
+                        scoped_applied |= target_session.is_some() && applied > 0;
+                        updated_sessions += applied;
                     });
                 tracing::info!(
                     yolo_mode,
@@ -2449,6 +2477,9 @@ impl acp::Agent for MvpAgent {
                                 h.yolo_mode = false;
                             }
                             updated += 1;
+                            if target_session.is_some() {
+                                scoped_auto = Some(enabled);
+                            }
                         }
                     });
                 tracing::info!(
@@ -2459,6 +2490,9 @@ impl acp::Agent for MvpAgent {
                     total_sessions,
                     "Setting auto permission mode for matching sessions"
                 );
+            }
+            if let (Some(sid), true) = (target_session, scoped_applied || scoped_auto.is_some()) {
+                self.emit_session_mode_changed(&acp::SessionId::new(sid), scoped_auto);
             }
         }
         if args.method.as_ref() == "x.ai/permissions/reset" {

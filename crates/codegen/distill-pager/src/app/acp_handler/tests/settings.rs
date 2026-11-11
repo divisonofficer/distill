@@ -353,6 +353,76 @@
         }
     }
 
+    /// Postudio: an agent→client echo with `sessionId` updates only that session's flags.
+    #[test]
+    fn session_scoped_mode_echo_updates_only_matching_session() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppView::new(
+            tx,
+            ModelState::default(),
+            Vec::new(),
+            crate::render::draw::EscapeWriter::disconnected(),
+        );
+        app.agents.insert(AgentId(0), make_agent(Some("sess-a")));
+        app.agents.insert(AgentId(1), make_agent(Some("sess-b")));
+        app.auto_mode_gate = true;
+        app.current_ui.permission_mode = Some("ask".into());
+        app.default_yolo = false;
+
+        let echo = |params: serde_json::Value| {
+            acp::ExtNotification::new(
+                "x.ai/yolo_mode_changed",
+                serde_json::value::to_raw_value(&params).unwrap().into(),
+            )
+        };
+
+        assert!(handle_ext_notification(
+            &echo(serde_json::json!({ "sessionId": "sess-a", "yolo_mode": true, "auto_mode": false, "permission_mode": "always-approve" })),
+            &mut app,
+        ));
+        let a = app.agents.get(&AgentId(0)).unwrap();
+        let b = app.agents.get(&AgentId(1)).unwrap();
+        assert!(a.session.is_yolo(), "matching session must take yolo");
+        assert!(!b.session.is_yolo(), "other session must keep its yolo");
+
+        assert!(handle_ext_notification(
+            &echo(serde_json::json!({ "sessionId": "sess-b", "yolo_mode": false, "auto_mode": true, "permission_mode": "auto" })),
+            &mut app,
+        ));
+        let b = app.agents.get(&AgentId(1)).unwrap();
+        assert!(b.session.is_auto(), "auto echo must set auto on the matching session");
+        assert!(!b.session.is_yolo());
+        let a = app.agents.get(&AgentId(0)).unwrap();
+        assert!(a.session.is_yolo() && !a.session.is_auto(), "auto echo for sess-b must not touch sess-a");
+
+        // Yolo wins over auto on the same session, matching the wire precedence.
+        assert!(handle_ext_notification(
+            &echo(serde_json::json!({ "sessionId": "sess-b", "yolo_mode": true, "auto_mode": true })),
+            &mut app,
+        ));
+        let b = app.agents.get(&AgentId(1)).unwrap();
+        assert!(b.session.is_yolo() && !b.session.is_auto());
+
+        // Unknown session and missing sessionId are ignored.
+        assert!(!handle_ext_notification(
+            &echo(serde_json::json!({ "sessionId": "sess-unknown", "yolo_mode": true })),
+            &mut app,
+        ));
+        assert!(!handle_ext_notification(&echo(serde_json::json!({ "yolo_mode": true })), &mut app));
+
+        // Applying the same echo again is harmless (the sender receives its own echo).
+        assert!(handle_ext_notification(
+            &echo(serde_json::json!({ "sessionId": "sess-a", "yolo_mode": true })),
+            &mut app,
+        ));
+        assert!(app.agents.get(&AgentId(0)).unwrap().session.is_yolo());
+
+        // No outbound notification and no global/config-backed mode change.
+        assert!(rx.try_recv().is_err(), "echo handling must not send anything back");
+        assert_eq!(app.current_ui.permission_mode.as_deref(), Some("ask"));
+        assert!(!app.default_yolo, "session-scoped echo must not change the client default");
+    }
+
     #[test]
     fn auto_gate_killswitch_notifies_agents_to_leave_auto() {
         // The kill-switch must tell live sessions to leave Auto, else the agent keeps classifier-approving while the UI shows "Ask"

@@ -39,6 +39,42 @@ fn labels(msgs: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// `params` of a `x.ai/yolo_mode_changed` message, in direct or leader-wrapped form.
+fn echo_params(m: &Value) -> &Value {
+    let wrapped = m.pointer("/params/method").is_some();
+    let inner = if wrapped {
+        m.pointer("/params/params")
+    } else {
+        m.get("params")
+    };
+    inner.unwrap_or(&Value::Null)
+}
+
+/// Whether `m` is `x.ai/yolo_mode_changed` for `sid`, with or without the leading `_` and in direct or wrapped form.
+fn is_mode_echo_for(m: &Value, sid: &str) -> bool {
+    let direct = method_of(m).is_some_and(|mt| mt.trim_start_matches('_') == "x.ai/yolo_mode_changed");
+    let wrapped = m
+        .pointer("/params/method")
+        .and_then(Value::as_str)
+        .is_some_and(|mt| mt.trim_start_matches('_') == "x.ai/yolo_mode_changed");
+    (direct || wrapped) && echo_params(m).get("sessionId").and_then(Value::as_str) == Some(sid)
+}
+
+/// Read incoming messages until a mode echo for `sid` arrives or `dur` passes. Returns whether it arrived.
+async fn wait_for_mode_echo(c: &mut RawClient, sid: &str, dur: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + dur;
+    loop {
+        if c.incoming().iter().any(|m| is_mode_echo_for(m, sid)) {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        c.pump_for((deadline - now).min(Duration::from_millis(200))).await;
+    }
+}
+
 fn is_update(m: &Value) -> bool {
     method_of(m) == Some("session/update")
 }
@@ -232,7 +268,14 @@ async fn l4_session_scoped_mode_change() {
     a.settle().await;
 
     a.notify("_x.ai/yolo_mode_changed", json!({"yolo_mode": true, "sessionId": s1})).await;
-    b.pump_for(Duration::from_secs(2)).await;
+    let echo_seen = wait_for_mode_echo(&mut b, &s1, Duration::from_secs(10)).await;
+    assert!(
+        echo_seen,
+        "B (attached to S1) did not receive x.ai/yolo_mode_changed for S1 within 10 s; saw {:?}",
+        labels(b.incoming())
+    );
+    let echo = b.incoming().iter().find(|m| is_mode_echo_for(m, &s1)).cloned().expect("echo present");
+    assert_eq!(echo_params(&echo).get("yolo_mode"), Some(&json!(true)), "echo carries new mode: {echo}");
     a.pump_for(Duration::from_millis(500)).await;
     eprintln!("OBSERVE B after mode change: {:?}", labels(b.incoming()));
     eprintln!("OBSERVE A after mode change: {:?}", labels(a.incoming()));

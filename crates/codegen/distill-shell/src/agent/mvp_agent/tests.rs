@@ -1916,6 +1916,72 @@ async fn yolo_mode_changed_without_session_id_keeps_client_wide_scope() {
         );
     }
 }
+/// Collects the params of each `x.ai/yolo_mode_changed` notification forwarded to the gateway.
+fn drain_yolo_mode_changed(
+    gw_rx: &mut tokio::sync::mpsc::UnboundedReceiver<distill_acp_lib::AcpClientMessage>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    while let Ok(msg) = gw_rx.try_recv() {
+        if let distill_acp_lib::AcpClientMessage::ExtNotification(args) = msg
+            && args.request.method.as_ref() == "x.ai/yolo_mode_changed"
+        {
+            out.push(serde_json::from_str(args.request.params.get()).expect("json params"));
+        }
+    }
+    out
+}
+/// Postudio: a session-scoped change echoes the resulting state to that session's subscribers.
+#[tokio::test(flavor = "current_thread")]
+async fn session_scoped_mode_change_emits_notification_for_that_session() {
+    use acp::Agent as _;
+    let (agent, mut gw_rx) = build_agent_with_gateway_rx();
+    let sid_a = acp::SessionId::new("sess-emit-a");
+    let sid_b = acp::SessionId::new("sess-emit-b");
+    let (handle_a, _tx_a, _rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, _rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    agent
+        .ext_notification(yolo_mode_changed(
+            serde_json::json!({ "yolo_mode": true, "sessionId": "sess-emit-a" }),
+        ))
+        .await
+        .expect("session-scoped yolo notification must be handled");
+    let emitted = drain_yolo_mode_changed(&mut gw_rx);
+    assert_eq!(emitted.len(), 1, "exactly one echo for the target session; got {emitted:?}");
+    assert_eq!(emitted[0].get("sessionId").and_then(|v| v.as_str()), Some("sess-emit-a"));
+    assert_eq!(emitted[0].get("yolo_mode"), Some(&serde_json::json!(true)));
+    assert!(emitted[0].get("auto_mode").is_none(), "yolo-only change must not carry auto_mode");
+    agent
+        .ext_notification(yolo_mode_changed(
+            serde_json::json!({ "permission_mode": "auto", "sessionId": "sess-emit-a" }),
+        ))
+        .await
+        .expect("session-scoped auto notification must be handled");
+    let emitted = drain_yolo_mode_changed(&mut gw_rx);
+    assert_eq!(emitted.len(), 1, "exactly one echo for the auto change; got {emitted:?}");
+    assert_eq!(emitted[0].get("sessionId").and_then(|v| v.as_str()), Some("sess-emit-a"));
+    assert_eq!(emitted[0].get("yolo_mode"), Some(&serde_json::json!(false)));
+    assert_eq!(emitted[0].get("auto_mode"), Some(&serde_json::json!(true)));
+    assert_eq!(emitted[0].get("permission_mode"), Some(&serde_json::json!("auto")));
+}
+/// The client-wide scope (no `sessionId`) emits no per-session echo.
+#[tokio::test(flavor = "current_thread")]
+async fn client_wide_mode_change_emits_no_session_notification() {
+    use acp::Agent as _;
+    let (agent, mut gw_rx) = build_agent_with_gateway_rx();
+    let sid_a = acp::SessionId::new("sess-wide-emit-a");
+    let (handle_a, _tx_a, _rx_a) = make_live_session_handle(&sid_a, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent
+        .ext_notification(yolo_mode_changed(serde_json::json!({ "yolo_mode": true })))
+        .await
+        .expect("client-wide yolo notification must be handled");
+    assert!(
+        drain_yolo_mode_changed(&mut gw_rx).is_empty(),
+        "client-wide change must not emit a session echo"
+    );
+}
 /// `drain_old_session_thread` returns immediately when the thread has already finished.
 #[tokio::test]
 async fn drain_finished_thread_returns_immediately() {
