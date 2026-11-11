@@ -1,54 +1,32 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
-	import Badge from '$lib/components/Badge.svelte';
-	import { activityBadge, basename, sessionTitle } from '$lib/format';
-	import { board, sortRows } from '$lib/board.svelte';
-
-	const rows = $derived(sortRows(board.rows));
+import { goto } from '$app/navigation';
+import { board } from '$lib/board.svelte';
+import Icon from '$lib/components/Icon.svelte';
+import { ui } from '$lib/ui.svelte';
 </script>
 
 <svelte:head>
-	<title>세션 · Postudio</title>
+<title>Postudio</title>
 </svelte:head>
 
-<section class="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
-	<div class="flex items-center gap-3">
-		<h1 class="min-w-0 flex-1 truncate text-base font-semibold">{board.host || '호스트'}</h1>
-		<button
-			type="button"
-			class="min-h-11 rounded-lg bg-blue-700 px-4 text-sm font-medium text-white hover:bg-blue-800"
-			onclick={() => goto('/new')}
-		>
-			새 작업
-		</button>
-	</div>
-
-	{#if !board.connected}
-		<p role="status" class="text-sm text-neutral-500">서버에 연결하는 중입니다.</p>
-	{/if}
-
-	{#if board.connected && rows.length === 0}
-		<p class="text-sm text-neutral-500">세션이 없습니다. 새 작업을 시작하세요.</p>
-	{/if}
-
-	<ul class="flex flex-col gap-2">
-		{#each rows as row (row.sessionId)}
-			{@const badge = activityBadge(row.activity)}
-			<li>
-				<a
-					href="/s/{row.sessionId}"
-					class="flex min-h-11 flex-col gap-1 rounded-lg border border-neutral-300 bg-white p-3 hover:border-blue-500 dark:border-neutral-700 dark:bg-neutral-900"
-				>
-					<span class="flex items-center gap-2">
-						<span class="min-w-0 flex-1 truncate font-medium">{sessionTitle(row)}</span>
-						{#if row.isWorktree}
-							<span class="rounded border border-neutral-400 px-1 text-xs text-neutral-600 dark:text-neutral-300" title="worktree">WT</span>
-						{/if}
-						<Badge label={badge.label} tone={badge.tone} />
-					</span>
-					<span class="truncate font-mono text-xs text-neutral-500" title={row.cwd}>{basename(row.cwd)} · {row.cwd}</span>
-				</a>
-			</li>
-		{/each}
-	</ul>
+<section class="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 p-6">
+<div class="flex flex-col items-center gap-2 text-center">
+<h1 class="text-3xl font-semibold tracking-tight">무엇을 만들까요?</h1>
+<p class="text-sm text-neutral-500">{board.host ? `${board.host}에서 작업을 시작합니다.` : '새 작업을 시작하세요.'}</p>
+</div>
+<button
+type="button"
+class="flex min-h-11 items-center gap-2 rounded-2xl border border-neutral-300 bg-white px-5 text-sm font-medium shadow-sm hover:bg-neutral-100 dark:border-neutral-700 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+onclick={() => goto('/new')}
+>
+<Icon name="new" class="size-4" />
+새 작업
+</button>
+<button
+type="button"
+class="text-sm text-neutral-500 underline-offset-4 hover:underline lg:hidden"
+onclick={() => (ui.drawerOpen = true)}
+>
+세션 목록 보기
+</button>
 </section>

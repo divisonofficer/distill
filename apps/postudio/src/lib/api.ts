@@ -47,11 +47,14 @@ export function connect<M>(path: string, h: SocketHandlers<M>): Socket {
 	const open = () => {
 		const cur = new WebSocket(`${proto}//${location.host}${path}`);
 		ws = cur;
+		// Frames from a superseded socket are dropped so one view never mixes two streams.
 		cur.onopen = () => {
+			if (ws !== cur) return;
 			delay = 1000;
 			h.onOpen();
 		};
 		cur.onmessage = (ev) => {
+			if (ws !== cur) return;
 			try {
 				h.onMessage(JSON.parse(ev.data as string) as M);
 			} catch {
@@ -59,6 +62,7 @@ export function connect<M>(path: string, h: SocketHandlers<M>): Socket {
 			}
 		};
 		cur.onclose = () => {
+			if (ws !== cur) return;
 			ws = null;
 			h.onClose();
 			if (closed) return;
@@ -76,7 +80,10 @@ export function connect<M>(path: string, h: SocketHandlers<M>): Socket {
 		close() {
 			closed = true;
 			clearTimeout(timer);
-			ws?.close();
+			// Detach first so frames still queued on this socket are dropped.
+			const cur = ws;
+			ws = null;
+			cur?.close();
 		}
 	};
 }

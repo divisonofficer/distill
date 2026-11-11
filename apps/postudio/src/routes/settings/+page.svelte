@@ -104,8 +104,8 @@
 	<title>설정 · Postudio</title>
 </svelte:head>
 
-<div class="flex flex-col gap-6 p-4">
-	<h1 class="text-base font-semibold">설정</h1>
+<div class="mx-auto flex w-full max-w-2xl flex-col gap-8 p-4 md:p-8">
+	<h1 class="text-2xl font-semibold tracking-tight">설정</h1>
 
 	<section class="flex flex-col gap-3" aria-labelledby="push-h">
 		<h2 id="push-h" class="text-sm font-semibold">푸시 알림</h2>
@@ -114,7 +114,7 @@
 			<button
 				type="button"
 				disabled={busy}
-				class="min-h-11 rounded-lg border border-neutral-400 px-4 text-sm font-medium disabled:opacity-40"
+				class="min-h-11 self-start rounded-xl border border-neutral-300 px-4 text-sm font-medium hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800"
 				onclick={pushState === 'on' ? disable : enable}
 			>
 				{pushState === 'on' ? '알림 끄기' : '알림 켜기'}
@@ -131,8 +131,8 @@
 			{#each MODES as m (m)}
 				<label
 					class={[
-						'flex min-h-11 cursor-pointer items-center rounded-lg border px-4 text-sm',
-						defaultMode === m ? 'border-blue-600 bg-blue-50 dark:bg-blue-950' : 'border-neutral-300 dark:border-neutral-700'
+						'flex min-h-11 cursor-pointer items-center rounded-xl border px-4 text-sm',
+						defaultMode === m ? 'border-neutral-900 bg-neutral-100 font-medium dark:border-neutral-100 dark:bg-neutral-800' : 'border-neutral-300 hover:bg-neutral-100 dark:border-neutral-700 dark:hover:bg-neutral-800'
 					]}
 				>
 					<input
