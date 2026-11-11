@@ -38,6 +38,7 @@ impl Reducer {
 ```
 
 다른 `sessionId`의 메시지는 버린다. `session/update`의 내용은 `params.update`, `_x.ai/session_notification`은 `params.update`(둘 다 `sessionUpdate`로 구분).
+재생에서는 `turn_completed`가 `_x.ai/session/update`로 온다(같은 방식으로 처리). `tool_call_update`에 `status`도 `content`도 없으면 이벤트를 내지 않는다.
 
 | ACP | SEP |
 |---|---|
@@ -102,6 +103,7 @@ impl AgentConn {
 - VAPID(ES256, `ring`) + RFC 8291 `aes128gcm`. RFC 8291 부록 A 테스트 벡터로 암호화 검증.
 - 키: `~/.distill/postudio/vapid.json`(없으면 생성, 0600). 구독: `~/.distill/postudio/push-subscriptions.json`.
 - 경로: `GET /api/push/key` → `{publicKey}`(base64url), `POST /api/push/subscribe` body = 브라우저 `PushSubscription.toJSON()`, `POST /api/push/unsubscribe {endpoint}`.
+- 2026-11-11 결정: MVP 알림은 Web Push로 간다. 별도 호스팅·Firebase 프로젝트 없음. 안드로이드 Chrome은 FCM 엔드포인트로 전달되지만 내용은 종단 암호화된다. node 호스트에 인터넷 HTTPS 송신이 필요하다(GPU 컨테이너는 3단계에서 확인).
 - 트리거: keeper가 `pending_interaction`(kind `permission`·`question`)을 받았을 때. 같은 `tool_call_id`는 한 번만.
 - 페이로드: `{"title": "<세션 제목> 승인 대기", "body": "<toolCall.title>", "url": "/s/<sessionId>", "tag": "<sessionId>"}`.
 - 발송 실패 404/410이면 구독 삭제.
