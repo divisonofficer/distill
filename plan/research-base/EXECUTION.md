@@ -1,7 +1,7 @@
 # Postudio — 재검토 결과와 멀티 에이전트 실행 계획 (v0.5)
 
 > 기준: `PLAN.md` v0.4, 기준 커밋 `40d7c6bc`(패치 #1), `9c16284d`(node 골격).
-> **2026-11-11 결정: R1~R12 전부 수용.** R1은 0단계 L1~L6 실행 검증을 통과해야 확정된다.
+> **2026-11-11 결정: R1~R12 전부 수용.** R1은 실행 검증으로 확정(`P0-RESULTS.md`). 트랙 간 경계는 [`CONTRACT.md`](CONTRACT.md)가 정본이다.
 > 이 문서는 (1) 코드를 읽고 찾은 계획 변경 제안, (2) 병렬 에이전트로 오래 돌릴 때의 작업 분할·소유권·검증 규칙을 정한다.
 > "코드 확인"은 소스를 읽은 것이고 실행해 본 것이 아니다. 실행 검증은 §3의 0단계에서 한다.
 > 실제 호스트 이름·tailnet 이름·로그인은 이 문서에 쓰지 않는다(§2).
@@ -68,21 +68,19 @@ R1이 가장 큰 변경이다. 다음 작업으로 잡혀 있던 "WP2 ACP 다중
 
 T0.4는 비용이 들지 않는다. 레포의 테스트용 가짜 모델 서버(`distill-test-support`의 `MockInferenceServer`)가 툴 호출과 오류를 대본대로 돌려주므로 실제 모델 계정을 쓰지 않는다.
 
-### 1단계 — 병렬 5트랙
+### 1단계 — 병렬 4트랙 (+E)
 
-각 트랙은 자기 worktree에서 일하고 표의 파일만 고친다. `src/lib.rs`의 라우터 조립과 `Cargo.toml`은 주 모델이 고친다. 각 모듈은 `pub fn routes() -> Router<…>`를 내놓는다.
+각 트랙은 자기 worktree(브랜치 `postudio/<트랙>`)에서 `CONTRACT.md`의 해당 절만 구현한다. `src/lib.rs` 라우터 조립, `Cargo.toml`, `src/sep.rs`는 주 모델만 고친다. 모듈 파일은 이미 빈 채로 커밋돼 있다.
 
-| 트랙 | 범위 | 소유 파일 | 검증 명령 |
+| 트랙 | 범위 (`CONTRACT.md`) | 소유 파일 | 검증 명령 |
 |---|---|---|---|
-| A node-core | ACP→SEP 변환(순수 함수), 세션 WS, 세션·보드 REST, **fixture 재생 에이전트**(`--fake-agent <jsonl>`) | `crates/custom/distill-node/src/{reduce,link,ws,sessions}.rs`, `tests/reduce.rs` | `cargo test -p distill-node` (fixture 전부 일치) |
-| B node-edge | R5 Origin 확인, R6 소켓 바인딩, R7 두 번째 리스너·포트 프록시·파일 서빙(경로 탈출 차단), `tailscale serve` 설정 | `src/{auth,listen,proxy,files,tailscale}.rs`, `tests/edge.rs` | `cargo test -p distill-node`; 위조 Origin·헤더 없음·`..`·심볼릭 링크 각각 거부 |
-| C web | SvelteKit 정적 앱: 세션 보드, 세션 화면, 승인 카드, 새 작업, 설정, 서비스워커 | `apps/postudio/**` | `npm run check && npm run build`, fake-agent node에 붙여 브라우저로 390×844와 1280×800 확인 |
-| D push | VAPID 서명, RFC 8291 본문 암호화(`ring`, RFC 부록 테스트 벡터), 구독 저장, `needs_input` 전환 시 발송 | `src/push/*.rs`, `tests/push.rs` | `cargo test -p distill-node push` |
-| E 업스트림 접점 | `distill node` 서브커맨드, leader 연결 접착 코드, 패치 후속. **전체 워크스페이스를 빌드하는 유일한 트랙** | `distill-pager/src/app/cli.rs`, `distill-pager-bin/src/main.rs`, `distill-shell` 패치 파일, `PATCHES.md` | `cargo test -p distill-shell --lib -- agent::mvp_agent::tests leader::server` (`RUST_MIN_STACK=16777216`), `cargo build -p distill-pager-bin` |
+| A node-core | §3 변환, §4 세션 WS·보드·REST, keeper | `src/{reduce,agent,session,board}.rs`, `tests/reduce.rs`, `tests/fixtures/sep/*.json` | `cargo test -p distill-node` (fixture 7개 일치), 실제 leader 대상 통합 테스트는 `postudio-probe`에 추가 |
+| B node-edge | §5 guard·리스너·비신뢰 출처 | `src/{guard,listen,untrusted}.rs`, `tests/edge.rs` | `cargo test -p distill-node`; §5 시험 목록 전부 |
+| C web | Studio 앱 | `apps/postudio/**` | `npm run check && npm run build`; §7 dev-stack에 붙여 브라우저 390×844, 1280×800 |
+| D push | §6 | `src/push.rs`(필요하면 `src/push/`), `tests/push.rs` | `cargo test -p distill-node push` (RFC 8291 벡터) |
+| E 업스트림 | 패치 #2: 세션 단위 모드 변경을 그 세션 구독자에게 알림(L4 관찰) | `distill-shell` 해당 파일, `PATCHES.md` | `RUST_MIN_STACK=16777216 cargo test -p distill-shell --lib -- agent::mvp_agent::tests leader::server`, `postudio-probe` l4 확장 |
 
-트랙 A·B·D는 `CARGO_TARGET_DIR=target-node`를 쓴다. `distill-node`는 Distill 내부 크레이트 중 `distill-version`만 의존하므로 빌드가 가볍고, 트랙 E의 `target/` 잠금과 겹치지 않는다. **`distill-node`에 `distill-shell`·`distill-tools` 의존을 추가하지 않는다.** leader 연결은 문자열 채널 한 쌍으로 넘겨받고, 실제 연결 코드는 트랙 E가 `distill-pager-bin`에 둔다.
-
-트랙 C는 A의 fake-agent가 필요하다. A가 끝나기 전에는 `tests/fixtures/sep/*.json`을 직접 읽어 화면을 만든다.
+트랙 A·B·D는 `CARGO_TARGET_DIR=target-node`를 쓴다. 트랙 E와 `postudio-probe` 실행만 `target/`(전체 빌드)를 쓴다. **`distill-node`에 Distill 내부 크레이트 의존을 추가하지 않는다**(`distill-version` 제외). 트랙 C는 A가 끝나기 전에는 `tests/fixtures/sep/*.json`으로 화면을 만든다.
 
 ### 2단계 — 통합 (트랙 E 완료 후)
 
@@ -92,7 +90,7 @@ T0.4는 비용이 들지 않는다. 레포의 테스트용 가짜 모델 서버(
 | I2 | 새 작업: `x.ai/git/worktree/create` → `session/new`(`_meta`로 초기 모드) | I1 |
 | I3 | 모드 칩: 패치 #1 호출, 계획 모드는 `session/set_mode` | I1 |
 | I4 | 호스트 목록(`tailscale status --json`), 브라우저 직접 연결, 오프라인 표시, `join` | B, C |
-| I5 | 운영: `distill node up`(nohup, pidfile, 멱등), launchd, Windows 작업 스케줄러 | E |
+| I5 | 운영: `postudio-node up`(nohup, pidfile, 멱등, leader 감시·재시작), launchd, Windows 작업 스케줄러 | A |
 | I6 | 푸시 종단: 구독 → 승인 대기 → 알림 → 탭하면 해당 세션 | C, D, I1 |
 
 ### 3단계 — 실제 호스트 검증 (보류)
@@ -130,9 +128,10 @@ T0.4는 비용이 들지 않는다. 레포의 테스트용 가짜 모델 서버(
 | node 골격 (`/healthz`, `/api/node`, 소유자 확인) | 커밋됨 | 테스트 3개 통과. R5·R6 미반영 |
 | 비공개 정보 규칙 | 적용 | §2 |
 | `PLAN.md` 본문을 v0.5로 고치기 | 대기 | R1~R12 반영 |
-| T0.3 허브 검증, T0.4 캡처 | 진행 중 | `crates/custom/postudio-probe`: 가짜 모델 서버 + 실제 `distill` 바이너리 |
-| T0.5 계약 고정 | 대기 | T0.4 후 |
-| 1단계 A~E | 대기 | 0단계 후 |
+| T0.3 허브 검증 | 완료 | 7/8 통과, L2 실패 → keeper로 대응. `P0-RESULTS.md` |
+| T0.4 캡처 | 완료 | fixture 7개, 비공개 정보 0건 |
+| T0.5 계약 고정 | 완료 | `CONTRACT.md`, `src/sep.rs`, 빈 모듈 파일. 기대 SEP fixture는 트랙 A가 만들고 주 모델이 검토 |
+| 1단계 A~E | 시작 가능 | |
 
 ## 6. 결정 기록과 남은 질문
 

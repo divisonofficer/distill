@@ -103,3 +103,26 @@
 1. S2(macOS) + S3: 이 Mac에서 `distill agent serve` 띄우고 ACP 다중화 시제품(WP2 시작)
 2. S7: `apps/postudio` 골격 빌드
 3. 서버 항목(두 컨테이너, nohup): Tailscale SSH 활성화 또는 서버에서 직접 스크립트 실행. 컨테이너 tailscaled 모드 확인
+
+## leader 허브 실행 검증 (T0.3, 2026-11-11, 이 Mac)
+
+실행: `crates/custom/postudio-probe` (가짜 모델 서버 `MockInferenceServer` + 실제 `target/debug/distill` leader, 클라이언트는 `distill agent --leader stdio`). 모델 비용 없음.
+명령: `GROK_BINARY=$PWD/target/debug/distill cargo test -p postudio-probe --test probe -- --ignored --nocapture --test-threads=1` → 7 통과, 1 실패(`l2`, 아래).
+
+| # | 테스트 | 결과 | 관찰 |
+|---|---|---|---|
+| L1 | `l1_two_clients_share_session` | 통과 | 두 클라이언트 모두 스트림과 `session/request_permission`을 받음. B가 승인하자 툴 실행, A의 prompt 응답 정상. A는 `interaction_resolved`를 받음 |
+| L1b | `l1b_late_joiner_gets_pending_permission` | 통과 | 승인 대기 중에 붙은 C가 대기 중 요청을 받음 |
+| L2 | `l2_background_process_survives_disconnect` | **실패** | 마지막 클라이언트가 끊기면 8초 안에 세션의 백그라운드 프로세스가 죽음 |
+| L2b | `l2b_background_process_with_one_client_still_attached` | 통과 | 다른 클라이언트가 붙어 있으면 유지. 그 클라이언트도 끊기면 죽음 |
+| L3 | `l3_leader_survives_zero_clients` | 통과 | 클라이언트 0개에서 leader 유지, 새 클라이언트가 `_x.ai/sessions/list`로 세션 확인 |
+| L4 | `l4_session_scoped_mode_change` | 통과 | 패치 #1: S1만 승인 생략(요청 0), S2·새 S3은 요청 1. 같은 세션에 붙은 B는 모드 변경 알림을 받지 못함 |
+| L7 | `l7_roster_broadcast_on_needs_input` | 통과 | 승인 대기 중 `_x.ai/sessions/list`는 `needs_input`. `sessions/changed` 알림에는 `working`만 실림 |
+| — | `capture_fixtures` | 통과 | fixture 7개(246줄) 기록, 호스트명·경로 치환 |
+
+결론:
+- **R1 확정.** leader를 허브로 쓴다.
+- L2 대응: node가 keeper 연결로 자기가 관리하는 세션에 붙어 있는다(`CONTRACT.md` §1). L2 테스트는 그대로 두어 Distill 쪽 동작이 바뀌면 알 수 있게 한다.
+- L4 관찰: TUI의 모드 표시는 웹에서 바꾼 모드를 모른다(완료 기준 9). 패치 #2 후보: 세션 단위 모드 변경 시 그 세션 구독자에게 알림 발송.
+- L7 관찰: 승인 대기 푸시 트리거는 `sessions/changed`가 아니라 keeper가 받는 `pending_interaction`으로 한다.
+- L5(Windows), L6(샌드박스 프로필)은 미검증.

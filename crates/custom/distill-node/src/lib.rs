@@ -5,6 +5,14 @@
 //! adds `Tailscale-User-Login`; the node itself only binds loopback.
 //! The ACP multiplexer (WP2) and the web app (WP3) build on this router.
 
+pub mod agent;
+pub mod guard;
+pub mod listen;
+pub mod push;
+pub mod reduce;
+pub mod sep;
+pub mod untrusted;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
