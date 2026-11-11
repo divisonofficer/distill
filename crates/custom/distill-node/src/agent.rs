@@ -205,8 +205,8 @@ impl AgentHandle {
                     "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
                     "_meta": {
                         "startupHints": {"nonInteractive": false, "skipGitStatus": true, "skipProjectLayout": true},
-                        "clientType": "test-client",
-                        "clientVersion": "0.0.0-test"
+                        "clientType": "postudio-node",
+                        "clientVersion": env!("CARGO_PKG_VERSION")
                     }
                 }),
             )
