@@ -1,0 +1,33 @@
+[
+  {
+    "t": "user.message",
+    "text": "go"
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_2_1",
+    "name": "read_file",
+    "title": "Read `/sandbox/proj/read.txt`",
+    "kind": "read",
+    "status": "completed",
+    "input": {
+      "target_file": "/sandbox/proj/read.txt",
+      "variant": "ReadFile"
+    }
+  },
+  {
+    "t": "message.delta",
+    "text": "Read done."
+  },
+  {
+    "t": "turn.end",
+    "stop_reason": "end_turn"
+  },
+  {
+    "t": "session.state",
+    "status": "idle"
+  },
+  {
+    "t": "replay.end"
+  }
+]

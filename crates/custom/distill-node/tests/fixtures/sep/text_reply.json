@@ -1,0 +1,39 @@
+[
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "session.title",
+    "title": "go"
+  },
+  {
+    "t": "usage",
+    "used": 2652,
+    "size": 256000
+  },
+  {
+    "t": "message.delta",
+    "text": "Hello"
+  },
+  {
+    "t": "message.delta",
+    "text": " from"
+  },
+  {
+    "t": "message.delta",
+    "text": " the"
+  },
+  {
+    "t": "message.delta",
+    "text": " mock."
+  },
+  {
+    "t": "turn.end",
+    "stop_reason": "end_turn"
+  },
+  {
+    "t": "session.state",
+    "status": "idle"
+  }
+]

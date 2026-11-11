@@ -1,0 +1,24 @@
+[
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "session.title",
+    "title": "go"
+  },
+  {
+    "t": "usage",
+    "used": 2652,
+    "size": 256000
+  },
+  {
+    "t": "turn.end",
+    "stop_reason": "error",
+    "error": "API error (status 400 Bad Request): Request failed (HTTP 400)."
+  },
+  {
+    "t": "session.state",
+    "status": "error"
+  }
+]

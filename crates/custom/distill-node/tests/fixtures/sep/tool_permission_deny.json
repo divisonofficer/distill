@@ -1,0 +1,94 @@
+[
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "session.title",
+    "title": "go"
+  },
+  {
+    "t": "usage",
+    "used": 2652,
+    "size": 256000
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_4_1",
+    "name": "search_replace",
+    "title": "search_replace",
+    "kind": "edit",
+    "status": "pending",
+    "input": {
+      "file_path": "/sandbox/proj/deny.txt",
+      "new_string": "after",
+      "old_string": "before"
+    }
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_4_1",
+    "content": [
+      {
+        "type": "diff",
+        "path": "/sandbox/proj/deny.txt",
+        "old": "before",
+        "new": "after"
+      }
+    ]
+  },
+  {
+    "t": "permission.request",
+    "id": 1,
+    "tool_call_id": "call_mock_4_1",
+    "title": "Edit `/sandbox/proj/deny.txt`",
+    "options": [
+      {
+        "id": "allow-edits-session",
+        "kind": "allow_always",
+        "name": "Yes, allow all edits during this session"
+      },
+      {
+        "id": "allow-once",
+        "kind": "allow_once",
+        "name": "Yes"
+      },
+      {
+        "id": "reject-once",
+        "kind": "reject_once",
+        "name": "No, and tell Grok what to do differently"
+      }
+    ]
+  },
+  {
+    "t": "session.state",
+    "status": "waiting_permission"
+  },
+  {
+    "t": "permission.resolved",
+    "tool_call_id": "call_mock_4_1"
+  },
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_4_1",
+    "status": "failed",
+    "content": [
+      {
+        "type": "text",
+        "text": "User rejected the execution for tool `search_replace`"
+      }
+    ]
+  },
+  {
+    "t": "turn.end",
+    "stop_reason": "cancelled"
+  },
+  {
+    "t": "session.state",
+    "status": "idle"
+  }
+]

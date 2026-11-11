@@ -1,0 +1,109 @@
+[
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "session.title",
+    "title": "go"
+  },
+  {
+    "t": "usage",
+    "used": 2652,
+    "size": 256000
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_3_1",
+    "name": "search_replace",
+    "title": "search_replace",
+    "kind": "edit",
+    "status": "pending",
+    "input": {
+      "file_path": "/sandbox/proj/allow.txt",
+      "new_string": "after",
+      "old_string": "before"
+    }
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_3_1",
+    "content": [
+      {
+        "type": "diff",
+        "path": "/sandbox/proj/allow.txt",
+        "old": "before",
+        "new": "after"
+      }
+    ]
+  },
+  {
+    "t": "permission.request",
+    "id": 0,
+    "tool_call_id": "call_mock_3_1",
+    "title": "Edit `/sandbox/proj/allow.txt`",
+    "options": [
+      {
+        "id": "allow-edits-session",
+        "kind": "allow_always",
+        "name": "Yes, allow all edits during this session"
+      },
+      {
+        "id": "allow-once",
+        "kind": "allow_once",
+        "name": "Yes"
+      },
+      {
+        "id": "reject-once",
+        "kind": "reject_once",
+        "name": "No, and tell Grok what to do differently"
+      }
+    ]
+  },
+  {
+    "t": "session.state",
+    "status": "waiting_permission"
+  },
+  {
+    "t": "permission.resolved",
+    "tool_call_id": "call_mock_3_1"
+  },
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_3_1",
+    "status": "completed",
+    "content": [
+      {
+        "type": "diff",
+        "path": "/sandbox/proj/allow.txt",
+        "old": "before",
+        "new": "after"
+      }
+    ]
+  },
+  {
+    "t": "usage",
+    "used": 58,
+    "size": 256000
+  },
+  {
+    "t": "message.delta",
+    "text": "Edit"
+  },
+  {
+    "t": "message.delta",
+    "text": " allowed."
+  },
+  {
+    "t": "turn.end",
+    "stop_reason": "end_turn"
+  },
+  {
+    "t": "session.state",
+    "status": "idle"
+  }
+]

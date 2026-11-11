@@ -1,0 +1,66 @@
+[
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "session.title",
+    "title": "go"
+  },
+  {
+    "t": "usage",
+    "used": 2652,
+    "size": 256000
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_2_1",
+    "name": "read_file",
+    "title": "read_file",
+    "kind": "read",
+    "status": "pending",
+    "input": {
+      "target_file": "/sandbox/proj/read.txt"
+    }
+  },
+  {
+    "t": "permission.resolved",
+    "tool_call_id": "call_mock_2_1"
+  },
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
+    "t": "tool",
+    "id": "call_mock_2_1",
+    "status": "completed",
+    "content": [
+      {
+        "type": "text",
+        "text": "1→before\n"
+      }
+    ]
+  },
+  {
+    "t": "usage",
+    "used": 32,
+    "size": 256000
+  },
+  {
+    "t": "message.delta",
+    "text": "Read"
+  },
+  {
+    "t": "message.delta",
+    "text": " done."
+  },
+  {
+    "t": "turn.end",
+    "stop_reason": "end_turn"
+  },
+  {
+    "t": "session.state",
+    "status": "idle"
+  }
+]
