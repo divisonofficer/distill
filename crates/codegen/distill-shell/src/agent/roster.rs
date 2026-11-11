@@ -66,6 +66,8 @@ pub struct RosterEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
     pub yolo: bool,
+    #[serde(default)]
+    pub auto_mode: bool,
     pub activity: RosterActivity,
     /// Ultra-short summary of the session's most recent turn, for the row's secondary line.
     /// From `summary.json`; absent until the first turn ends.
@@ -143,6 +145,7 @@ pub(crate) fn merge_roster(
         model_id: Some(summary.current_model_id.0.to_string()),
         reasoning_effort: summary.reasoning_effort,
         yolo: false,
+        auto_mode: false,
         activity: RosterActivity::Dormant,
         last_turn_summary: summary.last_turn_summary.clone(),
         resident: false,
@@ -186,6 +189,7 @@ mod merge_roster_tests {
             model_id: Some("grok-4".into()),
             reasoning_effort: None,
             yolo: false,
+            auto_mode: false,
             activity,
             last_turn_summary: None,
             resident: true,
@@ -383,5 +387,20 @@ mod merge_roster_tests {
             !json.contains("reasoningEffort"),
             "a None effort must not be serialized: {json}"
         );
+    }
+
+    #[test]
+    fn auto_mode_serializes_as_camel_case_and_defaults_false() {
+        let entry = RosterEntry {
+            auto_mode: true,
+            ..resident("a", RosterActivity::Idle, 1)
+        };
+        let mut json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["autoMode"], true);
+        assert!(json.get("auto_mode").is_none());
+
+        json.as_object_mut().unwrap().remove("autoMode");
+        let legacy: RosterEntry = serde_json::from_value(json).unwrap();
+        assert!(!legacy.auto_mode);
     }
 }

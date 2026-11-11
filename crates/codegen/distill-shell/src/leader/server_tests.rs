@@ -4472,6 +4472,7 @@ async fn roster_merge_round_trips_namespaced_ids_and_broadcasts_changes() {
         model_id: None,
         reasoning_effort: None,
         yolo: false,
+        auto_mode: false,
         activity: RosterActivity::Idle,
         last_turn_summary: None,
         resident: false,

@@ -3527,6 +3527,43 @@ async fn resident_activity_reports_needs_input_when_pending() {
     pending.lock().unwrap().clear();
     assert_eq!(agent.resident_activity(&sid), RosterActivity::Working);
 }
+#[tokio::test]
+async fn resident_roster_reads_live_permission_modes() {
+    tokio::task::LocalSet::new().run_until(async {
+    use distill_workspace::permission::{ClientType, spawn_permission_manager};
+    use distill_workspace::permission::types::PermissionConfig;
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-live-permission-modes");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let cwd = distill_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp"))
+        .expect("absolute cwd");
+    let (permission_handle, _events_rx) = spawn_permission_manager(
+        sid.clone(),
+        GatewaySender::new(tx),
+        cwd,
+        ClientType::Generic,
+        Some(PermissionConfig::new(Vec::new())),
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+    );
+    let mut handle = make_test_handle("grok-3", false, None);
+    handle.permission_handle = permission_handle.clone();
+    agent.insert_resident(&sid, handle);
+
+    permission_handle.set_auto_mode(true);
+    let entry = agent.resident_roster_entry(&sid).expect("resident entry");
+    assert!(!entry.yolo);
+    assert!(entry.auto_mode);
+
+    permission_handle.set_yolo_mode(true);
+    let entry = agent.resident_roster_entry(&sid).expect("resident entry");
+    assert!(entry.yolo);
+    assert!(!entry.auto_mode);
+    }).await;
+}
 /// Drain the agent gateway, returning the first `x.ai/sessions/changed` payload that carries an upserted entry.
 /// Unrelated notifications parse into an empty `RosterChanged` and are ignored.
 fn drain_roster_changed(

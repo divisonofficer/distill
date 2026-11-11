@@ -433,14 +433,15 @@ impl MvpAgent {
             return None;
         }
         let session_id = id.0.to_string();
-        let (cwd, is_worktree, model_id, reasoning_effort, yolo) = {
+        let (cwd, is_worktree, model_id, reasoning_effort, yolo, auto_mode) = {
             let h = self.resident_handle(id)?;
             (
                 h.display_cwd.clone().unwrap_or_else(|| h.info.cwd.clone()),
                 h.display_cwd.is_some(),
                 Some(h.model_id.0.to_string()),
                 h.reasoning_effort,
-                h.yolo_mode,
+                h.permission_handle.is_yolo_mode(),
+                h.permission_handle.is_auto_mode(),
             )
         };
         let (title, last_turn_summary) = self
@@ -459,6 +460,7 @@ impl MvpAgent {
             model_id,
             reasoning_effort,
             yolo,
+            auto_mode,
             activity: self.resident_activity(id),
             resident: true,
             last_change_unix_ms: chrono::Utc::now().timestamp_millis(),
