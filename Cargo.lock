@@ -3718,15 +3718,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "clap",
  "distill-version",
+ "futures-util",
  "gethostname",
  "reqwest 0.12.24",
+ "ring",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -10232,6 +10239,17 @@ dependencies = [
  "shell-words",
  "winapi",
  "winreg 0.10.1",
+]
+
+[[package]]
+name = "postudio-probe"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "distill-test-support",
+ "libc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

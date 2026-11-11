@@ -110,6 +110,7 @@ members = [
     "third_party/ordered_hashmap",
     # Postudio (plan/research-base/PLAN.md)
     "crates/custom/distill-node",
+    "crates/custom/postudio-probe",
 ]
 
 [workspace.package]

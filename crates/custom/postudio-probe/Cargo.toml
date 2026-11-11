@@ -1,0 +1,17 @@
+[package]
+license = "Apache-2.0"
+name = "postudio-probe"
+version = "0.1.0"
+edition.workspace = true
+description = "Probe tests that drive the real distill leader over raw ACP and record fixtures"
+publish = false
+
+[dependencies]
+base64 = { workspace = true }
+distill-test-support = { workspace = true }
+libc = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
