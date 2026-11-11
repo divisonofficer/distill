@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
+dunce = { workspace = true }
 futures-util = { workspace = true }
 gethostname = { workspace = true }
 reqwest = { workspace = true }
@@ -32,6 +33,7 @@ distill-version = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true
