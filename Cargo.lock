@@ -10248,11 +10248,17 @@ dependencies = [
 name = "postudio-probe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
+ "clap",
+ "distill-node",
  "distill-test-support",
+ "futures-util",
  "libc",
+ "reqwest 0.12.24",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

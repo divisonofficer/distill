@@ -1,6 +1,8 @@
 //! Raw line-delimited JSON-RPC client for `distill agent --leader stdio`, plus a leader harness on the mock model server.
 //! Every line in either direction lands in an ordered log as `{"dir":"c2a"|"a2c","msg":..}`.
 
+pub mod stack;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -343,10 +345,14 @@ impl RawClient {
         let mut answered = 0;
         loop {
             let msg = self
-                .wait_for("prompt response or permission request", Duration::from_secs(60), |m| {
-                    (m.get("method").is_none() && m.get("id") == Some(&json!(prompt_id)))
-                        || method_of(m) == Some("session/request_permission")
-                })
+                .wait_for(
+                    "prompt response or permission request",
+                    Duration::from_secs(60),
+                    |m| {
+                        (m.get("method").is_none() && m.get("id") == Some(&json!(prompt_id)))
+                            || method_of(m) == Some("session/request_permission")
+                    },
+                )
                 .await?;
             if method_of(&msg).is_none() {
                 return Ok((msg, answered));

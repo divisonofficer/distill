@@ -78,8 +78,22 @@ impl Keeper {
     }
 
     pub async fn refresh(&self) -> anyhow::Result<Vec<Value>> {
-        let rows = list(&self.handle()).await?;
-        lock(&self.inner.state).rows = rows.clone();
+        let mut rows = list(&self.handle()).await?;
+        let mut state = lock(&self.inner.state);
+        let pending: Vec<Value> = state
+            .rows
+            .iter()
+            .filter(|r| {
+                let sid = r.get("sessionId").and_then(Value::as_str);
+                state.attached.iter().any(|a| Some(a.as_str()) == sid)
+                    && !rows
+                        .iter()
+                        .any(|n| n.get("sessionId").and_then(Value::as_str) == sid)
+            })
+            .cloned()
+            .collect();
+        rows.extend(pending);
+        state.rows = rows.clone();
         Ok(rows)
     }
 
@@ -116,6 +130,27 @@ impl Keeper {
         load(&self.handle(), session_id, &cwd).await?;
         lock(&self.inner.state).attached.push(session_id.to_owned());
         Ok(())
+    }
+
+    /// Record a session this keeper created with `session/new`: it is already loaded on this
+    /// connection, and the leader lists it only after its first turn, so seed a row with its cwd.
+    pub fn adopt(&self, session_id: &str, cwd: &Path) {
+        let mut state = lock(&self.inner.state);
+        if !state.attached.iter().any(|s| s == session_id) {
+            state.attached.push(session_id.to_owned());
+        }
+        if !state
+            .rows
+            .iter()
+            .any(|r| r.get("sessionId").and_then(Value::as_str) == Some(session_id))
+        {
+            state.rows.push(json!({
+                "sessionId": session_id,
+                "cwd": cwd.to_string_lossy(),
+                "activity": "idle",
+                "resident": true,
+            }));
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BoardEvent> {

@@ -68,10 +68,8 @@ async fn create(State(keeper): State<Keeper>, Json(body): Json<CreateBody>) -> R
         },
         Err(e) => return fail(StatusCode::BAD_GATEWAY, e),
     };
+    keeper.adopt(&session_id, std::path::Path::new(&body.cwd));
     if let Err(e) = keeper.refresh().await {
-        return fail(StatusCode::BAD_GATEWAY, e);
-    }
-    if let Err(e) = keeper.attach(&session_id).await {
         return fail(StatusCode::BAD_GATEWAY, e);
     }
     if let Some(text) = body.prompt.filter(|p| !p.is_empty()) {
