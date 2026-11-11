@@ -28,3 +28,8 @@ rebase할 때 이 목록만 확인하면 되도록 한다.
 - `auto_mode_changed_with_session_id_updates_only_that_session` (auto 켜기 → ask로 끄기 왕복)
 - `yolo_mode_changed_without_session_id_keeps_client_wide_scope` (하위 호환)
 - `extract_mode_changes_ignore_session_scoped_notifications` (leader)
+
+**패치 없는 코드에서의 결과** (2026-11-11, `acp_agent.rs`와 `leader/server.rs`만 `5fcab86e`로 되돌리고 실행):
+- 실패 3개: `yolo_mode_changed_with_session_id_updates_only_that_session`, `auto_mode_changed_with_session_id_updates_only_that_session`, `extract_mode_changes_ignore_session_scoped_notifications`
+- 통과 1개: `yolo_mode_changed_without_session_id_keeps_client_wide_scope`. 기존 동작을 확인하는 테스트라서 패치와 무관하게 통과하는 것이 맞다.
+- 실행 명령: `RUST_MIN_STACK=16777216 cargo test --locked -p distill-shell --lib -- session_id session_scoped`
