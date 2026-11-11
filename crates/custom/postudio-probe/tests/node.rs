@@ -276,3 +276,39 @@ async fn rejects_without_login_and_bad_origin() {
         Ok(_) => panic!("ws with bad origin: upgrade succeeded"),
     }
 }
+
+/// A prompt given at creation runs on the keeper; the permission request must wait for a
+/// client that attaches later, and replay plus live must not duplicate the reply.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the distill binary; set GROK_BINARY"]
+async fn prompt_at_creation_waits_for_late_client() {
+    let stack = stack::start(0, None).await.expect("start stack");
+    let resp = post_json(
+        &stack,
+        "/api/sessions",
+        json!({"cwd": stack.cwd.display().to_string(), "mode": "ask", "prompt": "go"}),
+    )
+    .send()
+    .await
+    .expect("POST /api/sessions");
+    let body: Value = resp.json().await.expect("json");
+    let sid = body["sessionId"].as_str().expect("sessionId").to_owned();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let readme = std::fs::read_to_string(stack.cwd.join("README.md")).expect("read README.md");
+    assert_eq!(readme, "hello", "edit ran before anyone approved");
+    let mut session = Feed::open(&stack, &format!("/ws/session/{sid}")).await;
+    let perm = session
+        .until("permission.request", |f| is_type(f, "permission.request"))
+        .await;
+    session
+        .send(json!({"t": "permission", "id": perm["id"], "option_id": "allow-once"}))
+        .await;
+    session.until("turn.end", |f| is_type(f, "turn.end")).await;
+    let text = deltas(&session.log);
+    assert_eq!(
+        text.matches("README 수정 완료.").count(),
+        1,
+        "deltas {text:?}"
+    );
+    session.close().await;
+}
