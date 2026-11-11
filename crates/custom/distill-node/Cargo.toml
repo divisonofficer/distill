@@ -28,6 +28,7 @@ tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "sig
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 url = { workspace = true }
+urlencoding = { workspace = true }
 distill-version = { workspace = true }
 
 [dev-dependencies]

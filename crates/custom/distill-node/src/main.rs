@@ -1,22 +1,48 @@
+use std::path::PathBuf;
+
+use anyhow::Context as _;
 use clap::Parser;
-use distill_node::NodeConfig;
+use distill_node::agent::AgentConfig;
+use distill_node::listen::{self, ListenAddr};
+use distill_node::{NodeConfig, run};
 
 /// Postudio node: per-host gateway in front of the local Distill agent.
 #[derive(Debug, Parser)]
 #[command(name = "postudio-node", version = distill_version::VERSION)]
-struct Args {
-    /// Listen address. Keep it on loopback; `tailscale serve` exposes it over HTTPS.
-    #[arg(long, default_value = "127.0.0.1:7410")]
-    bind: std::net::SocketAddr,
-    /// Tailscale login allowed to use the API (e.g. you@github). Required unless --insecure-no-owner.
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Run the node until a listener fails.
+    Serve(Serve),
+}
+
+#[derive(Debug, clap::Args)]
+struct Serve {
+    /// Tailscale login allowed to use the API (e.g. me@example.com).
     #[arg(long, env = "POSTUDIO_OWNER")]
-    owner: Option<String>,
-    /// Skip the owner check. Local development only.
-    #[arg(long, conflicts_with = "owner")]
-    insecure_no_owner: bool,
-    /// Local Distill agent WebSocket URL (`distill agent serve`).
-    #[arg(long, default_value = "ws://127.0.0.1:2419/ws")]
-    agent_url: String,
+    owner: String,
+    /// Trusted listener: `unix:<path>` or `tcp:<loopback addr:port>`.
+    #[arg(long)]
+    listen: Option<ListenAddr>,
+    /// Untrusted listener: `unix:<path>` or `tcp:<loopback addr:port>`.
+    #[arg(long)]
+    untrusted_listen: Option<ListenAddr>,
+    /// Origin allowed for `/api` and `/ws` (repeat for several).
+    #[arg(long = "allow-origin", value_name = "ORIGIN")]
+    allow_origin: Vec<String>,
+    /// Local Distill binary (`distill agent --leader stdio`).
+    #[arg(long, default_value = "distill")]
+    distill_bin: PathBuf,
+    /// State directory for keys, subscriptions and sockets. Default: `$HOME/.distill/postudio`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+    /// Directory with the built web app, served with SPA fallback.
+    #[arg(long)]
+    web_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -27,19 +53,27 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let args = Args::parse();
-    if args.owner.is_none() && !args.insecure_no_owner {
-        anyhow::bail!(
-            "--owner <tailscale login> is required (or --insecure-no-owner for local dev)"
-        );
-    }
-    let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    let config = NodeConfig {
-        owner_login: args.owner,
-        agent_url: args.agent_url,
+    let Command::Serve(args) = Cli::parse().command;
+    let state_dir = match args.state_dir {
+        Some(dir) => dir,
+        None => {
+            let home = std::env::var_os("HOME").context("HOME is not set; pass --state-dir")?;
+            PathBuf::from(home).join(".distill/postudio")
+        }
     };
-    distill_node::serve(listener, config, async {
-        let _ = tokio::signal::ctrl_c().await;
+    run(NodeConfig {
+        owner: args.owner,
+        listen: args.listen.unwrap_or_else(listen::default_trusted),
+        untrusted_listen: args
+            .untrusted_listen
+            .unwrap_or_else(listen::default_untrusted),
+        allowed_origins: args.allow_origin,
+        agent: AgentConfig {
+            distill_bin: args.distill_bin,
+            ..AgentConfig::default()
+        },
+        state_dir,
+        web_dir: args.web_dir,
     })
     .await
 }

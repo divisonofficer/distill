@@ -1,185 +1,206 @@
 //! Postudio node — per-host gateway (plan/research-base/PLAN.md §4).
 //!
-//! WP1 skeleton: health, host info, and the owner check that every `/api` route
-//! sits behind. `tailscale serve` terminates HTTPS in front of this server and
-//! adds `Tailscale-User-Login`; the node itself only binds loopback.
-//! The ACP multiplexer (WP2) and the web app (WP3) build on this router.
+//! Trusted listener: web app, session list, board and session WebSockets, Web Push,
+//! all behind the owner/Origin guard. Untrusted listener: session file and port proxy.
 
 pub mod agent;
+pub mod board;
 pub mod guard;
 pub mod keeper;
 pub mod listen;
 pub mod push;
 pub mod reduce;
 pub mod sep;
+pub mod session;
 pub mod untrusted;
 
-use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::Router;
+use axum::extract::Request;
+use axum::http::{Method, StatusCode, header};
+use axum::middleware;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
-use axum::{Json, Router};
 use serde::Serialize;
+use serde_json::json;
+
+use agent::AgentConfig;
+use guard::GuardConfig;
+use keeper::Keeper;
+use listen::ListenAddr;
+use push::Push;
 
 /// Header `tailscale serve` sets to the requesting user's login for tailnet traffic.
 pub const TAILSCALE_USER_LOGIN: &str = "Tailscale-User-Login";
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
-    /// Tailscale login allowed to use `/api`. `None` disables the check (local development only).
-    pub owner_login: Option<String>,
-    /// Local Distill agent (`distill agent serve`) WebSocket URL.
-    pub agent_url: String,
+    pub owner: String,
+    pub listen: ListenAddr,
+    pub untrusted_listen: ListenAddr,
+    pub allowed_origins: Vec<String>,
+    pub agent: AgentConfig,
+    pub state_dir: PathBuf,
+    pub web_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct NodeInfo {
-    pub hostname: String,
-    pub os: &'static str,
-    pub arch: &'static str,
+    pub host: String,
     pub version: &'static str,
-    pub agent_url: String,
 }
 
-impl NodeInfo {
-    fn current(config: &NodeConfig) -> Self {
-        Self {
-            hostname: gethostname::gethostname().to_string_lossy().into_owned(),
-            os: std::env::consts::OS,
-            arch: std::env::consts::ARCH,
-            version: distill_version::VERSION,
-            agent_url: config.agent_url.clone(),
-        }
-    }
-}
+/// Start the keeper and push sender, then serve both listeners until one fails.
+pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
+    let keeper = Keeper::start(cfg.agent.clone()).await?;
+    let push = Arc::new(Push::load_or_create(&cfg.state_dir)?);
+    tokio::spawn(notify_needs_input(keeper.clone(), push.clone()));
 
-pub fn router(config: NodeConfig) -> Router {
-    let config = Arc::new(config);
-    let api = Router::new()
-        .route("/api/node", get(node_info))
-        .route_layer(middleware::from_fn_with_state(
-            config.clone(),
-            require_owner,
-        ));
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .merge(api)
-        .with_state(config)
-}
-
-async fn node_info(State(config): State<Arc<NodeConfig>>) -> Json<NodeInfo> {
-    Json(NodeInfo::current(&config))
-}
-
-/// Reject `/api` requests whose Tailscale identity is not the configured owner.
-/// A missing header means the request did not come through `tailscale serve`.
-async fn require_owner(
-    State(config): State<Arc<NodeConfig>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let Some(owner) = config.owner_login.as_deref() else {
-        return next.run(request).await;
+    let guard = Arc::new(GuardConfig {
+        owner: cfg.owner.clone(),
+        allowed_origins: cfg.allowed_origins.clone(),
+    });
+    let trusted = trusted_router(
+        keeper.clone(),
+        push,
+        cfg.agent.clone(),
+        guard,
+        cfg.web_dir.clone(),
+    );
+    let resolver: untrusted::CwdResolver = {
+        let keeper = keeper.clone();
+        Arc::new(move |sid: &str| keeper.cwd_of(sid))
     };
-    let login = request
-        .headers()
-        .get(TAILSCALE_USER_LOGIN)
-        .and_then(|v| v.to_str().ok());
-    if login == Some(owner) {
-        next.run(request).await
-    } else {
-        tracing::warn!(?login, "rejected /api request: not the node owner");
-        (StatusCode::FORBIDDEN, "not the node owner").into_response()
-    }
-}
-
-/// Serve until the listener fails or `shutdown` resolves.
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    config: NodeConfig,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> anyhow::Result<()> {
-    let addr: SocketAddr = listener.local_addr()?;
-    tracing::info!(%addr, "postudio node listening");
-    axum::serve(listener, router(config))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    tokio::try_join!(
+        listen::serve(cfg.listen, trusted),
+        listen::serve(cfg.untrusted_listen, untrusted::routes(resolver)),
+    )?;
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn spawn(config: NodeConfig) -> (String, tokio::sync::oneshot::Sender<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(serve(listener, config, async {
-            let _ = rx.await;
-        }));
-        (base, tx)
+async fn notify_needs_input(keeper: Keeper, push: Arc<Push>) {
+    let mut needs = keeper.needs_input();
+    loop {
+        let event = match needs.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let row = keeper
+            .rows()
+            .into_iter()
+            .find(|r| r.get("sessionId").and_then(|v| v.as_str()) == Some(&event.session_id));
+        let title = row
+            .as_ref()
+            .and_then(|r| r.get("title").and_then(|v| v.as_str()))
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                keeper
+                    .cwd_of(&event.session_id)?
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| event.session_id.clone());
+        let payload = json!({
+            "title": format!("{title} 승인 대기"),
+            "body": event.kind,
+            "url": format!("/s/{}", event.session_id),
+            "tag": event.session_id,
+        });
+        push.notify_all(&payload).await;
     }
+}
 
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "localhost-only test client against the node bound on 127.0.0.1"
-    )]
-    fn local_client() -> reqwest::Client {
-        reqwest::Client::new()
+/// Trusted listener. `/healthz` and the static web app are unguarded; `/api` and `/ws` are guarded.
+pub fn trusted_router(
+    keeper: Keeper,
+    push: Arc<Push>,
+    agent: AgentConfig,
+    guard: Arc<GuardConfig>,
+    web_dir: Option<PathBuf>,
+) -> Router {
+    let guarded = Router::new()
+        .route("/api/node", get(node_info))
+        .merge(board::routes(keeper.clone()))
+        .merge(session::routes(agent, keeper))
+        .merge(push.routes())
+        .layer(middleware::from_fn_with_state(guard, guard::guard));
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(guarded)
+        .fallback(move |req: Request| {
+            let web_dir = web_dir.clone();
+            async move { serve_web(web_dir.as_deref(), req).await }
+        })
+}
+
+async fn node_info() -> Json<NodeInfo> {
+    Json(NodeInfo {
+        host: gethostname::gethostname().to_string_lossy().into_owned(),
+        version: distill_version::VERSION,
+    })
+}
+
+/// GET only. Existing files under `root` are served; any other path gets `index.html` (SPA).
+async fn serve_web(root: Option<&Path>, req: Request) -> Response {
+    let not_found = || StatusCode::NOT_FOUND.into_response();
+    let Some(root) = root else {
+        return not_found();
+    };
+    if req.method() != Method::GET {
+        return not_found();
     }
-
-    fn config(owner: Option<&str>) -> NodeConfig {
-        NodeConfig {
-            owner_login: owner.map(str::to_owned),
-            agent_url: "ws://127.0.0.1:2419/ws".to_owned(),
-        }
+    let path = req.uri().path();
+    if ["/api", "/ws"]
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    {
+        return not_found();
     }
-
-    #[tokio::test]
-    async fn healthz_needs_no_identity() {
-        let (base, _stop) = spawn(config(Some("me@example.com"))).await;
-        let res = local_client()
-            .get(format!("{base}/healthz"))
-            .send()
+    let Ok(decoded) = urlencoding::decode(path) else {
+        return not_found();
+    };
+    let rel = Path::new(decoded.trim_start_matches('/'));
+    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return not_found();
+    }
+    match static_file(root, rel).await {
+        Some(res) => res,
+        None => static_file(root, Path::new("index.html"))
             .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        assert_eq!(res.text().await.unwrap(), "ok");
+            .unwrap_or_else(not_found),
     }
+}
 
-    #[tokio::test]
-    async fn api_rejects_missing_or_foreign_identity() {
-        let (base, _stop) = spawn(config(Some("me@example.com"))).await;
-        let client = local_client();
-        let missing = client.get(format!("{base}/api/node")).send().await.unwrap();
-        assert_eq!(missing.status(), 403);
-        let foreign = client
-            .get(format!("{base}/api/node"))
-            .header(TAILSCALE_USER_LOGIN, "someone@else.com")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(foreign.status(), 403);
+/// `rel` under `root` as a regular file; symlinks that leave `root` are refused.
+async fn static_file(root: &Path, rel: &Path) -> Option<Response> {
+    let root = dunce::canonicalize(root).ok()?;
+    let file = dunce::canonicalize(root.join(rel)).ok()?;
+    if !file.starts_with(&root) || !tokio::fs::metadata(&file).await.ok()?.is_file() {
+        return None;
     }
+    let bytes = tokio::fs::read(&file).await.ok()?;
+    Some(([(header::CONTENT_TYPE, content_type(&file))], bytes).into_response())
+}
 
-    #[tokio::test]
-    async fn api_node_reports_host_for_owner() {
-        let (base, _stop) = spawn(config(Some("me@example.com"))).await;
-        let res = local_client()
-            .get(format!("{base}/api/node"))
-            .header(TAILSCALE_USER_LOGIN, "me@example.com")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let body: serde_json::Value = res.json().await.unwrap();
-        assert_eq!(body["os"], std::env::consts::OS);
-        assert_eq!(body["agent_url"], "ws://127.0.0.1:2419/ws");
-        assert!(!body["hostname"].as_str().unwrap_or_default().is_empty());
+fn content_type(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("json") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
