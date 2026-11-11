@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use distill_node::reduce::Reducer;
-use distill_node::sep::Sep;
-use serde_json::Value;
+use distill_node::sep::{Sep, Status, ToolContent};
+use serde_json::{Value, json};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -69,4 +69,193 @@ fn acp_fixtures_match_sep_expectations() {
         count += 1;
     }
     assert_eq!(count, 7);
+}
+
+#[test]
+fn replayed_tool_call_keeps_status_kind_and_output() {
+    let mut reducer = Reducer::new("s1".into());
+    let events = reducer.on_agent(&json!({
+        "method": "session/update",
+        "params": {
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c1",
+                "title": "Read file",
+                "kind": "read",
+                "status": "Completed",
+                "rawInput": {"path": "file.txt"},
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": "file output"}
+                }]
+            }
+        }
+    }));
+    assert_eq!(
+        events,
+        vec![Sep::Tool {
+            id: "c1".into(),
+            name: None,
+            title: Some("Read file".into()),
+            kind: Some("read".into()),
+            status: Some("completed".into()),
+            input: Some(json!({"path": "file.txt"})),
+            content: Some(vec![ToolContent::Text {
+                text: "file output".into()
+            }]),
+        }]
+    );
+}
+
+#[test]
+fn outgoing_prompt_emits_user_message_and_suppresses_echo() {
+    let mut reducer = Reducer::new("s1".into());
+    let prompt = json!({
+        "id": 1,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "hello "},
+                {"type": "image", "data": "ignored"},
+                {"type": "text", "text": "world"}
+            ]
+        }
+    });
+    assert_eq!(
+        reducer.on_client(&prompt),
+        vec![
+            Sep::SessionState {
+                status: Status::Running
+            },
+            Sep::UserMessage {
+                text: "hello world".into()
+            }
+        ]
+    );
+
+    let echo = json!({
+        "method": "session/update",
+        "params": {
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "hello world"}
+            }
+        }
+    });
+    assert!(reducer.on_agent(&echo).is_empty());
+}
+
+#[test]
+fn same_prompt_text_in_distinct_turns_emits_once_per_turn() {
+    let mut reducer = Reducer::new("s1".into());
+    for id in [1, 2] {
+        let prompt = json!({
+            "id": id,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "s1",
+                "prompt": [{"type": "text", "text": "repeat"}]
+            }
+        });
+        assert_eq!(
+            reducer.on_client(&prompt),
+            vec![
+                Sep::SessionState {
+                    status: Status::Running
+                },
+                Sep::UserMessage {
+                    text: "repeat".into()
+                }
+            ]
+        );
+        let echo = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "repeat"}
+                }
+            }
+        });
+        assert!(reducer.on_agent(&echo).is_empty());
+        let completed = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {"sessionUpdate": "turn_completed", "stop_reason": "end_turn"}
+            }
+        });
+        assert_eq!(
+            reducer.on_agent(&completed),
+            vec![
+                Sep::TurnEnd {
+                    stop_reason: "end_turn".into(),
+                    error: None
+                },
+                Sep::SessionState {
+                    status: Status::Idle
+                }
+            ]
+        );
+    }
+}
+
+#[test]
+fn foreign_session_prompt_and_echo_are_filtered() {
+    let mut reducer = Reducer::new("s1".into());
+    let foreign_prompt = json!({
+        "id": 1,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s2",
+            "prompt": [{"type": "text", "text": "local"}]
+        }
+    });
+    assert!(reducer.on_client(&foreign_prompt).is_empty());
+
+    let prompt = json!({
+        "id": 2,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [{"type": "text", "text": "local"}]
+        }
+    });
+    assert_eq!(
+        reducer.on_client(&prompt),
+        vec![
+            Sep::SessionState {
+                status: Status::Running
+            },
+            Sep::UserMessage {
+                text: "local".into()
+            }
+        ]
+    );
+    let foreign_echo = json!({
+        "method": "session/update",
+        "params": {
+            "sessionId": "s2",
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "local"}
+            }
+        }
+    });
+    assert!(reducer.on_agent(&foreign_echo).is_empty());
+    let own_echo = json!({
+        "method": "session/update",
+        "params": {
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "local"}
+            }
+        }
+    });
+    assert!(reducer.on_agent(&own_echo).is_empty());
 }

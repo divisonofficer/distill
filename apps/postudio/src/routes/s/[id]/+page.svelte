@@ -4,24 +4,41 @@ import { page } from '$app/state';
 import { connect, type Socket } from '$lib/api';
 import Badge from '$lib/components/Badge.svelte';
 import Icon from '$lib/components/Icon.svelte';
+import InteractionCard from '$lib/components/InteractionCard.svelte';
 import Markdown from '$lib/components/Markdown.svelte';
 import ToolRow from '$lib/components/ToolRow.svelte';
 import { board } from '$lib/board.svelte';
+import { modeFromRow } from '$lib/types';
 import { MODES, MODE_LABEL } from '$lib/prefs';
 import { sessionTitle, statusBadge } from '$lib/format';
 import { SessionView } from '$lib/session.svelte';
 import { ui } from '$lib/ui.svelte';
-import type { ClientMsg, Mode, Sep } from '$lib/types';
+import type { ClientMsg, InteractionRequest, Mode, Sep } from '$lib/types';
 
 const id = $derived(page.params.id ?? '');
 const view = new SessionView();
+let interactions = $state<InteractionRequest[]>([]);
 const row = $derived(board.find(id));
 const title = $derived(view.title || (row ? sessionTitle(row) : id));
 const badge = $derived(statusBadge(view.status));
 
-// Mode chosen by tap, scoped to the session it was chosen for; never sent unless tapped.
-let override = $state<{ id: string; mode: Mode } | null>(null);
-const mode = $derived<Mode>(override?.id === id ? override.mode : row?.yolo ? 'always-approve' : 'ask');
+const mode = $derived<Mode | undefined>(modeFromRow(row));
+const modeLabel = $derived(mode === undefined ? '확인 중' : MODE_LABEL[mode]);
+let modePending = $state<{ id: string; mode: Mode } | null>(null);
+let modeError = $state<{ id: string; message: string } | null>(null);
+let modeTimer: ReturnType<typeof setTimeout> | undefined;
+let modeRequest = 0;
+
+$effect(() => {
+const pending = modePending;
+if (pending?.id === id && modeFromRow(row) === pending.mode) {
+modeRequest++;
+if (modeTimer !== undefined) clearTimeout(modeTimer);
+modeTimer = undefined;
+modePending = null;
+modeError = null;
+}
+});
 
 // One socket per session view: the effect closes the previous socket before opening the next.
 // Each open resets the transcript so replayed events never stack on old ones.
@@ -29,11 +46,18 @@ let sock: Socket | undefined;
 $effect(() => {
 const s = connect<Sep>(`/ws/session/${id}`, {
 onOpen: () => {
+interactions = [];
 view.reset();
 view.setConnected(true);
 },
-onClose: () => view.setConnected(false),
-onMessage: (m) => view.apply(m)
+onClose: () => {
+interactions = [];
+view.setConnected(false);
+},
+onMessage: (m) => {
+view.apply(m);
+applyInteraction(m);
+}
 });
 sock = s;
 return () => {
@@ -42,13 +66,30 @@ if (sock === s) sock = undefined;
 };
 });
 
-function send(msg: ClientMsg) {
-sock?.send(msg);
+function send(msg: ClientMsg): boolean {
+return sock?.send(msg) ?? false;
+}
+
+function applyInteraction(ev: Sep) {
+if (ev.t === 'question.request' || ev.t === 'plan.request') {
+if (!interactions.some((request) => request.id === ev.id)) interactions.push(ev);
+} else if (ev.t === 'permission.resolved') {
+interactions = interactions.filter((request) => request.tool_call_id !== ev.tool_call_id);
+} else if (ev.t === 'turn.end' || (ev.t === 'session.state' && ev.status === 'error')) {
+interactions = [];
+}
+}
+
+function replyInteraction(request: InteractionRequest, msg: ClientMsg): boolean {
+if (!send(msg)) return false;
+// Keep the card until the agent confirms resolution; validation errors remain retryable.
+return true;
 }
 
 let text = $state('');
 let images = $state<{ key: number; mime: string; data: string; url: string }[]>([]);
 let imageSeq = 0;
+let sendError = $state('');
 let scroller = $state<HTMLElement>();
 let composer = $state<HTMLTextAreaElement>();
 
@@ -68,11 +109,15 @@ composer.style.height = `${Math.min(composer.scrollHeight, 240)}px`;
 function submit(e: SubmitEvent) {
 e.preventDefault();
 if (!canSend) return;
-send({
+if (!send({
 t: 'prompt',
 text: text.trim(),
 images: images.map(({ mime, data }) => ({ mime, data }))
-});
+})) {
+sendError = '메시지를 보내지 못했습니다. 연결을 확인한 뒤 다시 시도해주세요.';
+return;
+}
+sendError = '';
 text = '';
 images = [];
 grow();
@@ -107,10 +152,24 @@ input.value = '';
 }
 
 function cycleMode() {
+if (!view.connected || mode === undefined || modePending?.id === id) return;
 const next = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
 if (next === 'always-approve' && !confirm('모든 작업을 승인 없이 실행합니다. 계속할까요?')) return;
-override = { id, mode: next };
-send({ t: 'mode', mode: next });
+if (!send({ t: 'mode', mode: next })) {
+modeError = { id, message: '권한 모드를 변경하지 못했습니다. 다시 시도해주세요.' };
+return;
+}
+modeError = null;
+modePending = { id, mode: next };
+const request = ++modeRequest;
+if (modeTimer !== undefined) clearTimeout(modeTimer);
+modeTimer = setTimeout(() => {
+if (modeRequest === request && modePending?.id === id && modePending.mode === next) {
+modePending = null;
+modeError = { id, message: '권한 모드 변경을 확인하지 못했습니다. 다시 시도해주세요.' };
+}
+modeTimer = undefined;
+}, 5000);
 }
 
 function optionLabel(kind: string, name: string): string {
@@ -210,6 +269,9 @@ style:width="{Math.min(100, (view.usage.used / Math.max(1, view.usage.size)) * 1
 </div>
 
 <div class="mx-auto flex w-full max-w-3xl flex-col gap-2 px-4 pb-4">
+{#each interactions as request (request.id)}
+<InteractionCard {request} connected={view.connected} reply={(msg) => replyInteraction(request, msg)} />
+{/each}
 {#each view.permissions as p (p.toolCallId)}
 <div class="rounded-2xl border border-amber-400 bg-amber-50 p-4 shadow-lg dark:border-amber-600 dark:bg-amber-950">
 <p class="mb-3 flex items-start gap-2 text-sm font-medium">
@@ -220,7 +282,8 @@ style:width="{Math.min(100, (view.usage.used / Math.max(1, view.usage.size)) * 1
 {#each p.options as opt (opt.id)}
 <button
 type="button"
-class="min-h-10 flex-1 rounded-xl border border-neutral-300 bg-white px-4 text-sm font-medium hover:bg-neutral-100 dark:border-neutral-600 dark:bg-neutral-900 dark:hover:bg-neutral-800"
+disabled={!view.connected}
+class="min-h-10 flex-1 rounded-xl border border-neutral-300 bg-white px-4 text-sm font-medium hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-600 dark:bg-neutral-900 dark:hover:bg-neutral-800"
 onclick={() => send({ t: 'permission', id: p.id, option_id: opt.id })}
 >
 {optionLabel(opt.kind, opt.name)}
@@ -230,6 +293,7 @@ onclick={() => send({ t: 'permission', id: p.id, option_id: opt.id })}
 </div>
 {/each}
 
+{#if modeError?.id === id}<p role="alert" class="text-sm text-red-600">{modeError.message}</p>{/if}
 <form
 class="flex flex-col gap-2 rounded-3xl border border-neutral-200 bg-white p-2 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"
 onsubmit={submit}
@@ -262,6 +326,9 @@ rows="1"
 placeholder="무엇을 도와드릴까요?"
 class="max-h-60 min-h-10 w-full resize-none bg-transparent px-2 py-1.5 text-[15px] leading-6 outline-none placeholder:text-neutral-400"
 ></textarea>
+{#if sendError}
+<p role="alert" class="px-2 text-sm text-red-700 dark:text-red-300">{sendError}</p>
+{/if}
 <div class="flex items-center gap-1">
 <label class="flex size-10 cursor-pointer items-center justify-center rounded-xl hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 첨부">
 <Icon name="image" />
@@ -270,11 +337,12 @@ class="max-h-60 min-h-10 w-full resize-none bg-transparent px-2 py-1.5 text-[15p
 </label>
 <button
 type="button"
-class="min-h-10 rounded-xl px-3 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800"
-aria-label="권한 모드: {MODE_LABEL[mode]}. 눌러서 변경"
+disabled={!view.connected || mode === undefined || modePending?.id === id}
+class="min-h-10 rounded-xl px-3 text-sm hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800"
+aria-label="권한 모드: {modeLabel}. 눌러서 변경"
 onclick={cycleMode}
 >
-{MODE_LABEL[mode]}
+{modeLabel}
 </button>
 {#if view.running}
 <button

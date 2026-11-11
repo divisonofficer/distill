@@ -49,11 +49,8 @@ async fn create(State(keeper): State<Keeper>, Json(body): Json<CreateBody>) -> R
             "cwd must be an absolute existing directory",
         );
     }
-    let meta = match body.mode {
-        Some(PermissionMode::AlwaysApprove) => json!({"yoloMode": true}),
-        Some(PermissionMode::Auto) => json!({"autoMode": true}),
-        Some(PermissionMode::Ask) | None => json!({}),
-    };
+    let mode = body.mode.unwrap_or(PermissionMode::Ask);
+    let meta = mode_meta(mode);
     let created = keeper
         .handle()
         .request(
@@ -68,7 +65,7 @@ async fn create(State(keeper): State<Keeper>, Json(body): Json<CreateBody>) -> R
         },
         Err(e) => return fail(StatusCode::BAD_GATEWAY, e),
     };
-    keeper.adopt(&session_id, std::path::Path::new(&body.cwd));
+    keeper.adopt(&session_id, std::path::Path::new(&body.cwd), mode);
     if let Err(e) = keeper.refresh().await {
         return fail(StatusCode::BAD_GATEWAY, e);
     }
@@ -85,6 +82,14 @@ async fn create(State(keeper): State<Keeper>, Json(body): Json<CreateBody>) -> R
         });
     }
     Json(json!({"sessionId": session_id})).into_response()
+}
+
+fn mode_meta(mode: PermissionMode) -> Value {
+    match mode {
+        PermissionMode::Ask => json!({"yoloMode": false, "autoMode": false}),
+        PermissionMode::Auto => json!({"yoloMode": false, "autoMode": true}),
+        PermissionMode::AlwaysApprove => json!({"yoloMode": true, "autoMode": false}),
+    }
 }
 
 async fn is_existing_dir(cwd: &str) -> bool {
@@ -138,4 +143,25 @@ async fn send(socket: &mut WebSocket, frame: &Value) -> bool {
         .send(Message::Text(frame.to_string().into()))
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_session_mode_metadata_is_explicit() {
+        assert_eq!(
+            mode_meta(PermissionMode::Ask),
+            json!({"yoloMode": false, "autoMode": false})
+        );
+        assert_eq!(
+            mode_meta(PermissionMode::Auto),
+            json!({"yoloMode": false, "autoMode": true})
+        );
+        assert_eq!(
+            mode_meta(PermissionMode::AlwaysApprove),
+            json!({"yoloMode": true, "autoMode": false})
+        );
+    }
 }

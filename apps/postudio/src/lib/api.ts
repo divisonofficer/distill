@@ -4,9 +4,14 @@ import type { ClientMsg } from './types';
 // dynamic import and mock.ts are dropped from production builds.
 const mock = import.meta.env.VITE_MOCK ? await import('./mock') : null;
 
+// The mock transport retains a void send; connect normalizes sends to boolean.
 export interface Socket {
-	send(msg: ClientMsg): void;
+	send(msg: ClientMsg): boolean | void;
 	close(): void;
+}
+
+export interface ConnectedSocket extends Socket {
+	send(msg: ClientMsg): boolean;
 }
 
 export interface SocketHandlers<M> {
@@ -29,14 +34,44 @@ export async function postJson<T>(path: string, body: unknown): Promise<T> {
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(body)
 	});
-	if (!res.ok) throw new Error(`${path}: ${res.status}`);
+	if (!res.ok) {
+		const text = await res.text();
+		let detail = text;
+		try {
+			const body: unknown = JSON.parse(text);
+			if (body && typeof body === 'object') {
+				const data = body as Record<string, unknown>;
+				if (typeof data.error === 'string') detail = data.error;
+				else if (typeof data.message === 'string') detail = data.message;
+			}
+		} catch {
+			// Keep plain-text error responses useful.
+		}
+		detail = detail.trim().slice(0, 500);
+		throw new Error(`${path}: ${res.status}${detail ? ` ${detail}` : ''}`);
+	}
 	const text = await res.text();
 	return (text ? JSON.parse(text) : undefined) as T;
 }
 
 /** WebSocket with reconnect (1 s doubling to 10 s). `onOpen` runs on every (re)connect. */
-export function connect<M>(path: string, h: SocketHandlers<M>): Socket {
-	if (mock) return mock.mockSocket<M>(path, h);
+export function connect<M>(path: string, h: SocketHandlers<M>): ConnectedSocket {
+	if (mock) {
+		const socket = mock.mockSocket<M>(path, h);
+		let closed = false;
+		return {
+			send(msg) {
+				if (closed) return false;
+				socket.send(msg);
+				return true;
+			},
+			close() {
+				if (closed) return;
+				closed = true;
+				socket.close();
+			}
+		};
+	}
 
 	const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
 	let ws: WebSocket | null = null;
@@ -75,7 +110,13 @@ export function connect<M>(path: string, h: SocketHandlers<M>): Socket {
 	return {
 		send(msg) {
 			const cur = ws;
-			if (cur?.readyState === WebSocket.OPEN) cur.send(JSON.stringify(msg));
+			if (cur?.readyState !== WebSocket.OPEN) return false;
+			try {
+				cur.send(JSON.stringify(msg));
+				return true;
+			} catch {
+				return false;
+			}
 		},
 		close() {
 			closed = true;

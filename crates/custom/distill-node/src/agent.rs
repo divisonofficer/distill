@@ -195,6 +195,10 @@ impl AgentHandle {
         self.send(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }
 
+    pub fn respond_error(&self, id: Value, code: i64, message: &str) -> anyhow::Result<()> {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}))
+    }
+
     /// `initialize` then `authenticate`, same params as `RawClient::initialize` in postudio-probe.
     pub async fn initialize(&self) -> anyhow::Result<Value> {
         let init = self

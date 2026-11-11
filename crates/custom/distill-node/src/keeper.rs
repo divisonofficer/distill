@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::agent::{self, AgentConfig, AgentHandle, lock};
+use crate::sep::PermissionMode;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_CAPACITY: usize = 256;
 static NULL: Value = Value::Null;
 
@@ -78,23 +80,8 @@ impl Keeper {
     }
 
     pub async fn refresh(&self) -> anyhow::Result<Vec<Value>> {
-        let mut rows = list(&self.handle()).await?;
-        let mut state = lock(&self.inner.state);
-        let pending: Vec<Value> = state
-            .rows
-            .iter()
-            .filter(|r| {
-                let sid = r.get("sessionId").and_then(Value::as_str);
-                state.attached.iter().any(|a| Some(a.as_str()) == sid)
-                    && !rows
-                        .iter()
-                        .any(|n| n.get("sessionId").and_then(Value::as_str) == sid)
-            })
-            .cloned()
-            .collect();
-        rows.extend(pending);
-        state.rows = rows.clone();
-        Ok(rows)
+        self.inner.refresh().await?;
+        Ok(self.rows())
     }
 
     pub fn rows(&self) -> Vec<Value> {
@@ -134,23 +121,37 @@ impl Keeper {
 
     /// Record a session this keeper created with `session/new`: it is already loaded on this
     /// connection, and the leader lists it only after its first turn, so seed a row with its cwd.
-    pub fn adopt(&self, session_id: &str, cwd: &Path) {
+    pub fn adopt(&self, session_id: &str, cwd: &Path, mode: PermissionMode) {
         let mut state = lock(&self.inner.state);
         if !state.attached.iter().any(|s| s == session_id) {
             state.attached.push(session_id.to_owned());
         }
-        if !state
+        let (yolo, auto_mode) = mode_flags(mode);
+        let row = match state
             .rows
-            .iter()
-            .any(|r| r.get("sessionId").and_then(Value::as_str) == Some(session_id))
+            .iter_mut()
+            .find(|r| r.get("sessionId").and_then(Value::as_str) == Some(session_id))
         {
-            state.rows.push(json!({
-                "sessionId": session_id,
-                "cwd": cwd.to_string_lossy(),
-                "activity": "idle",
-                "resident": true,
-            }));
-        }
+            Some(row) => {
+                row["yolo"] = json!(yolo);
+                row["autoMode"] = json!(auto_mode);
+                row.clone()
+            }
+            None => {
+                let row = json!({
+                    "sessionId": session_id,
+                    "cwd": cwd.to_string_lossy(),
+                    "activity": "idle",
+                    "resident": true,
+                    "yolo": yolo,
+                    "autoMode": auto_mode,
+                });
+                state.rows.push(row.clone());
+                row
+            }
+        };
+        drop(state);
+        let _ = self.inner.board.send(BoardEvent::Upsert(vec![row]));
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BoardEvent> {
@@ -163,12 +164,33 @@ impl Keeper {
 }
 
 impl Inner {
+    async fn refresh(&self) -> anyhow::Result<()> {
+        let handle = lock(&self.conn).clone();
+        let rows = list(&handle).await?;
+        self.replace_rows(rows);
+        Ok(())
+    }
+
+    fn replace_rows(&self, rows: Vec<Value>) {
+        let (upserted, removed) = {
+            let mut state = lock(&self.state);
+            replace_rows(&mut state, rows)
+        };
+        if !upserted.is_empty() {
+            let _ = self.board.send(BoardEvent::Upsert(upserted));
+        }
+        if !removed.is_empty() {
+            let _ = self.board.send(BoardEvent::Remove(removed));
+        }
+    }
+
     /// Spawn a new child and restore state on it. Commits the new connection only on success.
     async fn connect(&self) -> anyhow::Result<mpsc::UnboundedReceiver<Value>> {
         let (handle, rx) = agent::spawn(&self.cfg).await?;
         handle.initialize().await?;
         let rows = list(&handle).await?;
-        lock(&self.state).rows = rows.clone();
+        self.replace_rows(rows);
+        let rows = lock(&self.state).rows.clone();
         let attached = lock(&self.state).attached.clone();
         for sid in attached {
             let cwd = rows.iter().find_map(|r| {
@@ -291,14 +313,83 @@ impl Inner {
     }
 }
 
+fn replace_rows(state: &mut State, mut rows: Vec<Value>) -> (Vec<Value>, Vec<String>) {
+    let pending: Vec<Value> = state
+        .rows
+        .iter()
+        .filter(|row| {
+            let sid = row.get("sessionId").and_then(Value::as_str);
+            state
+                .attached
+                .iter()
+                .any(|attached| Some(attached.as_str()) == sid)
+                && !rows
+                    .iter()
+                    .any(|new| new.get("sessionId").and_then(Value::as_str) == sid)
+        })
+        .cloned()
+        .collect();
+    rows.extend(pending);
+
+    let upserted = rows
+        .iter()
+        .filter(|row| {
+            !state
+                .rows
+                .iter()
+                .any(|old| old.get("sessionId") == row.get("sessionId") && old == *row)
+        })
+        .cloned()
+        .collect();
+    let removed = state
+        .rows
+        .iter()
+        .filter_map(|row| row.get("sessionId").and_then(Value::as_str))
+        .filter(|sid| {
+            !rows
+                .iter()
+                .any(|row| row.get("sessionId").and_then(Value::as_str) == Some(*sid))
+        })
+        .map(str::to_owned)
+        .collect();
+    state.rows = rows;
+    (upserted, removed)
+}
+
+fn mode_flags(mode: PermissionMode) -> (bool, bool) {
+    match mode {
+        PermissionMode::Ask => (false, false),
+        PermissionMode::Auto => (false, true),
+        PermissionMode::AlwaysApprove => (true, false),
+    }
+}
+
 /// Consume agent messages; when the child dies, reconnect with backoff.
 async fn run(weak: Weak<Inner>, mut rx: mpsc::UnboundedReceiver<Value>) {
+    let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh.tick().await;
     loop {
-        while let Some(msg) = rx.recv().await {
-            let Some(inner) = weak.upgrade() else {
-                return;
-            };
-            inner.apply(&msg);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => {
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        inner.apply(&msg);
+                    }
+                    None => break,
+                },
+                _ = refresh.tick() => {
+                    let Some(inner) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Err(e) = inner.refresh().await {
+                        tracing::debug!(error = %e, "session list refresh failed");
+                    }
+                }
+            }
         }
         match reconnect(&weak).await {
             Some(next) => rx = next,
@@ -322,18 +413,28 @@ async fn reconnect(weak: &Weak<Inner>) -> Option<mpsc::UnboundedReceiver<Value>>
 
 async fn list(handle: &AgentHandle) -> anyhow::Result<Vec<Value>> {
     let res = handle.request("_x.ai/sessions/list", json!({})).await?;
-    Ok(res
+    roster_rows(&res)
+}
+
+fn roster_rows(res: &Value) -> anyhow::Result<Vec<Value>> {
+    res.get("result")
+        .unwrap_or(res)
         .get("sessions")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default())
+        .ok_or_else(|| anyhow!("session roster response has no sessions array"))
 }
 
 async fn load(handle: &AgentHandle, session_id: &str, cwd: &Path) -> anyhow::Result<()> {
     handle
         .request(
             "session/load",
-            json!({"sessionId": session_id, "cwd": cwd.to_string_lossy(), "mcpServers": []}),
+            json!({
+                "sessionId": session_id,
+                "cwd": cwd.to_string_lossy(),
+                "mcpServers": [],
+                "_meta": {"yoloMode": false, "autoMode": false},
+            }),
         )
         .await?;
     Ok(())
@@ -355,6 +456,25 @@ fn envelope(msg: &Value) -> Option<(&str, &Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_envelope_and_mode_refresh() {
+        let row = json!({"sessionId":"s", "yolo":false, "autoMode":false});
+        let mut state = State::default();
+        let rows = roster_rows(&json!({"result":{"sessions":[row.clone()]}})).unwrap();
+        assert_eq!(replace_rows(&mut state, rows).0, vec![row.clone()]);
+        assert!(replace_rows(&mut state, vec![row.clone()]).0.is_empty());
+        let changed = json!({"sessionId":"s", "yolo":false, "autoMode":true});
+        assert_eq!(
+            replace_rows(&mut state, vec![changed.clone()]).0,
+            vec![changed]
+        );
+        assert!(roster_rows(&json!({"invalid":true})).is_err());
+        assert_eq!(
+            roster_rows(&json!({"sessions":[row.clone()]})).unwrap(),
+            vec![row]
+        );
+    }
 
     #[test]
     fn envelope_unwraps_and_strips_prefix() {

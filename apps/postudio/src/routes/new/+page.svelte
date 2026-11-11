@@ -6,7 +6,7 @@ import { loadDefaultMode, loadRecent, MODES, MODE_LABEL, rememberCwd } from '$li
 import type { Mode, NewSession } from '$lib/types';
 
 let cwd = $state('');
-let worktree = $state(true);
+let worktree = $state(false);
 let wtName = $state('');
 let mode = $state<Mode>(loadDefaultMode());
 let prompt = $state('');
@@ -30,8 +30,9 @@ try {
 const res = await postJson<{ sessionId: string }>('/api/sessions', body);
 rememberCwd(dir);
 await goto(`/s/${encodeURIComponent(res.sessionId)}`);
-} catch {
-error = '세션을 만들지 못했습니다. 연결을 확인하세요.';
+} catch (cause) {
+const detail = cause instanceof Error ? cause.message : '알 수 없는 오류';
+error = `세션을 만들지 못했습니다. ${detail}`;
 } finally {
 busy = false;
 }
@@ -84,9 +85,18 @@ onclick={() => (cwd = r)}
 
 <div class="flex flex-col gap-3">
 <label class="flex min-h-11 items-center gap-3 text-sm font-medium">
-<input type="checkbox" bind:checked={worktree} class="size-5 accent-neutral-900 dark:accent-neutral-100" />
+<input
+ type="checkbox"
+ bind:checked={worktree}
+ disabled
+ aria-describedby="worktree-unsupported"
+ class="size-5 accent-neutral-900 disabled:cursor-not-allowed disabled:opacity-50 dark:accent-neutral-100"
+/>
 worktree로 격리
 </label>
+<p id="worktree-unsupported" class="-mt-1 text-sm text-neutral-500 dark:text-neutral-400">
+서버가 아직 worktree 격리를 지원하지 않습니다. 지원될 때까지 사용할 수 없습니다.
+</p>
 {#if worktree}
 <label for="wt-name" class={label}>worktree 이름</label>
 <input id="wt-name" bind:value={wtName} autocomplete="off" placeholder="비우면 자동 이름" class={field} />

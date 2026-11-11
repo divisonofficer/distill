@@ -12,6 +12,7 @@ use distill_node::agent::AgentConfig;
 use distill_node::guard::GuardConfig;
 use distill_node::keeper::Keeper;
 use distill_node::push::Push;
+use distill_node::sep::{ClientMsg, PlanReplyOutcome, QuestionReplyOutcome};
 use distill_node::trusted_router;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
@@ -27,7 +28,7 @@ const OWNER: &str = "me@example.com";
 const ORIGIN: &str = "https://node.example.com";
 const WAIT: Duration = Duration::from_secs(10);
 
-const FAKE_AGENT: &str = r#"
+const FAKE_AGENT: &str = r###"
 import json, os, sys
 
 LOG = os.environ["FAKE_LOG"]
@@ -72,18 +73,43 @@ for line in lines:
         notif("_x.ai/session_notification", {"sessionId": "s1", "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "t1"}})
     elif meth == "session/prompt":
         sid = p["sessionId"]
-        send({"jsonrpc": "2.0", "id": 900, "method": "session/request_permission", "params": {
-            "sessionId": sid,
-            "options": [{"optionId": "allow-once", "kind": "allow_once", "name": "Yes"}],
-            "toolCall": {"toolCallId": "c1", "title": "Edit `a`"}}})
+        prompt = " ".join(block.get("text", "") for block in p.get("prompt", []) if block.get("type") == "text").lower()
+        if "question" in prompt:
+            request_id, method, tool_call_id = 901, "_x.ai/ask_user_question", "q1"
+            body = {"sessionId": sid, "toolCallId": tool_call_id, "mode": "default", "questions": [
+                {"question": "Pick a color", "options": [{"label": "blue", "description": "Blue"}], "multiSelect": False},
+                {"question": "Add a note", "options": [], "multiSelect": False}]}
+        elif "plan" in prompt:
+            request_id, method, tool_call_id = "plan-id", "_x.ai/exit_plan_mode", "p1"
+            body = {"sessionId": sid, "toolCallId": tool_call_id, "planContent": "## Plan"}
+        else:
+            send({"jsonrpc": "2.0", "id": 900, "method": "session/request_permission", "params": {
+                "sessionId": sid,
+                "options": [{"optionId": "allow-once", "kind": "allow_once", "name": "Yes"}],
+                "toolCall": {"toolCallId": "c1", "title": "Edit `a`"}}})
+            for resp in lines:
+                r = json.loads(resp)
+                log(r)
+                if r.get("id") == 900 and "method" not in r:
+                    break
+            notif("_x.ai/session_notification", {"sessionId": sid, "update": {"sessionUpdate": "turn_completed", "stop_reason": "end_turn"}})
+            ok(i, {"stopReason": "end_turn"})
+            continue
+        send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": {"method": method[1:], "params": body}})
         for resp in lines:
             r = json.loads(resp)
             log(r)
-            if r.get("id") == 900 and "method" not in r:
+            if r.get("id") == request_id and "method" not in r:
+                break
+        notif("_x.ai/session_notification", {"sessionId": sid, "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": tool_call_id}})
+        for resp in lines:
+            r = json.loads(resp)
+            log(r)
+            if r.get("method") == "session/cancel":
                 break
         notif("_x.ai/session_notification", {"sessionId": sid, "update": {"sessionUpdate": "turn_completed", "stop_reason": "end_turn"}})
         ok(i, {"stopReason": "end_turn"})
-"#;
+"###;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -187,6 +213,10 @@ async fn send_json(ws: &mut Ws, value: Value) {
     ws.send(Message::Text(value.to_string().into()))
         .await
         .unwrap();
+}
+
+async fn send_client_msg(ws: &mut Ws, msg: &ClientMsg) {
+    send_json(ws, serde_json::to_value(msg).unwrap()).await;
 }
 
 fn log_lines(path: &Path) -> Vec<Value> {
@@ -310,6 +340,200 @@ async fn session_replays_then_prompt_permission_turn() {
             && m["result"]["outcome"]["optionId"] == "allow-once"
     });
     assert!(answered, "permission response reached the agent");
+}
+
+#[tokio::test]
+async fn session_question_reply_validates_and_resolves_request() {
+    timeout(WAIT, async {
+        let f = start().await;
+        let mut ws = connect(f.addr, "/ws/session/s1").await;
+        until(&mut ws, "replay.end").await;
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::Prompt {
+                text: "question flow".into(),
+                images: vec![],
+            },
+        )
+        .await;
+
+        let req = until(&mut ws, "question.request").await;
+        assert_eq!(req["id"], 901);
+        assert_eq!(req["session_id"], "s1");
+        assert_eq!(req["tool_call_id"], "q1");
+        assert_eq!(req["questions"][0]["question"], "Pick a color");
+        assert_eq!(req["questions"][1]["question"], "Add a note");
+
+        let answers = std::collections::BTreeMap::from([
+            ("Pick a color".into(), vec!["blue".into()]),
+            ("Add a note".into(), vec!["free text".into()]),
+        ]);
+        let answer = ClientMsg::QuestionReply {
+            id: json!(901),
+            session_id: "s1".into(),
+            tool_call_id: "q1".into(),
+            outcome: QuestionReplyOutcome::Accepted,
+            answers: Some(answers),
+        };
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::QuestionReply {
+                id: json!(902),
+                session_id: "s1".into(),
+                tool_call_id: "q1".into(),
+                outcome: QuestionReplyOutcome::Accepted,
+                answers: Some(std::collections::BTreeMap::new()),
+            },
+        )
+        .await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "unknown or stale interaction request id"
+        );
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::PlanReply {
+                id: json!(901),
+                session_id: "s1".into(),
+                tool_call_id: "q1".into(),
+                outcome: PlanReplyOutcome::Approved,
+                feedback: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "interaction request kind does not match reply"
+        );
+
+        send_client_msg(&mut ws, &answer).await;
+        assert_eq!(
+            until(&mut ws, "permission.resolved").await["tool_call_id"],
+            "q1"
+        );
+        send_client_msg(&mut ws, &answer).await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "unknown or stale interaction request id"
+        );
+        send_client_msg(&mut ws, &ClientMsg::Cancel).await;
+        until(&mut ws, "turn.end").await;
+
+        let response = log_lines(&f.log)
+            .into_iter()
+            .find(|m| m["id"] == 901 && m.get("method").is_none())
+            .expect("accepted answer reached the agent");
+        assert_eq!(
+            response["result"],
+            json!({
+                "outcome": "accepted",
+                "answers": {"Pick a color": ["blue"], "Add a note": ["free text"]}
+            })
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn session_plan_reply_validates_and_resolves_request() {
+    timeout(WAIT, async {
+        let f = start().await;
+        let mut ws = connect(f.addr, "/ws/session/s1").await;
+        until(&mut ws, "replay.end").await;
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::Prompt {
+                text: "plan flow".into(),
+                images: vec![],
+            },
+        )
+        .await;
+
+        let req = until(&mut ws, "plan.request").await;
+        assert_eq!(req["id"], "plan-id");
+        assert_eq!(req["session_id"], "s1");
+        assert_eq!(req["tool_call_id"], "p1");
+        assert_eq!(req["plan_content"], "## Plan");
+
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::Permission {
+                id: json!("plan-id"),
+                option_id: "allow-once".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "unknown permission request or option"
+        );
+
+        let answer = ClientMsg::PlanReply {
+            id: json!("plan-id"),
+            session_id: "s1".into(),
+            tool_call_id: "p1".into(),
+            outcome: PlanReplyOutcome::Approved,
+            feedback: Some("Looks good".into()),
+        };
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::PlanReply {
+                id: json!("missing-id"),
+                session_id: "s1".into(),
+                tool_call_id: "p1".into(),
+                outcome: PlanReplyOutcome::Approved,
+                feedback: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "unknown or stale interaction request id"
+        );
+        send_client_msg(
+            &mut ws,
+            &ClientMsg::QuestionReply {
+                id: json!("plan-id"),
+                session_id: "s1".into(),
+                tool_call_id: "p1".into(),
+                outcome: QuestionReplyOutcome::Accepted,
+                answers: Some(std::collections::BTreeMap::from([(
+                    "question".into(),
+                    vec!["answer".into()],
+                )])),
+            },
+        )
+        .await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "interaction request kind does not match reply"
+        );
+
+        send_client_msg(&mut ws, &answer).await;
+        assert_eq!(
+            until(&mut ws, "permission.resolved").await["tool_call_id"],
+            "p1"
+        );
+        send_client_msg(&mut ws, &answer).await;
+        assert_eq!(
+            until(&mut ws, "error").await["message"],
+            "unknown or stale interaction request id"
+        );
+        send_client_msg(&mut ws, &ClientMsg::Cancel).await;
+        until(&mut ws, "turn.end").await;
+
+        let response = log_lines(&f.log)
+            .into_iter()
+            .find(|m| m["id"] == "plan-id" && m.get("method").is_none())
+            .expect("approved plan reply reached the agent");
+        assert_eq!(
+            response["result"],
+            json!({"outcome": "approved", "feedback": "Looks good"})
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

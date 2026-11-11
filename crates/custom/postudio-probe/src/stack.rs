@@ -111,6 +111,12 @@ async fn boot(
         Conversation::nth(2)
             .calls([MockToolCall::new(Tool::Read, json!({"target_file": png}))])
             .reply("이미지를 읽었습니다."),
+        Conversation::nth(3)
+            .calls([MockToolCall::new(Tool::Question, json!({"questions":[{"question":"저장소 선택", "options":[{"label":"SQLite", "description":"로컬 데이터베이스"},{"label":"PostgreSQL", "description":"서버 데이터베이스"}]}]}))])
+            .reply("질문 응답을 받았습니다."),
+        Conversation::nth(4)
+            .calls([MockToolCall::new(Tool::ExitPlanMode, json!({}))])
+            .reply("계획 승인을 받았습니다."),
     ]);
     server.set_response(FALLBACK_REPLY);
 

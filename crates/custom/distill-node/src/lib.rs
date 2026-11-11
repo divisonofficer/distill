@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod board;
 pub mod guard;
+pub mod interaction;
 pub mod keeper;
 pub mod listen;
 pub mod push;

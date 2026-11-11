@@ -39,6 +39,7 @@ export class SessionView {
 	revision = $state(0);
 
 	#seq = 0;
+	#canAppend = false;
 	#toolIndex = new Map<string, number>();
 
 	get running(): boolean {
@@ -51,11 +52,13 @@ export class SessionView {
 		this.usage = null;
 		this.title = '';
 		this.#toolIndex.clear();
+		this.#canAppend = false;
 	}
 
 	setConnected(on: boolean) {
 		this.connected = on;
 		if (!on) this.status = 'offline';
+else this.status = 'idle';
 	}
 
 	apply(ev: Sep) {
@@ -63,6 +66,10 @@ export class SessionView {
 		switch (ev.t) {
 			case 'session.state':
 				this.status = ev.status;
+				if (ev.status === 'error') {
+					this.permissions = [];
+					this.#canAppend = false;
+				}
 				break;
 			case 'session.title':
 				this.title = ev.title;
@@ -82,7 +89,12 @@ export class SessionView {
 			case 'tool':
 				this.#tool(ev);
 				break;
-			case 'permission.request':
+			case 'question.request':
+case 'plan.request':
+this.status = 'waiting_permission';
+break;
+case 'permission.request':
+this.status = 'waiting_permission';
 				if (!this.permissions.some((p) => p.toolCallId === ev.tool_call_id)) {
 					this.permissions.push({
 						id: ev.id,
@@ -96,10 +108,12 @@ export class SessionView {
 				this.permissions = this.permissions.filter((p) => p.toolCallId !== ev.tool_call_id);
 				break;
 			case 'turn.end':
+				this.permissions = [];
+				this.#canAppend = false;
 				if (ev.error) this.#push('error', ev.error);
 				break;
 			case 'error':
-				this.#push('error', ev.message);
+								this.#push('error', ev.message);
 				break;
 			case 'replay.end':
 				break;
@@ -108,18 +122,21 @@ export class SessionView {
 
 	#push(role: TextItem['role'], text: string) {
 		this.items.push({ kind: 'text', role, key: ++this.#seq, text });
+		this.#canAppend = false;
 	}
 
 	#append(role: 'assistant' | 'reasoning', text: string) {
 		const last = this.items.at(-1);
-		if (last?.kind === 'text' && last.role === role) {
+		if (this.#canAppend && last?.kind === 'text' && last.role === role) {
 			last.text += text;
 			return;
 		}
 		this.items.push({ kind: 'text', role, key: ++this.#seq, text });
+		this.#canAppend = true;
 	}
 
 	#tool(ev: Extract<Sep, { t: 'tool' }>) {
+		this.#canAppend = false;
 		let idx = this.#toolIndex.get(ev.id);
 		if (idx === undefined) {
 			idx = this.items.push({ kind: 'tool', key: ++this.#seq, id: ev.id }) - 1;

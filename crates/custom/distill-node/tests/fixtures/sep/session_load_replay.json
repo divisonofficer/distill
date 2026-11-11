@@ -13,7 +13,13 @@
     "input": {
       "target_file": "/sandbox/proj/read.txt",
       "variant": "ReadFile"
-    }
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "1\u2192before\n"
+      }
+    ]
   },
   {
     "t": "message.delta",

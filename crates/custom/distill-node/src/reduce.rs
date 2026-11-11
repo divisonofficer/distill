@@ -18,6 +18,8 @@ pub struct Reducer {
     pending: Vec<(Value, Pending)>,
     /// Whether the latest prompt already produced `turn.end`.
     turn_ended: bool,
+    /// Text sent by the latest prompt, awaiting its echoed user update.
+    pending_user_echo: Option<String>,
 }
 
 impl Reducer {
@@ -26,6 +28,7 @@ impl Reducer {
             session_id,
             pending: Vec::new(),
             turn_ended: true,
+            pending_user_echo: None,
         }
     }
 
@@ -45,9 +48,14 @@ impl Reducer {
         match kind {
             Pending::Prompt => {
                 self.turn_ended = false;
-                vec![Sep::SessionState {
+                self.pending_user_echo = prompt_text(msg);
+                let mut events = vec![Sep::SessionState {
                     status: Status::Running,
-                }]
+                }];
+                if let Some(text) = &self.pending_user_echo {
+                    events.push(Sep::UserMessage { text: text.clone() });
+                }
+                events
             }
             Pending::Load => Vec::new(),
         }
@@ -84,12 +92,19 @@ impl Reducer {
             return Vec::new();
         };
         match kind {
-            "user_message_chunk" => text_of(update)
-                .map(|text| Sep::UserMessage {
-                    text: text.to_owned(),
-                })
-                .into_iter()
-                .collect(),
+            "user_message_chunk" => {
+                let Some(text) = text_of(update) else {
+                    return Vec::new();
+                };
+                if self.pending_user_echo.as_deref() == Some(text) {
+                    self.pending_user_echo = None;
+                    Vec::new()
+                } else {
+                    vec![Sep::UserMessage {
+                        text: text.to_owned(),
+                    }]
+                }
+            }
             "agent_message_chunk" => text_of(update)
                 .map(|text| Sep::MessageDelta {
                     text: text.to_owned(),
@@ -111,10 +126,13 @@ impl Reducer {
                     id: id.to_owned(),
                     name: meta.and_then(|m| str_field(m, "name")).map(str::to_owned),
                     title: str_field(update, "title").map(str::to_owned),
-                    kind: meta.and_then(|m| str_field(m, "kind")).map(str::to_owned),
+                    kind: meta
+                        .and_then(|m| str_field(m, "kind"))
+                        .or_else(|| str_field(update, "kind"))
+                        .map(str::to_owned),
                     status: Some(status_of(update).unwrap_or_else(|| "pending".to_owned())),
                     input: update.get("rawInput").cloned(),
-                    content: None,
+                    content: content_of(update),
                 }]
             }
             "tool_call_update" => {
@@ -122,10 +140,7 @@ impl Reducer {
                     return Vec::new();
                 };
                 let status = status_of(update);
-                let content: Option<Vec<ToolContent>> = update
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|items| items.iter().filter_map(tool_content).collect());
+                let content = content_of(update);
                 if status.is_none() && content.is_none() {
                     return Vec::new();
                 }
@@ -171,6 +186,7 @@ impl Reducer {
                     return Vec::new();
                 };
                 self.turn_ended = true;
+                self.pending_user_echo = None;
                 let is_error = stop_reason == "error";
                 let error = if is_error {
                     str_field(update, "agent_result").map(str::to_owned)
@@ -212,6 +228,7 @@ impl Reducer {
                 let Some(error) = msg.get("error") else {
                     return Vec::new();
                 };
+                self.pending_user_echo = None;
                 if self.turn_ended {
                     return Vec::new();
                 }
@@ -233,6 +250,21 @@ impl Reducer {
             }
         }
     }
+}
+
+fn prompt_text(msg: &Value) -> Option<String> {
+    let blocks = msg.pointer("/params/prompt")?.as_array()?;
+    let mut text = String::new();
+    let mut found = false;
+    for block in blocks {
+        if str_field(block, "type") == Some("text")
+            && let Some(part) = str_field(block, "text")
+        {
+            text.push_str(part);
+            found = true;
+        }
+    }
+    found.then_some(text)
 }
 
 fn permission_request(msg: &Value) -> Vec<Sep> {
@@ -266,6 +298,13 @@ fn permission_option(option: &Value) -> Option<PermissionOption> {
         kind: str_field(option, "kind")?.to_owned(),
         name: str_field(option, "name")?.to_owned(),
     })
+}
+
+fn content_of(update: &Value) -> Option<Vec<ToolContent>> {
+    update
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(tool_content).collect())
 }
 
 fn tool_content(item: &Value) -> Option<ToolContent> {

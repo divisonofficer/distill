@@ -4,6 +4,10 @@
     "status": "running"
   },
   {
+    "t": "user.message",
+    "text": "go"
+  },
+  {
     "t": "session.title",
     "title": "go"
   },

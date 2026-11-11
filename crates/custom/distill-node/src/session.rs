@@ -13,6 +13,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinSet;
 
 use crate::agent::{self, AgentConfig, AgentHandle};
+use crate::interaction::{self, Interaction, Outstanding};
 use crate::keeper::Keeper;
 use crate::reduce::Reducer;
 use crate::sep::{ClientMsg, PermissionMode, Sep};
@@ -52,7 +53,12 @@ async fn run(mut socket: WebSocket, ctx: Ctx, id: String) {
     let mut conn = Conn::new(id.clone(), handle);
     let (_, events) = conn.request(
         "session/load",
-        json!({"sessionId": id, "cwd": cwd.to_string_lossy(), "mcpServers": []}),
+        json!({
+            "sessionId": id,
+            "cwd": cwd.to_string_lossy(),
+            "mcpServers": [],
+            "_meta": {"yoloMode": false, "autoMode": false},
+        }),
     );
     if !emit(&mut socket, &events).await {
         return;
@@ -102,7 +108,8 @@ struct Conn {
     reducer: Reducer,
     tasks: JoinSet<Done>,
     next_id: u64,
-    warned_unsupported: bool,
+    interactions: Outstanding,
+    permissions: Vec<(Value, String, Vec<String>)>,
 }
 
 struct Done {
@@ -119,7 +126,8 @@ impl Conn {
             handle,
             tasks: JoinSet::new(),
             next_id: 0,
-            warned_unsupported: false,
+            interactions: Outstanding::default(),
+            permissions: Vec::new(),
         }
     }
 
@@ -179,10 +187,54 @@ impl Conn {
                 .1
             }
             ClientMsg::Cancel => self.notify("session/cancel", json!({"sessionId": sid})),
-            ClientMsg::Permission { id, option_id } => self.respond(
+            ClientMsg::Permission { id, option_id } => {
+                let Some(index) = self.permissions.iter().position(|(pending, _, options)| {
+                    *pending == id && options.contains(&option_id)
+                }) else {
+                    return vec![error("unknown permission request or option")];
+                };
+                self.permissions.remove(index);
+                self.respond(
+                    id,
+                    json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+                )
+            }
+            ClientMsg::QuestionReply {
                 id,
-                json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
-            ),
+                session_id,
+                tool_call_id,
+                outcome,
+                answers,
+            } => {
+                match self.interactions.answer_question(
+                    id,
+                    &session_id,
+                    &tool_call_id,
+                    outcome,
+                    answers,
+                ) {
+                    Ok((id, result)) => self.respond(id, result),
+                    Err(e) => vec![error(e)],
+                }
+            }
+            ClientMsg::PlanReply {
+                id,
+                session_id,
+                tool_call_id,
+                outcome,
+                feedback,
+            } => {
+                match self.interactions.answer_plan(
+                    id,
+                    &session_id,
+                    &tool_call_id,
+                    outcome,
+                    feedback,
+                ) {
+                    Ok((id, result)) => self.respond(id, result),
+                    Err(e) => vec![error(e)],
+                }
+            }
             ClientMsg::Mode { mode } => {
                 self.notify("_x.ai/yolo_mode_changed", mode_params(&sid, mode))
             }
@@ -190,15 +242,93 @@ impl Conn {
     }
 
     fn on_agent_msg(&mut self, msg: &Value) -> Vec<Sep> {
-        if !self.warned_unsupported
-            && msg.get("id").is_some()
-            && let Some(method) = msg.get("method").and_then(Value::as_str)
-            && method != "session/request_permission"
+        if let (Some(id), Some(method)) = (msg.get("id"), msg.get("method").and_then(Value::as_str))
         {
-            self.warned_unsupported = true;
-            tracing::warn!(method, "agent request not supported; ignored");
+            match interaction::parse_request(msg, &self.id) {
+                Ok(Some(request)) => return self.add_interaction(request),
+                Err(message) => return self.respond_error(id.clone(), -32602, &message),
+                Ok(None) if method == "session/request_permission" => {
+                    if let Err(message) = validate_permission_request(msg, &self.id) {
+                        return self.respond_error(id.clone(), -32602, &message);
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(method, "unsupported agent request rejected");
+                    return self.respond_error(id.clone(), -32601, "Method not found");
+                }
+            }
         }
-        self.reducer.on_agent(msg)
+        let events = self.reducer.on_agent(msg);
+        for event in &events {
+            match event {
+                Sep::PermissionRequest {
+                    id,
+                    tool_call_id,
+                    options,
+                    ..
+                } => {
+                    self.permissions.retain(|(pending, _, _)| pending != id);
+                    self.permissions.push((
+                        id.clone(),
+                        tool_call_id.clone(),
+                        options.iter().map(|option| option.id.clone()).collect(),
+                    ));
+                }
+                Sep::PermissionResolved { tool_call_id } => {
+                    self.permissions.retain(|(_, tool, _)| tool != tool_call_id);
+                    self.interactions.remove_tool_call(tool_call_id)
+                }
+                Sep::TurnEnd { .. } => {
+                    self.permissions.clear();
+                    self.interactions.clear();
+                }
+                _ => {}
+            }
+        }
+        events
+    }
+
+    fn add_interaction(&mut self, request: Interaction) -> Vec<Sep> {
+        if let Err(message) = self.interactions.insert(request.clone()) {
+            return self.respond_error(request.id().clone(), -32602, &message);
+        }
+        match request {
+            Interaction::Question {
+                id,
+                session_id,
+                tool_call_id,
+                mode,
+                questions,
+                preview,
+            } => vec![Sep::QuestionRequest {
+                id,
+                session_id,
+                tool_call_id,
+                mode,
+                questions,
+                preview,
+            }],
+            Interaction::Plan {
+                id,
+                session_id,
+                tool_call_id,
+                plan_content,
+            } => vec![Sep::PlanRequest {
+                id,
+                session_id,
+                tool_call_id,
+                plan_content,
+            }],
+        }
+    }
+
+    fn respond_error(&mut self, id: Value, code: i64, message: &str) -> Vec<Sep> {
+        self.handle
+            .respond_error(id, code, message)
+            .err()
+            .map(error)
+            .into_iter()
+            .collect()
     }
 
     /// Err when the session/load failed: the caller closes the socket.
@@ -219,15 +349,47 @@ impl Conn {
     }
 }
 
+fn validate_permission_request(msg: &Value, expected_session: &str) -> Result<(), String> {
+    let params = msg
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "permission params must be an object".to_owned())?;
+    if params.get("sessionId").and_then(Value::as_str) != Some(expected_session) {
+        return Err("permission session does not match this connection".into());
+    }
+    if msg
+        .pointer("/params/toolCall/toolCallId")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err("permission toolCallId must be a string".into());
+    }
+    let options = params
+        .get("options")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "permission options must be an array".to_owned())?;
+    for option in options {
+        if ["optionId", "kind", "name"]
+            .iter()
+            .any(|field| option.get(field).and_then(Value::as_str).is_none())
+        {
+            return Err("permission option fields must be strings".into());
+        }
+    }
+    Ok(())
+}
+
 fn mode_params(sid: &str, mode: PermissionMode) -> Value {
     match mode {
         PermissionMode::Ask => json!({
             "sessionId": sid, "yolo_mode": false, "auto_mode": false, "permission_mode": "ask"
         }),
         PermissionMode::Auto => json!({
-            "sessionId": sid, "auto_mode": true, "permission_mode": "auto"
+            "sessionId": sid, "yolo_mode": false, "auto_mode": true, "permission_mode": "auto"
         }),
-        PermissionMode::AlwaysApprove => json!({"sessionId": sid, "yolo_mode": true}),
+        PermissionMode::AlwaysApprove => json!({
+            "sessionId": sid, "yolo_mode": true, "auto_mode": false
+        }),
     }
 }
 

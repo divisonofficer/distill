@@ -9,10 +9,19 @@ export interface BoardRow {
 	title: string;
 	activity: string;
 	resident: boolean;
-	yolo: boolean;
+	yolo?: boolean;
+	autoMode?: boolean;
 	modelId: string;
 	isWorktree: boolean;
 	lastChangeUnixMs: number;
+}
+
+export function modeFromRow(row: Pick<BoardRow, 'autoMode' | 'yolo'> | undefined): Mode | undefined {
+	if (!row) return undefined;
+	if (row.yolo === true) return 'always-approve';
+	if (row.autoMode === true && row.yolo === false) return 'auto';
+	if (row.autoMode === false && row.yolo === false) return 'ask';
+	return undefined;
 }
 
 export interface NodeInfo {
@@ -45,6 +54,35 @@ export interface PermissionOption {
 	name: string;
 }
 
+export interface QuestionOption {
+	label: string;
+	description: string;
+}
+
+export interface Question {
+	question: string;
+	options: QuestionOption[];
+	multiSelect: boolean;
+}
+
+export type InteractionRequest =
+	| {
+			t: 'question.request';
+			id: string | number;
+			session_id: string;
+			tool_call_id: string;
+			mode: 'default' | 'plan';
+			questions: Question[];
+			preview?: string;
+	  }
+	| {
+			t: 'plan.request';
+			id: string | number;
+			session_id: string;
+			tool_call_id: string;
+			plan_content?: string;
+	  };
+
 export type Sep =
 	| { t: 'session.state'; status: Status }
 	| { t: 'session.title'; title: string }
@@ -68,6 +106,8 @@ export type Sep =
 			title: string;
 			options: PermissionOption[];
 	  }
+	| Extract<InteractionRequest, { t: 'question.request' }>
+	| Extract<InteractionRequest, { t: 'plan.request' }>
 	| { t: 'permission.resolved'; tool_call_id: string }
 	| { t: 'usage'; used: number; size: number }
 	| { t: 'turn.end'; stop_reason: string; error?: string }
@@ -78,4 +118,27 @@ export type ClientMsg =
 	| { t: 'prompt'; text: string; images: ImageIn[] }
 	| { t: 'cancel' }
 	| { t: 'permission'; id: unknown; option_id: string }
+	| {
+			t: 'question_reply';
+			id: string | number;
+			session_id: string;
+			tool_call_id: string;
+			outcome: 'accepted';
+			answers: Record<string, string[]>;
+	  }
+	| {
+			t: 'question_reply';
+			id: string | number;
+			session_id: string;
+			tool_call_id: string;
+			outcome: 'cancelled';
+	  }
+	| {
+			t: 'plan_reply';
+			id: string | number;
+			session_id: string;
+			tool_call_id: string;
+			outcome: 'approved' | 'cancelled' | 'abandoned';
+			feedback?: string;
+	  }
 	| { t: 'mode'; mode: Mode };

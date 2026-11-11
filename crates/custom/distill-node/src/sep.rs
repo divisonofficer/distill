@@ -40,6 +40,42 @@ pub struct PermissionOption {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionMode {
+    Default,
+    Plan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    pub options: Vec<QuestionOption>,
+    #[serde(rename = "multiSelect")]
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionReplyOutcome {
+    Accepted,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanReplyOutcome {
+    Approved,
+    Cancelled,
+    Abandoned,
+}
+
 /// Node to client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t")]
@@ -79,6 +115,24 @@ pub enum Sep {
         tool_call_id: String,
         title: String,
         options: Vec<PermissionOption>,
+    },
+    #[serde(rename = "question.request")]
+    QuestionRequest {
+        id: Value,
+        session_id: String,
+        tool_call_id: String,
+        mode: QuestionMode,
+        questions: Vec<Question>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
+    },
+    #[serde(rename = "plan.request")]
+    PlanRequest {
+        id: Value,
+        session_id: String,
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_content: Option<String>,
     },
     #[serde(rename = "permission.resolved")]
     PermissionResolved { tool_call_id: String },
@@ -125,6 +179,22 @@ pub enum ClientMsg {
     Permission {
         id: Value,
         option_id: String,
+    },
+    QuestionReply {
+        id: Value,
+        session_id: String,
+        tool_call_id: String,
+        outcome: QuestionReplyOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    },
+    PlanReply {
+        id: Value,
+        session_id: String,
+        tool_call_id: String,
+        outcome: PlanReplyOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feedback: Option<String>,
     },
     Mode {
         mode: PermissionMode,

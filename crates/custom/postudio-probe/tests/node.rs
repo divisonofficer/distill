@@ -312,3 +312,58 @@ async fn prompt_at_creation_waits_for_late_client() {
     );
     session.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the distill binary; set GROK_BINARY"]
+async fn permission_mode_survives_browser_reconnect() {
+    let stack = stack::start(0, None).await.expect("stack");
+    let sid = create_session(&stack).await;
+    let mut session = Feed::open(&stack, &format!("/ws/session/{sid}")).await;
+    session
+        .until("replay.end", |f| is_type(f, "replay.end"))
+        .await;
+    session.send(json!({"t":"mode", "mode":"auto"})).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let rows: Value = get(&stack, "/api/sessions")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if rows["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["sessionId"] == sid && r["autoMode"] == true && r["yolo"] == false)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "auto mode missing: {rows}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    session.close().await;
+    let mut reopened = Feed::open(&stack, &format!("/ws/session/{sid}")).await;
+    reopened
+        .until("replay.end", |f| is_type(f, "replay.end"))
+        .await;
+    let rows: Value = get(&stack, "/api/sessions")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        rows["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["sessionId"] == sid && r["autoMode"] == true)
+    );
+    reopened.close().await;
+}
