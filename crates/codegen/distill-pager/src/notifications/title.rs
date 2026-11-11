@@ -203,7 +203,8 @@ fn push_separator(buf: &mut String, has_parts: &mut bool) {
     }
 }
 
-fn write_activity(buf: &mut String, activity: &TurnActivity) {
+/// Human label for the current turn activity (shared with the OSC 7501 `msg`).
+pub(super) fn write_activity(buf: &mut String, activity: &TurnActivity) {
     match activity {
         TurnActivity::Thinking => buf.push_str("Thinking"),
         TurnActivity::Responding => buf.push_str("Responding"),

@@ -2,6 +2,7 @@
 pub mod config;
 pub mod focus;
 pub mod hooks;
+pub mod program_status;
 pub mod progress;
 pub mod protocol;
 pub mod sleep;
@@ -20,6 +21,7 @@ pub use config::{
     NotificationCondition, NotificationConfig, NotificationEventKind, NotificationHook,
     NotificationMethod, TitleConfig, TitleItem,
 };
+pub use program_status::TurnOutcome;
 pub use title::TitleState;
 
 pub struct NotificationEvent {
@@ -34,6 +36,8 @@ pub struct NotificationService {
     pub focus_tracker: focus::FocusTracker,
     pub sleep_inhibitor: sleep::SleepInhibitor,
     title_manager: title::TitleManager,
+    /// OSC 7501 agent-state reports for terminal hosts that track agents (e.g. Orca).
+    program_status: program_status::ProgramStatusReporter,
     protocol: protocol::NotificationProtocol,
     terminal_ctx: &'static crate::terminal::TerminalContext,
     /// Whether the OSC 9;4 progress indicator is currently active.
@@ -57,11 +61,16 @@ impl NotificationService {
         );
         let sleep_inhibitor = sleep::SleepInhibitor::new(config.sleep_prevention);
         let title_manager = title::TitleManager::new(&config.title);
+        let program_status = program_status::ProgramStatusReporter::new(
+            config.program_status,
+            &config.program_status_app,
+        );
         Self {
             config,
             focus_tracker,
             sleep_inhibitor,
             title_manager,
+            program_status,
             protocol,
             terminal_ctx,
             progress_active: false,
@@ -132,7 +141,15 @@ impl NotificationService {
             self.clear_progress_into(&mut buf);
         }
 
+        self.program_status
+            .update_into(state, self.terminal_ctx, &mut buf);
+
         if buf.is_empty() { None } else { Some(buf) }
+    }
+
+    /// Record how a turn ended so the next at-rest update reports `done`/`error`/`idle` over OSC 7501.
+    pub fn note_turn_finished(&mut self, outcome: TurnOutcome, msg: Option<&str>) {
+        self.program_status.note_turn_finished(outcome, msg);
     }
 
     /// Advance the tab title and progress bar state.
@@ -171,15 +188,21 @@ impl NotificationService {
             }
         }
 
+        // Explicit agent state, so hosts keep treating the pane as an agent while it is idle
+        self.program_status
+            .update_into(state, self.terminal_ctx, &mut buf);
+
         if buf.is_empty() { None } else { Some(buf) }
     }
 
-    /// Reset the tab title back to "grok" and clear the progress bar so neither lingers after exit. Enqueued, never
-    /// inline: `/quit` can land while the writer is parked holding the stderr lock, and the queue orders the reset
-    /// after any still-queued busy-title escape.
+    /// Reset the tab title back to "Distill", clear the progress bar, and clear the OSC 7501 agent record so none of
+    /// them linger after exit. Enqueued, never inline: `/quit` can land while the writer is parked holding the stderr
+    /// lock, and the queue orders the reset after any still-queued busy-title escape.
     pub fn shutdown(&mut self) {
         let mut buf = self.title_manager.reset();
         self.clear_progress_into(&mut buf);
+        self.program_status
+            .shutdown_into(self.terminal_ctx, &mut buf);
         self.escape_writer.emit(buf);
     }
 
@@ -228,11 +251,16 @@ impl NotificationService {
         );
         let sleep_inhibitor = sleep::SleepInhibitor::new(config.sleep_prevention);
         let title_manager = title::TitleManager::new(&config.title);
+        let program_status = program_status::ProgramStatusReporter::new(
+            config.program_status,
+            &config.program_status_app,
+        );
         Self {
             config,
             focus_tracker,
             sleep_inhibitor,
             title_manager,
+            program_status,
             protocol: protocol::NotificationProtocol::None,
             terminal_ctx,
             progress_active: false,
@@ -631,9 +659,14 @@ mod tests {
         let payload = rx
             .try_recv()
             .expect("shutdown escapes must ride the writer queue");
+        let data = String::from_utf8_lossy(payload.data()).into_owned();
         assert!(
-            String::from_utf8_lossy(payload.data()).contains("grok"),
+            data.contains("Distill"),
             "expected the title reset in the queued escape"
+        );
+        assert!(
+            data.contains("\x1b]7501;state=clear"),
+            "expected the OSC 7501 agent record to be cleared in the same payload"
         );
         assert!(rx.try_recv().is_err(), "one combined payload expected");
     }
