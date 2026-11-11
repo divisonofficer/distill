@@ -121,3 +121,10 @@ impl Push {
 
 - `postudio-probe`에 `dev-stack` 바이너리: 가짜 모델 서버 + 샌드박스 + leader를 띄우고, 그 환경으로 `postudio-node --listen tcp:127.0.0.1:7410 --owner me@example.com --allow-origin http://127.0.0.1:5173 --web-dir apps/postudio/build`를 실행한다. 가짜 모델의 기본 응답과 대본 몇 개(승인 필요 편집, 이미지)를 넣는다. 비용 없음.
 - 브라우저 확인 시 `Tailscale-User-Login`은 개발 서버 프록시(Vite)가 붙인다. node에는 우회 옵션을 두지 않는다.
+
+## 8. A2 착수 시 결정 (2026-11-11)
+
+1. `AgentConn`은 액터로 바꾼다: `AgentConn::spawn(cfg) -> anyhow::Result<(AgentHandle, mpsc::UnboundedReceiver<Value>)>`. `AgentHandle`은 `Clone`이고 `request(&self, ..)`, `notify(&self, ..)`, `respond(&self, ..)`를 가진다(대기 중 요청은 id → oneshot 맵). 수신 채널에는 응답이 아닌 agent→client 메시지가 온다. 자식이 죽으면 채널이 닫힌다.
+2. `POST /api/sessions`의 `worktree`는 A2에서 구현하지 않는다(있으면 501). 통합 I2에서 실제 호출을 캡처해 정한다.
+3. 확장 메서드 이름은 앞의 `_`를 떼고 비교한다(`_x.ai/session_notification`과 `x.ai/session_notification` 모두 처리). `params.method`로 감싼 형태(`{"method":"_x.ai/…","params":{"method":"x.ai/…","params":{…}}}`)도 풀어서 처리한다(leader `method_of`와 같은 규칙).
+4. `/api/node`는 `{host, version}`만 낸다. `agent_url`과 그 테스트는 지운다. `--insecure-no-owner`는 없앤다.
