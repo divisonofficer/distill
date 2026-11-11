@@ -3,12 +3,14 @@
 //! Trusted listener: web app, session list, board and session WebSockets, Web Push,
 //! all behind the owner/Origin guard. Untrusted listener: session file and port proxy.
 
+pub mod accounts;
 pub mod agent;
 pub mod board;
 pub mod guard;
 pub mod interaction;
 pub mod keeper;
 pub mod listen;
+pub mod models;
 pub mod push;
 pub mod reduce;
 pub mod sep;
@@ -125,7 +127,9 @@ pub fn trusted_router(
 ) -> Router {
     let guarded = Router::new()
         .route("/api/node", get(node_info))
+        .merge(accounts::routes(agent.clone()))
         .merge(board::routes(keeper.clone()))
+        .merge(models::routes(keeper.clone()))
         .merge(session::routes(agent, keeper))
         .merge(push.routes())
         .layer(middleware::from_fn_with_state(guard, guard::guard));

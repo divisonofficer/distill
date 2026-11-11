@@ -84,6 +84,8 @@ pub enum Sep {
     SessionState { status: Status },
     #[serde(rename = "session.title")]
     SessionTitle { title: String },
+    #[serde(rename = "session.model")]
+    SessionModel { model_id: String },
     #[serde(rename = "user.message")]
     UserMessage { text: String },
     #[serde(rename = "message.delta")]
@@ -199,6 +201,9 @@ pub enum ClientMsg {
     Mode {
         mode: PermissionMode,
     },
+    Model {
+        model_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -250,6 +255,20 @@ mod tests {
                 text: "hi".into(),
                 images: vec![]
             }
+        );
+        let msg: ClientMsg = serde_json::from_str(r#"{"t":"model","model_id":"model-x"}"#).unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Model {
+                model_id: "model-x".into()
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&Sep::SessionModel {
+                model_id: "model-x".into()
+            })
+            .unwrap(),
+            r#"{"t":"session.model","model_id":"model-x"}"#
         );
     }
 }

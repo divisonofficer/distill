@@ -34,6 +34,7 @@ export class SessionView {
 	status = $state<Status | 'offline'>('offline');
 	connected = $state(false);
 	title = $state('');
+	modelId = $state('');
 	usage = $state<{ used: number; size: number } | null>(null);
 	permissions = $state<Pending[]>([]);
 	revision = $state(0);
@@ -51,6 +52,7 @@ export class SessionView {
 		this.permissions = [];
 		this.usage = null;
 		this.title = '';
+		this.modelId = '';
 		this.#toolIndex.clear();
 		this.#canAppend = false;
 	}
@@ -73,6 +75,9 @@ else this.status = 'idle';
 				break;
 			case 'session.title':
 				this.title = ev.title;
+				break;
+			case 'session.model':
+				this.modelId = ev.model_id;
 				break;
 			case 'usage':
 				this.usage = { used: ev.used, size: ev.size };

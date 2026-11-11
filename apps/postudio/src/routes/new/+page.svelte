@@ -2,6 +2,7 @@
 import { goto } from '$app/navigation';
 import { postJson } from '$lib/api';
 import Icon from '$lib/components/Icon.svelte';
+import ModelSelect from '$lib/components/ModelSelect.svelte';
 import { loadDefaultMode, loadRecent, MODES, MODE_LABEL, rememberCwd } from '$lib/prefs';
 import type { Mode, NewSession } from '$lib/types';
 
@@ -9,6 +10,7 @@ let cwd = $state('');
 let worktree = $state(false);
 let wtName = $state('');
 let mode = $state<Mode>(loadDefaultMode());
+let modelId = $state('');
 let prompt = $state('');
 let error = $state('');
 let busy = $state(false);
@@ -23,6 +25,7 @@ error = '작업 경로를 입력하세요.';
 return;
 }
 const body: NewSession = { cwd: dir, mode };
+if (modelId) body.modelId = modelId;
 if (worktree) body.worktree = { name: wtName.trim() };
 if (prompt.trim()) body.prompt = prompt.trim();
 busy = true;
@@ -102,6 +105,8 @@ worktree로 격리
 <input id="wt-name" bind:value={wtName} autocomplete="off" placeholder="비우면 자동 이름" class={field} />
 {/if}
 </div>
+
+<ModelSelect id="new-model" bind:value={modelId} initialFromCatalog />
 
 <div class="flex flex-col gap-2">
 <label for="mode" class={label}>권한 모드</label>

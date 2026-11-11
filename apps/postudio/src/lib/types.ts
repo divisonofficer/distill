@@ -29,8 +29,19 @@ export interface NodeInfo {
 	version: string;
 }
 
+export interface Model {
+	modelId: string;
+	name: string;
+}
+
+export interface ModelCatalog {
+	currentModelId: string | null;
+	availableModels: Model[];
+}
+
 export interface NewSession {
 	cwd: string;
+	modelId?: string;
 	worktree?: { name: string };
 	mode?: Mode;
 	prompt?: string;
@@ -86,6 +97,7 @@ export type InteractionRequest =
 export type Sep =
 	| { t: 'session.state'; status: Status }
 	| { t: 'session.title'; title: string }
+	| { t: 'session.model'; model_id: string }
 	| { t: 'user.message'; text: string }
 	| { t: 'message.delta'; text: string }
 	| { t: 'reasoning.delta'; text: string }
@@ -141,4 +153,5 @@ export type ClientMsg =
 			outcome: 'approved' | 'cancelled' | 'abandoned';
 			feedback?: string;
 	  }
-	| { t: 'mode'; mode: Mode };
+	| { t: 'mode'; mode: Mode }
+	| { t: 'model'; model_id: string };

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import AccountSettings from '$lib/components/AccountSettings.svelte';
 	import { postJson, getJson } from '$lib/api';
 	import { loadDefaultMode, MODES, MODE_LABEL, saveDefaultMode } from '$lib/prefs';
 	import type { Mode } from '$lib/types';
@@ -106,6 +107,8 @@
 
 <div class="mx-auto flex w-full max-w-2xl flex-col gap-8 p-4 md:p-8">
 	<h1 class="text-2xl font-semibold tracking-tight">설정</h1>
+
+	<AccountSettings />
 
 	<section class="flex flex-col gap-3" aria-labelledby="push-h">
 		<h2 id="push-h" class="text-sm font-semibold">푸시 알림</h2>

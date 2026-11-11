@@ -36,6 +36,8 @@ struct CreateBody {
     cwd: String,
     worktree: Option<Value>,
     mode: Option<PermissionMode>,
+    #[serde(rename = "modelId")]
+    model_id: Option<String>,
     prompt: Option<String>,
 }
 
@@ -49,8 +51,18 @@ async fn create(State(keeper): State<Keeper>, Json(body): Json<CreateBody>) -> R
             "cwd must be an absolute existing directory",
         );
     }
+    if body
+        .model_id
+        .as_ref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        return fail(StatusCode::BAD_REQUEST, "modelId must not be empty");
+    }
     let mode = body.mode.unwrap_or(PermissionMode::Ask);
-    let meta = mode_meta(mode);
+    let mut meta = mode_meta(mode);
+    if let Some(model_id) = body.model_id {
+        meta["modelId"] = json!(model_id);
+    }
     let created = keeper
         .handle()
         .request(

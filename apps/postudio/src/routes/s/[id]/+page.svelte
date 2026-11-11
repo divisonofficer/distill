@@ -6,6 +6,7 @@ import Badge from '$lib/components/Badge.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import InteractionCard from '$lib/components/InteractionCard.svelte';
 import Markdown from '$lib/components/Markdown.svelte';
+import ModelSelect from '$lib/components/ModelSelect.svelte';
 import ToolRow from '$lib/components/ToolRow.svelte';
 import { board } from '$lib/board.svelte';
 import { modeFromRow } from '$lib/types';
@@ -28,6 +29,10 @@ let modePending = $state<{ id: string; mode: Mode } | null>(null);
 let modeError = $state<{ id: string; message: string } | null>(null);
 let modeTimer: ReturnType<typeof setTimeout> | undefined;
 let modeRequest = 0;
+let modelPending = $state<{ id: string; requested: string } | null>(null);
+let modelError = $state<{ id: string; message: string } | null>(null);
+let modelTimer: ReturnType<typeof setTimeout> | undefined;
+let modelRequest = 0;
 
 $effect(() => {
 const pending = modePending;
@@ -40,6 +45,17 @@ modeError = null;
 }
 });
 
+$effect(() => {
+const pending = modelPending;
+if (pending?.id === id && view.modelId === pending.requested) {
+modelRequest++;
+if (modelTimer !== undefined) clearTimeout(modelTimer);
+modelTimer = undefined;
+modelPending = null;
+modelError = null;
+}
+});
+
 // One socket per session view: the effect closes the previous socket before opening the next.
 // Each open resets the transcript so replayed events never stack on old ones.
 let sock: Socket | undefined;
@@ -47,6 +63,9 @@ $effect(() => {
 const s = connect<Sep>(`/ws/session/${id}`, {
 onOpen: () => {
 interactions = [];
+if (modelTimer !== undefined) clearTimeout(modelTimer);
+modelPending = null;
+modelError = null;
 view.reset();
 view.setConnected(true);
 },
@@ -56,6 +75,15 @@ view.setConnected(false);
 },
 onMessage: (m) => {
 view.apply(m);
+if (m.t === 'session.model') {
+if (modelTimer !== undefined) clearTimeout(modelTimer);
+modelPending = null;
+modelError = null;
+} else if (m.t === 'error' && modelPending?.id === id) {
+if (modelTimer !== undefined) clearTimeout(modelTimer);
+modelPending = null;
+modelError = { id, message: `모델 변경 실패: ${m.message}` };
+}
 applyInteraction(m);
 }
 });
@@ -149,6 +177,25 @@ const mime = url.slice(5, url.indexOf(';'));
 images.push({ key: ++imageSeq, mime, data: url.slice(comma + 1), url });
 }
 input.value = '';
+}
+
+function chooseModel(modelId: string) {
+if (!view.connected || view.running || modelPending?.id === id || modelId === view.modelId) return;
+if (!send({ t: 'model', model_id: modelId })) {
+modelError = { id, message: '모델 변경 요청을 보내지 못했습니다. 연결을 확인한 뒤 다시 시도해주세요.' };
+return;
+}
+modelError = null;
+modelPending = { id, requested: modelId };
+const request = ++modelRequest;
+if (modelTimer !== undefined) clearTimeout(modelTimer);
+modelTimer = setTimeout(() => {
+if (modelRequest === request && modelPending?.id === id) {
+modelPending = null;
+modelError = { id, message: '모델 변경을 확인하지 못했습니다. 다시 시도해주세요.' };
+}
+modelTimer = undefined;
+}, 5000);
 }
 
 function cycleMode() {
@@ -293,6 +340,7 @@ onclick={() => send({ t: 'permission', id: p.id, option_id: opt.id })}
 </div>
 {/each}
 
+{#if modelError?.id === id}<p role="alert" class="text-sm text-red-600">{modelError.message}</p>{/if}
 {#if modeError?.id === id}<p role="alert" class="text-sm text-red-600">{modeError.message}</p>{/if}
 <form
 class="flex flex-col gap-2 rounded-3xl border border-neutral-200 bg-white p-2 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"
@@ -329,7 +377,16 @@ class="max-h-60 min-h-10 w-full resize-none bg-transparent px-2 py-1.5 text-[15p
 {#if sendError}
 <p role="alert" class="px-2 text-sm text-red-700 dark:text-red-300">{sendError}</p>
 {/if}
-<div class="flex items-center gap-1">
+<div class="flex flex-wrap items-center gap-1">
+<div class="basis-full">
+<ModelSelect
+id="session-model"
+value={view.modelId}
+disabled={!view.connected || view.running || modelPending?.id === id}
+commitOnSelect={false}
+onselect={chooseModel}
+/>
+</div>
 <label class="flex size-10 cursor-pointer items-center justify-center rounded-xl hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 첨부">
 <Icon name="image" />
 <span class="sr-only">이미지 첨부</span>

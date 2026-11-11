@@ -110,6 +110,7 @@ struct Conn {
     next_id: u64,
     interactions: Outstanding,
     permissions: Vec<(Value, String, Vec<String>)>,
+    model_id: Option<String>,
 }
 
 struct Done {
@@ -128,6 +129,7 @@ impl Conn {
             next_id: 0,
             interactions: Outstanding::default(),
             permissions: Vec::new(),
+            model_id: None,
         }
     }
 
@@ -238,6 +240,16 @@ impl Conn {
             ClientMsg::Mode { mode } => {
                 self.notify("_x.ai/yolo_mode_changed", mode_params(&sid, mode))
             }
+            ClientMsg::Model { model_id } => {
+                if model_id.trim().is_empty() {
+                    return vec![error("model_id must not be empty")];
+                }
+                self.request(
+                    "session/set_model",
+                    json!({"sessionId": sid, "modelId": model_id}),
+                )
+                .1
+            }
         }
     }
 
@@ -257,6 +269,9 @@ impl Conn {
                     return self.respond_error(id.clone(), -32601, "Method not found");
                 }
             }
+        }
+        if let Some(model_id) = model_changed(msg, &self.id) {
+            return self.select_model(model_id, false);
         }
         let events = self.reducer.on_agent(msg);
         for event in &events {
@@ -286,6 +301,14 @@ impl Conn {
             }
         }
         events
+    }
+
+    fn select_model(&mut self, model_id: String, force: bool) -> Vec<Sep> {
+        if !force && self.model_id.as_deref() == Some(model_id.as_str()) {
+            return Vec::new();
+        }
+        self.model_id = Some(model_id.clone());
+        vec![Sep::SessionModel { model_id }]
     }
 
     fn add_interaction(&mut self, request: Interaction) -> Vec<Sep> {
@@ -336,6 +359,7 @@ impl Conn {
         let response = match done.result {
             Ok(result) => json!({"jsonrpc": "2.0", "id": done.id, "result": result}),
             Err(e) if done.method == "session/load" => return Err(e),
+            Err(e) if done.method == "session/set_model" => return Ok(vec![error(e)]),
             // The turn outlasts the request timeout; turn_completed still ends it.
             Err(e)
                 if done.method == "session/prompt" && e.to_string().contains("no response in") =>
@@ -345,8 +369,80 @@ impl Conn {
             }
             Err(e) => json!({"jsonrpc": "2.0", "id": done.id, "error": {"message": e.to_string()}}),
         };
-        Ok(self.reducer.on_agent(&response))
+        let result = response.get("result").unwrap_or(&Value::Null);
+        let mut events = self.reducer.on_agent(&response);
+        match done.method {
+            "session/load" => {
+                if let Some(model_id) = loaded_model_id(result) {
+                    let mut selected = self.select_model(model_id, false);
+                    selected.extend(events);
+                    events = selected;
+                }
+            }
+            "session/set_model" => {
+                if let Some(model_id) = canonical_model_id(result) {
+                    events.extend(self.select_model(model_id, true));
+                }
+            }
+            _ => {}
+        }
+        Ok(events)
     }
+}
+
+fn model_changed(msg: &Value, expected_session: &str) -> Option<String> {
+    let method = msg.get("method")?.as_str()?;
+    let params = msg.get("params")?;
+    let (method, params) = match (
+        params.get("method").and_then(Value::as_str),
+        params.get("params"),
+    ) {
+        (Some(inner), Some(inner_params)) => (inner, inner_params),
+        _ => (method, params),
+    };
+    let method = method.strip_prefix('_').unwrap_or(method);
+    if !matches!(method, "x.ai/session_notification" | "session/update")
+        || params.get("sessionId").and_then(Value::as_str) != Some(expected_session)
+    {
+        return None;
+    }
+    let update = params.get("update")?;
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("model_changed") {
+        return None;
+    }
+    nonempty_string(update.get("model_id").or_else(|| update.get("modelId")))
+}
+
+fn loaded_model_id(result: &Value) -> Option<String> {
+    let model_id = result
+        .pointer("/models/currentModelId")
+        .or_else(|| result.pointer("/_meta/x.ai~1sessionDetail/currentModelId"))
+        .or_else(|| result.pointer("/meta/x.ai~1sessionDetail/currentModelId"))
+        .or_else(|| result.pointer("/_meta/sessionDetail/currentModelId"))
+        .or_else(|| result.pointer("/meta/sessionDetail/currentModelId"))
+        .or_else(|| result.get("currentModelId"));
+    nonempty_string(model_id)
+}
+
+fn canonical_model_id(result: &Value) -> Option<String> {
+    let model_id = result
+        .pointer("/_meta/canonicalModelId")
+        .or_else(|| result.pointer("/meta/canonicalModelId"))
+        .or_else(|| result.get("canonicalModelId"))
+        .or_else(|| result.pointer("/_meta/model/modelId"))
+        .or_else(|| result.pointer("/_meta/model/id"))
+        .or_else(|| result.pointer("/meta/model/modelId"))
+        .or_else(|| result.pointer("/meta/model/id"))
+        .or_else(|| result.pointer("/model/modelId"))
+        .or_else(|| result.pointer("/model/id"));
+    nonempty_string(model_id)
+}
+
+fn nonempty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn validate_permission_request(msg: &Value, expected_session: &str) -> Result<(), String> {
