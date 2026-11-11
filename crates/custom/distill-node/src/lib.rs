@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod guard;
+pub mod keeper;
 pub mod listen;
 pub mod push;
 pub mod reduce;
