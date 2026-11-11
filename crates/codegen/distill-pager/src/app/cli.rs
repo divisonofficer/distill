@@ -455,6 +455,9 @@ pub struct LeaderArgs {
     #[command(flatten)]
     pub headless: HeadlessArgs,
 }
+/// The command users type to launch Distill. User-facing hints (resume lines, "start a new
+/// session" errors) must print this, not the upstream `grok` name, so they can be pasted as-is.
+pub(crate) const CLI_COMMAND: &str = "distill";
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "distill",
