@@ -53,11 +53,13 @@ pub struct RosterEntry {
     pub title: Option<String>,
     pub cwd: String,
     pub is_worktree: bool,
-    /// Set only on rows the leader synthesizes outside the agent; rows a local agent owns
-    /// leave it `None`. Its value set is disjoint from the persisted `Summary.session_kind`
-    /// (`worktree`, `subagent`, ...), which `merge_roster` only folds into `is_worktree`.
+    /// Persisted relationship metadata; populated from the session summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_workspace_dir: Option<String>,
     #[serde(default)]
     pub model_id: Option<String>,
     /// Per-session reasoning effort for `model_id`.
@@ -99,22 +101,34 @@ pub struct RosterChanged {
 pub const SESSIONS_LIST_METHOD: &str = "x.ai/sessions/list";
 pub const SESSIONS_CHANGED_METHOD: &str = "x.ai/sessions/changed";
 
-/// Merge live `resident` rows with on-disk `summaries` into the sorted roster. Pure, so it is unit-testable without disk or a live actor.
-/// Resident rows own the live state but carry no title or last-active time, so each adopts those from its summary. A `Working` row keeps its "now" timestamp instead.
-/// Summaries with no resident row become `Dormant`; keying by id dedups them. Hidden and headless summaries are excluded, including resident rows whose persisted summary is headless.
-pub(crate) fn merge_roster(
+/// Merge roster rows, hiding hidden sessions unless subagent rows were explicitly requested.
+pub(crate) fn merge_roster(entries: Vec<RosterEntry>, summaries: Vec<Summary>) -> Vec<RosterEntry> {
+    merge_roster_with_subagents(entries, summaries, false)
+}
+
+pub(crate) fn merge_roster_with_subagents(
     mut entries: Vec<RosterEntry>,
     summaries: Vec<Summary>,
+    include_subagents: bool,
 ) -> Vec<RosterEntry> {
+    let excluded = |summary: &Summary| {
+        summary.is_headless()
+            || (summary.is_hidden()
+                && !(include_subagents
+                    && summary
+                        .session_kind
+                        .as_deref()
+                        .is_some_and(|kind| kind.starts_with("subagent"))))
+    };
     let excluded_ids: std::collections::HashSet<String> = summaries
         .iter()
-        .filter(|summary| summary.is_hidden() || summary.is_headless())
+        .filter(|summary| excluded(summary))
         .map(|summary| summary.info.id.0.to_string())
         .collect();
     entries.retain(|entry| !excluded_ids.contains(&entry.session_id));
     let mut by_id: std::collections::HashMap<String, Summary> = summaries
         .into_iter()
-        .filter(|summary| !excluded_ids.contains(summary.info.id.0.as_ref()))
+        .filter(|summary| !excluded(summary))
         .map(|s| (s.info.id.0.to_string(), s))
         .collect();
 
@@ -126,6 +140,9 @@ pub(crate) fn merge_roster(
         if let Some(title) = summary.display_title_opt() {
             entry.title = Some(title);
         }
+        entry.parent_session_id = summary.parent_session_id.clone();
+        entry.session_kind = summary.session_kind.clone();
+        entry.source_workspace_dir = summary.source_workspace_dir.clone();
         // Copied through even when `None`: disk is authoritative
         // A rewind-cleared summary.json also clears a resident row whose cache still holds the old value
         entry.last_turn_summary = summary.last_turn_summary.clone();
@@ -141,7 +158,9 @@ pub(crate) fn merge_roster(
         cwd: summary.info.cwd.clone(),
         is_worktree: summary.session_kind.as_deref() == Some("worktree")
             || summary.source_workspace_dir.is_some(),
-        session_kind: None,
+        parent_session_id: summary.parent_session_id.clone(),
+        session_kind: summary.session_kind.clone(),
+        source_workspace_dir: summary.source_workspace_dir.clone(),
         model_id: Some(summary.current_model_id.0.to_string()),
         reasoning_effort: summary.reasoning_effort,
         yolo: false,
@@ -185,7 +204,9 @@ mod merge_roster_tests {
             title: None,
             cwd: format!("/live/{id}"),
             is_worktree: false,
+            parent_session_id: None,
             session_kind: None,
+            source_workspace_dir: None,
             model_id: Some("grok-4".into()),
             reasoning_effort: None,
             yolo: false,
@@ -285,6 +306,42 @@ mod merge_roster_tests {
             ],
         );
         assert_eq!(out.len(), 1, "duplicate ids collapse to one row");
+    }
+
+    #[test]
+    fn requested_subagent_rows_preserve_parent_kind_and_workspace_metadata() {
+        let mut parent = summary("parent", Some("Parent"), 5_000);
+        parent.session_kind = Some("worktree".into());
+        parent.source_workspace_dir = Some("/repo/source".into());
+        let mut child = summary("child", Some("Child"), 4_000);
+        child.info.cwd = "/tmp/child".into();
+        child.parent_session_id = Some("parent".into());
+        child.session_kind = Some("subagent".into());
+        let mut nested = summary("nested", Some("Nested"), 3_000);
+        nested.parent_session_id = Some("child".into());
+        nested.session_kind = Some("subagent_fork".into());
+
+        let summaries = vec![parent, child, nested];
+        let hidden_default = merge_roster(vec![], summaries.clone());
+        assert_eq!(hidden_default.len(), 1);
+        let rows = merge_roster_with_subagents(
+            vec![resident("parent", RosterActivity::Idle, 6_000)],
+            summaries,
+            true,
+        );
+        assert_eq!(rows.len(), 3);
+        let child = rows.iter().find(|row| row.session_id == "child").unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(child.session_kind.as_deref(), Some("subagent"));
+        let parent = rows.iter().find(|row| row.session_id == "parent").unwrap();
+        assert!(parent.resident);
+        assert_eq!(parent.source_workspace_dir.as_deref(), Some("/repo/source"));
+        let nested = rows.iter().find(|row| row.session_id == "nested").unwrap();
+        assert_eq!(nested.parent_session_id.as_deref(), Some("child"));
+
+        let wire = serde_json::to_value(child).unwrap();
+        assert_eq!(wire["parentSessionId"], "parent");
+        assert_eq!(wire["sessionKind"], "subagent");
     }
 
     #[test]

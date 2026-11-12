@@ -47,6 +47,15 @@ for line in sys.stdin:
         notif("_x.ai/session_notification", {"method": "x.ai/session_notification", "params": {"sessionId": "s1", "update": {"kind": "permission", "sessionUpdate": "pending_interaction", "tool_call_id": "t2"}}})
     elif meth == "echo":
         ok(i, p)
+    elif meth == "delayed":
+        import time
+        time.sleep(0.15)
+        ok(i, p)
+    elif meth == "slow-response":
+        import time
+        notif("_x.ai/session_notification", {"sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "streaming"}}})
+        time.sleep(0.15)
+        ok(i, p)
     elif meth == "boom":
         send({"jsonrpc": "2.0", "id": i, "error": {"code": -32000, "message": "nope"}})
     elif meth == "die":
@@ -79,6 +88,49 @@ async fn concurrent_requests_correlate_by_id() {
     );
     assert_eq!(a.unwrap(), json!({"n": 1}));
     assert_eq!(b.unwrap(), json!({"n": 2}));
+}
+
+#[tokio::test]
+async fn unbounded_request_streams_before_delayed_result_past_short_deadline() {
+    let (_dir, cfg) = fake_config();
+    let (handle, mut inbound) = spawn(&cfg).await.unwrap();
+    let mut pending = tokio::spawn(async move {
+        handle
+            .request_without_timeout("slow-response", json!({"ok": true}))
+            .await
+    });
+
+    let event = timeout(WAIT, inbound.recv()).await.unwrap().unwrap();
+    assert_eq!(event["params"]["update"]["content"]["text"], "streaming");
+    assert!(
+        timeout(Duration::from_millis(30), &mut pending)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        timeout(WAIT, pending).await.unwrap().unwrap().unwrap(),
+        json!({"ok": true})
+    );
+}
+
+#[tokio::test]
+async fn dropping_pending_request_removes_registration() {
+    let (_dir, cfg) = fake_config();
+    let (handle, _rx) = spawn(&cfg).await.unwrap();
+    let request_handle = handle.clone();
+    let request = tokio::spawn(async move {
+        request_handle
+            .request_with_timeout("delayed", json!({}), Duration::from_secs(5))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        handle.request("echo", json!({"alive":true})).await.unwrap(),
+        json!({"alive":true})
+    );
 }
 
 #[tokio::test]

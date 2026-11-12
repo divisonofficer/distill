@@ -38,6 +38,7 @@ interface MockSession {
 }
 
 const sessions = new Map<string, MockSession>();
+const boardListeners = new Set<(sessions: BoardRow[]) => void>();
 let created = 0;
 let loaded: Promise<void> | null = null;
 
@@ -74,6 +75,11 @@ function loadAll(): Promise<void> {
 		}
 	})();
 	return loaded;
+}
+
+function publishRow(s: MockSession): void {
+	const update = [rowOf(s)];
+	for (const listener of boardListeners) listener(update);
 }
 
 function rowOf(s: MockSession): BoardRow {
@@ -127,10 +133,12 @@ async function replay(s: MockSession, emit: (m: Sep) => void, alive: () => boole
 		if (ev.t === 'session.state' && ev.status === 'waiting_permission') continue;
 		if (ev.t === 'permission.resolved') {
 			if (s.answered.has(ev.tool_call_id)) emit(ev);
+			publishRow(s);
 			continue;
 		}
 		if (ev.t === 'permission.request') {
 			emit(ev);
+			publishRow(s);
 			if (s.answered.has(ev.tool_call_id)) continue;
 			if (!ended) {
 				ended = true;
@@ -155,6 +163,7 @@ async function runTurn(s: MockSession, emit: (m: Sep) => void, text: string, ali
 		if (!alive() || s.turn !== turn) return;
 		s.events.push(ev);
 		emit(ev);
+		if (ev.t === 'session.state') publishRow(s);
 		await sleep(40);
 	}
 }
@@ -167,6 +176,8 @@ export function mockSocket<M>(path: string, h: SocketHandlers<M>): Socket {
 	};
 
 	if (path === '/ws/board') {
+		const publish = (sessions: BoardRow[]) => emit({ t: 'board.upsert', sessions });
+		boardListeners.add(publish);
 		void (async () => {
 			await loadAll();
 			await sleep(50);
@@ -174,7 +185,13 @@ export function mockSocket<M>(path: string, h: SocketHandlers<M>): Socket {
 			h.onOpen();
 			emit({ t: 'board.upsert', sessions: [...sessions.values()].map(rowOf) });
 		})();
-		return { send() {}, close: () => (closed = true) };
+		return {
+			send() {},
+			close: () => {
+				closed = true;
+				boardListeners.delete(publish);
+			}
+		};
 	}
 
 	const id = path.replace('/ws/session/', '');
@@ -212,6 +229,7 @@ export function mockSocket<M>(path: string, h: SocketHandlers<M>): Socket {
 					if (!p) break;
 					s.pending.delete(keyOf(msg.id));
 					s.answered.add(p.toolCallId);
+					publishRow(s);
 					p.resolve();
 					break;
 				}

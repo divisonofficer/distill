@@ -64,6 +64,13 @@ for line in lines:
         ok(i, {})
     elif meth == "_x.ai/sessions/list":
         ok(i, {"sessions": list(SESSIONS)})
+    elif meth == "_x.ai/git/worktree/create_from_worktree_sync":
+        if p.get("label") == "fail":
+            ok(i, {"result": None, "error": "worktree creation failed"})
+        else:
+            path = os.environ["FAKE_WORKTREE"]
+            os.makedirs(path, exist_ok=True)
+            ok(i, {"result": {"status": "created", "newSessionId": p["newSessionId"], "worktreePath": path, "sourceGitRoot": p["sourceWorktreePath"]}})
     elif meth == "session/new":
         SESSIONS.append({"sessionId": "s2", "cwd": p.get("cwd", "/tmp"), "activity": "idle"})
         ok(i, {"sessionId": "s2"})
@@ -71,9 +78,27 @@ for line in lines:
         ok(i, {})
         notif("_x.ai/session_notification", pending("t1"))
         notif("_x.ai/session_notification", {"sessionId": "s1", "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "t1"}})
+    elif meth == "_x.ai/session/load_history":
+        cursor = p.get("cursor")
+        if cursor is None:
+            ok(i, {"items": [{"t": "user.message", "text": "latest"}], "cursor": "older-page", "has_more": True})
+        elif cursor == "older-page":
+            ok(i, {"items": [{"t": "user.message", "text": "oldest"}], "cursor": None, "has_more": False})
+        else:
+            send({"jsonrpc": "2.0", "id": i, "error": {"code": -32602, "message": "bad cursor"}})
     elif meth == "session/prompt":
         sid = p["sessionId"]
         prompt = " ".join(block.get("text", "") for block in p.get("prompt", []) if block.get("type") == "text").lower()
+        if "slow prompt" in prompt:
+            import time
+            notif("_x.ai/session_notification", {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "early stream"}}})
+            time.sleep(0.2)
+            notif("_x.ai/session_notification", {"sessionId": sid, "update": {"sessionUpdate": "turn_completed", "stop_reason": "end_turn"}})
+            ok(i, {"stopReason": "end_turn"})
+            continue
+        if "disconnect prompt" in prompt:
+            notif("_x.ai/session_notification", {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "before disconnect"}}})
+            sys.exit(4)
         if "question" in prompt:
             request_id, method, tool_call_id = 901, "_x.ai/ask_user_question", "q1"
             body = {"sessionId": sid, "toolCallId": tool_call_id, "mode": "default", "questions": [
@@ -118,6 +143,7 @@ struct Fixture {
     addr: SocketAddr,
     log: PathBuf,
     cwd: PathBuf,
+    worktree: PathBuf,
     web: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -128,6 +154,7 @@ async fn start() -> Fixture {
     let script = dir.path().join("fake_agent.py");
     std::fs::write(&script, FAKE_AGENT).unwrap();
     let log = dir.path().join("fake.log");
+    let worktree = dir.path().join("worktree");
     let cwd = dir.path().join("cwd");
     std::fs::create_dir(&cwd).unwrap();
     let web = dir.path().join("web");
@@ -138,15 +165,20 @@ async fn start() -> Fixture {
     let agent = AgentConfig {
         distill_bin: PathBuf::from("python3"),
         args: vec![script.into_os_string()],
-        extra_env: vec![("FAKE_LOG".into(), log.clone().into_os_string())],
+        extra_env: vec![
+            ("FAKE_LOG".into(), log.clone().into_os_string()),
+            ("FAKE_WORKTREE".into(), worktree.clone().into_os_string()),
+        ],
     };
     let keeper = Keeper::start(agent.clone()).await.unwrap();
-    let push = Arc::new(Push::load_or_create(&dir.path().join("state")).unwrap());
+    let state_dir = dir.path().join("state");
+    let push = Arc::new(Push::load_or_create(&state_dir).unwrap());
+    let chat_store = distill_node::chat_store::Store::open(&state_dir.join("chats")).unwrap();
     let guard = Arc::new(GuardConfig {
         owner: OWNER.to_owned(),
         allowed_origins: vec![ORIGIN.to_owned()],
     });
-    let app = trusted_router(keeper, push, agent, guard, Some(web.clone()));
+    let app = trusted_router(keeper, push, agent, guard, Some(web.clone()), chat_store);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -158,6 +190,7 @@ async fn start() -> Fixture {
         addr,
         log,
         cwd,
+        worktree,
         web,
         _dir: dir,
     }
@@ -250,7 +283,7 @@ async fn create_session_always_approve_sets_yolo_meta() {
 }
 
 #[tokio::test]
-async fn create_session_rejects_relative_cwd_and_worktree() {
+async fn create_session_rejects_relative_cwd_and_creates_worktree_before_session() {
     let f = start().await;
     let client = client();
     let relative = client
@@ -261,6 +294,14 @@ async fn create_session_rejects_relative_cwd_and_worktree() {
         .await
         .unwrap();
     assert_eq!(relative.status(), 400);
+    let invalid_name = client
+        .post(format!("{}/api/sessions", f.base))
+        .header("Tailscale-User-Login", OWNER)
+        .json(&json!({"cwd": f.cwd, "worktree": {"name": "../escape"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_name.status(), 400);
 
     let worktree = client
         .post(format!("{}/api/sessions", f.base))
@@ -269,7 +310,50 @@ async fn create_session_rejects_relative_cwd_and_worktree() {
         .send()
         .await
         .unwrap();
-    assert_eq!(worktree.status(), 501);
+    assert_eq!(worktree.status(), 200);
+    let calls = log_lines(&f.log);
+    let create = calls
+        .iter()
+        .find(|m| m["method"] == "_x.ai/git/worktree/create_from_worktree_sync")
+        .unwrap();
+    let session = calls.iter().find(|m| m["method"] == "session/new").unwrap();
+    assert_eq!(
+        create["params"]["sourceWorktreePath"],
+        f.cwd.to_string_lossy().as_ref()
+    );
+    assert_eq!(create["params"]["copyMode"], "dirty");
+    assert_eq!(create["params"]["label"], "wt");
+    assert!(create["params"]["newSessionId"].as_str().unwrap().len() > 10);
+    assert_eq!(
+        session["params"]["cwd"],
+        f.worktree.to_string_lossy().as_ref()
+    );
+    assert!(
+        calls
+            .iter()
+            .position(|m| m["method"] == "_x.ai/git/worktree/create_from_worktree_sync")
+            .unwrap()
+            < calls
+                .iter()
+                .position(|m| m["method"] == "session/new")
+                .unwrap()
+    );
+
+    let failed = client
+        .post(format!("{}/api/sessions", f.base))
+        .header("Tailscale-User-Login", OWNER)
+        .json(&json!({"cwd": f.cwd, "worktree": {"name": "fail"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 502);
+    assert_eq!(
+        log_lines(&f.log)
+            .iter()
+            .filter(|m| m["method"] == "session/new")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -293,6 +377,179 @@ async fn list_requires_owner() {
         .await
         .unwrap();
     assert_eq!(ok["sessions"][0]["sessionId"], "s1");
+}
+
+#[tokio::test]
+async fn general_chat_api_guards_persists_and_reopens_messages() {
+    let f = start().await;
+    let client = client();
+    let endpoint = format!("{}/api/chats", f.base);
+
+    let anonymous = client.get(&endpoint).send().await.unwrap();
+    assert_eq!(anonymous.status(), 403);
+
+    let bad_origin = client
+        .get(&endpoint)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), 403);
+
+    let empty: Value = client
+        .get(&endpoint)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty, json!({"chats": []}));
+
+    let invalid_create = client
+        .post(&endpoint)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .json(&json!({"title": "Injected", "role": "assistant"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_create.status(), 400);
+
+    let create = client
+        .post(&endpoint)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .json(&json!({"title": "General chat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), 201);
+    let chat: Value = create.json().await.unwrap();
+    let chat_id = chat["chatId"].as_str().unwrap().to_owned();
+    assert!(!chat_id.is_empty());
+    assert_eq!(chat["title"], "General chat");
+    let listed: Value = client
+        .get(&endpoint)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["chats"],
+        json!([{"chatId": chat_id, "title": "General chat"}])
+    );
+
+    let missing_chat = client
+        .get(format!("{}/api/chats/missing", f.base))
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_chat.status(), 404);
+
+    let messages = format!("{}/api/chats/{chat_id}/messages", f.base);
+    let root_response = client
+        .post(&messages)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .json(&json!({"text": "root", "parentId": null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root_response.status(), 201);
+    let root: Value = root_response.json().await.unwrap();
+    assert_eq!(root["message"]["role"], "user");
+    assert_eq!(root["message"]["text"], "root");
+    assert_eq!(root["message"]["parentId"], Value::Null);
+    assert_eq!(root["message"]["model"], Value::Null);
+    assert!(!root["message"]["author"].as_str().unwrap().is_empty());
+    assert!(root["message"]["seq"].as_u64().is_some());
+    assert_eq!(
+        root["inference"],
+        json!({"status": "unavailable", "reason": "not_implemented"})
+    );
+    let root_id = root["message"]["messageId"].as_str().unwrap();
+
+    for text in ["left branch", "right branch"] {
+        let response = client
+            .post(&messages)
+            .header("Tailscale-User-Login", OWNER)
+            .header("Origin", ORIGIN)
+            .json(&json!({"text": text, "parentId": root_id}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["message"]["parentId"], root_id);
+        assert_eq!(body["message"]["role"], "user");
+    }
+
+    let invalid_parent = client
+        .post(&messages)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .json(&json!({"text": "bad parent", "parentId": "not-in-chat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_parent.status(), 400);
+
+    let role_injection = client
+        .post(&messages)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .json(&json!({"text": "not assistant", "role": "assistant"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(role_injection.status(), 400);
+
+    let oversized_text = client
+        .post(&messages)
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .json(&json!({"text": "x".repeat(1024 * 1024 + 1)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized_text.status(), 400);
+
+    let history: Value = client
+        .get(format!("{}/api/chats/{chat_id}", f.base))
+        .header("Tailscale-User-Login", OWNER)
+        .header("Origin", ORIGIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(history["chatId"], chat_id);
+    assert_eq!(history["title"], "General chat");
+    assert_eq!(history["messages"].as_array().unwrap().len(), 3);
+    assert!(
+        history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["role"] == "user")
+    );
+
+    let reopened =
+        distill_node::chat_store::Store::open(&f._dir.path().join("state/chats")).unwrap();
+    let saved = reopened.conversation(&chat_id).unwrap();
+    assert_eq!(saved.title.as_deref(), Some("General chat"));
+    assert_eq!(saved.messages.len(), 3);
 }
 
 #[tokio::test]
@@ -332,7 +589,14 @@ async fn session_replays_then_prompt_permission_turn() {
         json!({"t": "permission", "id": 900, "option_id": "allow-once"}),
     )
     .await;
+    until(&mut ws, "permission.resolved").await;
     until(&mut ws, "turn.end").await;
+    send_json(
+        &mut ws,
+        json!({"t":"permission","id":900,"option_id":"allow-once"}),
+    )
+    .await;
+    assert_eq!(until(&mut ws, "permission.expired").await["id"], 900);
 
     let answered = log_lines(&f.log).into_iter().any(|m| {
         m["id"] == 900
@@ -340,6 +604,98 @@ async fn session_replays_then_prompt_permission_turn() {
             && m["result"]["outcome"]["optionId"] == "allow-once"
     });
     assert!(answered, "permission response reached the agent");
+}
+
+#[tokio::test]
+async fn history_pages_are_requested_from_agent_and_invalid_cursor_can_retry() {
+    let f = start().await;
+    let mut ws = connect(f.addr, "/ws/session/s1").await;
+    let initial = until(&mut ws, "history.page").await;
+    assert_eq!(initial["items"][0]["text"], "latest");
+    assert_eq!(initial["initial"], true);
+    until(&mut ws, "replay.end").await;
+    send_json(&mut ws, json!({"t":"history.load", "cursor":"foreign"})).await;
+    let invalid = until(&mut ws, "history.page").await;
+    assert!(invalid["error"].is_string());
+    assert_eq!(invalid["has_more"], true);
+    send_json(&mut ws, json!({"t":"history.load", "cursor":"older-page"})).await;
+    let older = until(&mut ws, "history.page").await;
+    assert_eq!(older["items"][0]["text"], "oldest");
+    assert_eq!(older["initial"], false);
+    assert_eq!(older["has_more"], false);
+    let log = log_lines(&f.log);
+    assert!(log.iter().any(|m| m["method"] == "session/load"
+        && m["params"]["_meta"]["noReplay"] == true));
+    assert!(log.iter().any(|m| m["method"] == "_x.ai/session/load_history"
+        && m["params"]["cursor"] == "older-page"));
+}
+
+#[tokio::test]
+async fn slow_prompt_streams_before_agent_result_without_false_idle() {
+    let f = start().await;
+    let mut ws = connect(f.addr, "/ws/session/s1").await;
+    until(&mut ws, "replay.end").await;
+    send_json(&mut ws, json!({"t": "prompt", "text": "slow prompt"})).await;
+
+    let running = until(&mut ws, "session.state").await;
+    assert_eq!(running["status"], "running");
+    let streamed = until(&mut ws, "message.delta").await;
+    assert_eq!(streamed["text"], "early stream");
+    let ended = until(&mut ws, "turn.end").await;
+    assert_eq!(ended["stop_reason"], "end_turn");
+    let idle = until(&mut ws, "session.state").await;
+    assert_eq!(idle["status"], "idle");
+}
+
+#[tokio::test]
+async fn prompt_disconnect_reports_unknown_without_retry_or_false_idle() {
+    let f = start().await;
+    let mut ws = connect(f.addr, "/ws/session/s1").await;
+    until(&mut ws, "replay.end").await;
+    send_json(&mut ws, json!({"t": "prompt", "text": "disconnect prompt"})).await;
+
+    let mut events = Vec::new();
+    loop {
+        let event = next_json(&mut ws).await;
+        let complete = event["t"] == "session.state" && event["status"] == "error";
+        events.push(event);
+        if complete {
+            break;
+        }
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| event["t"] == "message.delta" && event["text"] == "before disconnect")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["t"] == "session.state" && event["status"] == "running")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| { event["t"] == "session.state" && event["status"] == "idle" })
+    );
+    assert!(events.iter().any(|event| {
+        event["t"] == "turn.end"
+            && event["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session/prompt outcome is unknown")
+    }));
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["t"] == "session.state" && event["status"] == "error" }),
+        "{events:?}"
+    );
+    let prompts = log_lines(&f.log)
+        .into_iter()
+        .filter(|m| m["method"] == "session/prompt")
+        .count();
+    assert_eq!(prompts, 1);
 }
 
 #[tokio::test]
@@ -353,6 +709,7 @@ async fn session_question_reply_validates_and_resolves_request() {
             &ClientMsg::Prompt {
                 text: "question flow".into(),
                 images: vec![],
+                text_files: vec![],
             },
         )
         .await;
@@ -446,6 +803,7 @@ async fn session_plan_reply_validates_and_resolves_request() {
             &ClientMsg::Prompt {
                 text: "plan flow".into(),
                 images: vec![],
+                text_files: vec![],
             },
         )
         .await;

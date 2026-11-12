@@ -1,5 +1,6 @@
 import { connect, getJson, type Socket } from './api';
-import type { BoardRow, NodeInfo } from './types';
+import { orderedOrigins } from './fleet';
+import type { BoardRow } from './types';
 
 type BoardMsg =
 	| { t: 'board.upsert'; sessions: BoardRow[] }
@@ -16,22 +17,26 @@ export function sortRows(rows: BoardRow[]): BoardRow[] {
 class Board {
 	rows = $state<BoardRow[]>([]);
 	host = $state('');
+	get origin() { return this.host; }
 	connected = $state(false);
 	#sock: Socket | null = null;
 
 	start() {
 		if (this.#sock) return;
-		getJson<NodeInfo>('/api/node')
-			.then((n) => (this.host = n.host))
-			.catch(() => {});
+		const hosts = orderedOrigins();
+		this.host = hosts[0] ?? (typeof location === 'undefined' ? '' : location.origin);
 		this.#sock = connect<BoardMsg>('/ws/board', {
+			onHost: (origin) => {
+				if (this.host !== origin) this.rows = [];
+				this.host = origin;
+			},
 			onOpen: () => {
 				this.connected = true;
 				void this.#refresh();
 			},
 			onClose: () => (this.connected = false),
 			onMessage: (m) => this.#apply(m)
-		});
+		}, { failover: true });
 	}
 
 	find(id: string): BoardRow | undefined {
@@ -40,8 +45,9 @@ class Board {
 
 	async #refresh() {
 		try {
-			const res = await getJson<{ sessions: BoardRow[] }>('/api/sessions');
-			this.rows = res.sessions;
+			const origin = this.host;
+			const res = await getJson<{ sessions: BoardRow[] }>('/api/sessions', origin || undefined);
+			if (this.host === origin) this.rows = res.sessions.map((row) => ({ ...row, apiOrigin: origin }));
 		} catch {
 			// the board stays on the last known rows
 		}
@@ -50,7 +56,7 @@ class Board {
 	#apply(m: BoardMsg) {
 		if (m.t === 'board.upsert') {
 			const map = new Map(this.rows.map((r) => [r.sessionId, r]));
-			for (const s of m.sessions) map.set(s.sessionId, s);
+			for (const s of m.sessions) map.set(s.sessionId, { ...s, apiOrigin: this.origin });
 			this.rows = [...map.values()];
 		} else if (m.t === 'board.remove') {
 			const gone = new Set(m.ids);

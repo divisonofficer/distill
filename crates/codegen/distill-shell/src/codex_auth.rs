@@ -860,6 +860,10 @@ pub async fn run_tui_login_at(
     Ok(())
 }
 
+fn should_auto_open_browser(url_feedback_present: bool) -> bool {
+    !url_feedback_present
+}
+
 async fn run_browser_login_at(
     path: &Path,
     endpoints: &CodexEndpoints,
@@ -889,16 +893,19 @@ async fn run_browser_login_at(
         eprintln!("Open this URL if your browser does not open automatically:");
         eprintln!("  {auth_url}");
     }
+    let open_browser = should_auto_open_browser(url_feedback.is_some());
     if let Some(tx) = url_feedback {
         let _ = tx.send(auth_url.clone());
     }
-    let open_url = auth_url.clone();
-    let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url))
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result.map_err(|error| error.to_string()));
-    if let Err(error) = browser_result {
-        report_browser_launch_failure(browser_fallback, &auth_url, error);
+    if open_browser {
+        let open_url = auth_url.clone();
+        let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+        if let Err(error) = browser_result {
+            report_browser_launch_failure(browser_fallback, &auth_url, error);
+        }
     }
 
     let code = tokio::time::timeout(
@@ -1654,6 +1661,12 @@ pub async fn apply_codex_backend_at(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn url_feedback_disables_automatic_browser_launch() {
+        assert!(!should_auto_open_browser(true));
+        assert!(should_auto_open_browser(false));
+    }
 
     #[test]
     fn reads_installed_codex_version() {

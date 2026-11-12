@@ -16,7 +16,7 @@ use crate::agent::{self, AgentConfig, AgentHandle};
 use crate::interaction::{self, Interaction, Outstanding};
 use crate::keeper::Keeper;
 use crate::reduce::Reducer;
-use crate::sep::{ClientMsg, PermissionMode, Sep};
+use crate::sep::{ClientMsg, PermissionMode, Sep, Status};
 
 #[derive(Clone)]
 struct Ctx {
@@ -50,25 +50,30 @@ async fn run(mut socket: WebSocket, ctx: Ctx, id: String) {
             return;
         }
     };
-    let mut conn = Conn::new(id.clone(), handle);
+    let mut conn = Conn::new(id.clone(), handle, cwd.to_string_lossy().into_owned());
     let (_, events) = conn.request(
         "session/load",
         json!({
             "sessionId": id,
             "cwd": cwd.to_string_lossy(),
             "mcpServers": [],
-            "_meta": {"yoloMode": false, "autoMode": false},
+            "_meta": {"yoloMode": false, "autoMode": false, "noReplay": true, "postudioHistoryPaging": true},
         }),
     );
     if !emit(&mut socket, &events).await {
         return;
     }
+    let mut inbound_open = true;
     loop {
         tokio::select! {
             // Biased: agent lines queued before a response are applied before that response.
             biased;
-            msg = inbound.recv() => {
-                let Some(msg) = msg else { break };
+            msg = inbound.recv(), if inbound_open => {
+                let Some(msg) = msg else {
+                    inbound_open = false;
+                    if conn.tasks.is_empty() { break; }
+                    continue;
+                };
                 if !emit(&mut socket, &conn.on_agent_msg(&msg)).await {
                     break;
                 }
@@ -86,6 +91,7 @@ async fn run(mut socket: WebSocket, ctx: Ctx, id: String) {
                         break;
                     }
                 }
+                if !inbound_open && conn.tasks.is_empty() { break; }
             }
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
@@ -111,6 +117,11 @@ struct Conn {
     interactions: Outstanding,
     permissions: Vec<(Value, String, Vec<String>)>,
     model_id: Option<String>,
+    runtime_status: Status,
+    history_cwd: String,
+    history_cursor: Option<String>,
+    history_has_more: bool,
+    history_request_pending: bool,
 }
 
 struct Done {
@@ -120,7 +131,7 @@ struct Done {
 }
 
 impl Conn {
-    fn new(id: String, handle: AgentHandle) -> Self {
+    fn new(id: String, handle: AgentHandle, history_cwd: String) -> Self {
         Self {
             reducer: Reducer::new(id.clone()),
             id,
@@ -130,6 +141,11 @@ impl Conn {
             interactions: Outstanding::default(),
             permissions: Vec::new(),
             model_id: None,
+            runtime_status: Status::Idle,
+            history_cwd,
+            history_cursor: None,
+            history_has_more: false,
+            history_request_pending: false,
         }
     }
 
@@ -140,9 +156,14 @@ impl Conn {
         let events = self.reducer.on_client(
             &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params.clone()}),
         );
+        self.record_runtime_status(&events);
         let handle = self.handle.clone();
         self.tasks.spawn(async move {
-            let result = handle.request(method, params).await;
+            let result = if method == "session/prompt" {
+                handle.request_without_timeout(method, params).await
+            } else {
+                handle.request(method, params).await
+            };
             Done { id, method, result }
         });
         (id, events)
@@ -175,13 +196,31 @@ impl Conn {
         };
         let sid = self.id.clone();
         match msg {
-            ClientMsg::Prompt { text, images } => {
-                let mut blocks = vec![json!({"type": "text", "text": text})];
-                blocks.extend(
-                    images.into_iter().map(
-                        |img| json!({"type": "image", "mimeType": img.mime, "data": img.data}),
-                    ),
-                );
+            ClientMsg::HistoryLoad { cursor } => {
+                if self.history_request_pending
+                    || !self.history_has_more
+                    || self.history_cursor.as_deref() != Some(cursor.as_str())
+                {
+                    return vec![history_page_error(
+                        self.history_cursor.clone(),
+                        self.history_has_more,
+                        false,
+                        "History cursor is stale",
+                    )];
+                }
+                self.request_history(Some(cursor), false);
+                Vec::new()
+            }
+            ClientMsg::Prompt {
+                text,
+                images,
+                text_files,
+            } => {
+                let blocks =
+                    match crate::attachments::prompt_blocks(Some(&text), &images, &text_files) {
+                        Ok(blocks) => blocks,
+                        Err(message) => return vec![error(message)],
+                    };
                 self.request(
                     "session/prompt",
                     json!({"sessionId": sid, "prompt": blocks}),
@@ -190,16 +229,30 @@ impl Conn {
             }
             ClientMsg::Cancel => self.notify("session/cancel", json!({"sessionId": sid})),
             ClientMsg::Permission { id, option_id } => {
-                let Some(index) = self.permissions.iter().position(|(pending, _, options)| {
-                    *pending == id && options.contains(&option_id)
-                }) else {
-                    return vec![error("unknown permission request or option")];
+                let Some(index) = self
+                    .permissions
+                    .iter()
+                    .position(|(pending, _, _)| *pending == id)
+                else {
+                    if self.interactions.contains_id(&id) {
+                        return vec![error("unknown permission request or option")];
+                    }
+                    return vec![Sep::PermissionExpired { id }];
                 };
-                self.permissions.remove(index);
-                self.respond(
+                let (_, tool_call_id, options) = &self.permissions[index];
+                if !options.contains(&option_id) {
+                    return vec![error("unknown permission request or option")];
+                }
+                let tool_call_id = tool_call_id.clone();
+                if let Err(e) = self.handle.respond(
                     id,
                     json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
-                )
+                ) {
+                    return vec![error(e)];
+                }
+                self.permissions.remove(index);
+                self.runtime_status = Status::Running;
+                vec![Sep::PermissionResolved { tool_call_id }]
             }
             ClientMsg::QuestionReply {
                 id,
@@ -254,6 +307,15 @@ impl Conn {
     }
 
     fn on_agent_msg(&mut self, msg: &Value) -> Vec<Sep> {
+        if is_historical_replay(msg) {
+            let events = self.reducer.on_agent(msg);
+            let state = events
+                .iter()
+                .filter(|event| matches!(event, Sep::SessionTitle { .. } | Sep::Usage { .. }))
+                .cloned()
+                .collect();
+            return state;
+        }
         if let (Some(id), Some(method)) = (msg.get("id"), msg.get("method").and_then(Value::as_str))
         {
             match interaction::parse_request(msg, &self.id) {
@@ -274,6 +336,7 @@ impl Conn {
             return self.select_model(model_id, false);
         }
         let events = self.reducer.on_agent(msg);
+        self.record_runtime_status(&events);
         for event in &events {
             match event {
                 Sep::PermissionRequest {
@@ -282,7 +345,8 @@ impl Conn {
                     options,
                     ..
                 } => {
-                    self.permissions.retain(|(pending, _, _)| pending != id);
+                    self.permissions
+                        .retain(|(pending, tool, _)| pending != id && tool != tool_call_id);
                     self.permissions.push((
                         id.clone(),
                         tool_call_id.clone(),
@@ -303,6 +367,15 @@ impl Conn {
         events
     }
 
+    fn record_runtime_status(&mut self, events: &[Sep]) {
+        if let Some(status) = events.iter().rev().find_map(|event| match event {
+            Sep::SessionState { status } => Some(*status),
+            _ => None,
+        }) {
+            self.runtime_status = status;
+        }
+    }
+
     fn select_model(&mut self, model_id: String, force: bool) -> Vec<Sep> {
         if !force && self.model_id.as_deref() == Some(model_id.as_str()) {
             return Vec::new();
@@ -315,6 +388,7 @@ impl Conn {
         if let Err(message) = self.interactions.insert(request.clone()) {
             return self.respond_error(request.id().clone(), -32602, &message);
         }
+        self.runtime_status = Status::WaitingPermission;
         match request {
             Interaction::Question {
                 id,
@@ -354,33 +428,137 @@ impl Conn {
             .collect()
     }
 
+    fn request_history(&mut self, cursor: Option<String>, initial: bool) {
+        self.history_request_pending = true;
+        self.next_id += 1;
+        let id = self.next_id;
+        let handle = self.handle.clone();
+        let session_id = self.id.clone();
+        let cwd = self.history_cwd.clone();
+        self.tasks.spawn(async move {
+            let result = handle
+                .request_without_timeout(
+                    "_x.ai/session/load_history",
+                    json!({"sessionId": session_id, "cwd": cwd, "cursor": cursor}),
+                )
+                .await;
+            Done {
+                id,
+                method: if initial {
+                    "history.initial"
+                } else {
+                    "history.older"
+                },
+                result,
+            }
+        });
+    }
+
     /// Err when the session/load failed: the caller closes the socket.
     fn on_done(&mut self, done: Done) -> anyhow::Result<Vec<Sep>> {
-        let response = match done.result {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": done.id, "result": result}),
+        let result = match done.result {
+            Ok(result) => result,
             Err(e) if done.method == "session/load" => return Err(e),
             Err(e) if done.method == "session/set_model" => return Ok(vec![error(e)]),
-            // The turn outlasts the request timeout; turn_completed still ends it.
-            Err(e)
-                if done.method == "session/prompt" && e.to_string().contains("no response in") =>
-            {
-                tracing::debug!(error = %e, "prompt still running");
-                return Ok(Vec::new());
+            Err(e) if done.method == "history.initial" || done.method == "history.older" => {
+                self.history_request_pending = false;
+                let initial = done.method == "history.initial";
+                let mut events = vec![history_page_error(
+                    self.history_cursor.clone(),
+                    self.history_has_more,
+                    initial,
+                    &e.to_string(),
+                )];
+                if initial {
+                    events.push(Sep::SessionState {
+                        status: self.runtime_status,
+                    });
+                    events.push(Sep::ReplayEnd);
+                }
+                return Ok(events);
             }
-            Err(e) => json!({"jsonrpc": "2.0", "id": done.id, "error": {"message": e.to_string()}}),
+            Err(e) => {
+                let response =
+                    json!({"jsonrpc":"2.0", "id":done.id, "error":{"message":e.to_string()}});
+                let events = self.reducer.on_agent(&response);
+                self.record_runtime_status(&events);
+                return Ok(events);
+            }
         };
-        let result = response.get("result").unwrap_or(&Value::Null);
+        let response = json!({"jsonrpc": "2.0", "id": done.id, "result": result});
         let mut events = self.reducer.on_agent(&response);
         match done.method {
             "session/load" => {
-                if let Some(model_id) = loaded_model_id(result) {
+                if let Some(model_id) = loaded_model_id(&result) {
                     let mut selected = self.select_model(model_id, false);
                     selected.extend(events);
                     events = selected;
                 }
+                events.retain(|event| !matches!(event, Sep::ReplayEnd));
+                self.request_history(None, true);
+            }
+            "history.initial" | "history.older" => {
+                self.history_request_pending = false;
+                let initial = done.method == "history.initial";
+                let items = result
+                    .get("items")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<Sep>>(value).ok());
+                let Some(items) = items else {
+                    let mut events = vec![history_page_error(
+                        self.history_cursor.clone(),
+                        self.history_has_more,
+                        initial,
+                        "Invalid history page from agent",
+                    )];
+                    if initial {
+                        events.push(Sep::SessionState {
+                            status: self.runtime_status,
+                        });
+                        events.push(Sep::ReplayEnd);
+                    }
+                    return Ok(events);
+                };
+                let cursor = result
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let has_more = result
+                    .get("has_more")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.history_cursor = cursor.clone();
+                self.history_has_more = has_more;
+                events.clear();
+                if initial {
+                    if let Some(title) = result.get("title").and_then(Value::as_str) {
+                        events.push(Sep::SessionTitle {
+                            title: title.to_owned(),
+                        });
+                    }
+                    if let (Some(used), Some(size)) = (
+                        result.pointer("/usage/used").and_then(Value::as_u64),
+                        result.pointer("/usage/size").and_then(Value::as_u64),
+                    ) {
+                        events.push(Sep::Usage { used, size });
+                    }
+                }
+                events.push(Sep::HistoryPage {
+                    items,
+                    cursor,
+                    has_more,
+                    initial,
+                    error: None,
+                });
+                if initial {
+                    events.push(Sep::SessionState {
+                        status: self.runtime_status,
+                    });
+                    events.push(Sep::ReplayEnd);
+                }
             }
             "session/set_model" => {
-                if let Some(model_id) = canonical_model_id(result) {
+                if let Some(model_id) = canonical_model_id(&result) {
                     events.extend(self.select_model(model_id, true));
                 }
             }
@@ -496,11 +674,36 @@ async fn open(cfg: &AgentConfig) -> anyhow::Result<(AgentHandle, UnboundedReceiv
 }
 
 async fn lookup_cwd(keeper: &Keeper, id: &str) -> Option<PathBuf> {
-    if let Some(cwd) = keeper.cwd_of(id) {
-        return Some(cwd);
+    if keeper.cwd_of(id).is_none() {
+        keeper.refresh().await.ok()?;
     }
-    keeper.refresh().await.ok()?;
-    keeper.cwd_of(id)
+    let cwd = keeper.cwd_of(id)?;
+    keeper.attach(id).await.ok()?;
+    Some(cwd)
+}
+
+fn history_page_error(cursor: Option<String>, has_more: bool, initial: bool, message: &str) -> Sep {
+    Sep::HistoryPage {
+        items: Vec::new(),
+        cursor,
+        has_more,
+        initial,
+        error: Some(message.to_owned()),
+    }
+}
+
+fn is_historical_replay(msg: &Value) -> bool {
+    matches!(
+        msg.get("method").and_then(Value::as_str),
+        Some("session/update" | "_x.ai/session/update" | "_x.ai/session_notification")
+    ) && (msg
+        .pointer("/params/_meta/isReplay")
+        .and_then(Value::as_bool)
+        == Some(true)
+        || msg
+            .pointer("/params/params/_meta/isReplay")
+            .and_then(Value::as_bool)
+            == Some(true))
 }
 
 fn error(message: impl std::fmt::Display) -> Sep {
@@ -520,4 +723,25 @@ async fn emit(socket: &mut WebSocket, events: &[Sep]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_tagged_session_updates_are_buffered_as_history() {
+        assert!(is_historical_replay(&json!({
+            "method": "session/update",
+            "params": {"_meta": {"isReplay": true}, "update": {}}
+        })));
+        assert!(!is_historical_replay(&json!({
+            "method": "session/update",
+            "params": {"update": {}}
+        })));
+        assert!(!is_historical_replay(&json!({
+            "method": "session/prompt",
+            "params": {"_meta": {"isReplay": true}}
+        })));
+    }
 }

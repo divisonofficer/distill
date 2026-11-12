@@ -1196,6 +1196,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn text_callback_collects_responses_stream_delta() {
+        let item: rs::OutputItem = serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+        }))
+        .unwrap();
+        let mut response = empty_completed_response();
+        response.output = vec![item];
+        let terminal =
+            rs::ResponseStreamEvent::ResponseCompleted(rs_types::ResponseCompletedEvent {
+                response,
+                sequence_number: 0,
+            });
+        let raw = stream::iter(vec![Ok(text_delta_event("hello")), Ok(terminal)]).boxed();
+        let mut emitted = Vec::new();
+        let (response, _) = crate::stream::collect_response_with_text(
+            stream_responses(raw, None, rid(), Duration::from_secs(60), None),
+            |text| emitted.push(text.to_owned()),
+        )
+        .await
+        .expect("Responses stream completes");
+        assert_eq!(emitted.concat(), response.assistant_text());
+        assert_eq!(response.assistant_text(), "hello");
+    }
+
     #[test]
     fn empty_failed_response_is_not_treated_as_output() {
         let event = rs::ResponseStreamEvent::ResponseFailed(rs_types::ResponseFailedEvent {

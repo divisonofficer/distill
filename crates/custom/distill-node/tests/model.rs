@@ -108,12 +108,14 @@ async fn start() -> Fixture {
         ],
     };
     let keeper = Keeper::start(agent.clone()).await.unwrap();
-    let push = Arc::new(Push::load_or_create(&dir.path().join("state")).unwrap());
+    let state_dir = dir.path().join("state");
+    let push = Arc::new(Push::load_or_create(&state_dir).unwrap());
+    let chat_store = distill_node::chat_store::Store::open(&state_dir.join("chats")).unwrap();
     let guard = Arc::new(GuardConfig {
         owner: OWNER.to_owned(),
         allowed_origins: vec![ORIGIN.to_owned()],
     });
-    let app = trusted_router(keeper, push, agent, guard, None);
+    let app = trusted_router(keeper, push, agent, guard, None, chat_store);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

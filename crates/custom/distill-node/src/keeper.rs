@@ -17,6 +17,7 @@ use crate::sep::PermissionMode;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_CAPACITY: usize = 256;
+pub const MAX_CHAT_PROGRESS_BYTES: usize = 1024 * 1024;
 static NULL: Value = Value::Null;
 
 #[derive(Debug, Clone)]
@@ -32,6 +33,12 @@ pub struct NeedsInput {
     pub kind: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChatProgress {
+    pub request_id: String,
+    pub text: String,
+}
+
 #[derive(Clone)]
 pub struct Keeper {
     inner: Arc<Inner>,
@@ -44,6 +51,7 @@ struct Inner {
     attach_gate: tokio::sync::Mutex<()>,
     board: broadcast::Sender<BoardEvent>,
     needs: broadcast::Sender<NeedsInput>,
+    chat_progress: broadcast::Sender<ChatProgress>,
 }
 
 #[derive(Default)]
@@ -61,6 +69,7 @@ impl Keeper {
         handle.initialize().await?;
         let (board, _) = broadcast::channel(EVENT_CAPACITY);
         let (needs, _) = broadcast::channel(EVENT_CAPACITY);
+        let (chat_progress, _) = broadcast::channel(EVENT_CAPACITY);
         let inner = Arc::new(Inner {
             cfg,
             conn: Mutex::new(handle),
@@ -68,9 +77,23 @@ impl Keeper {
             attach_gate: tokio::sync::Mutex::new(()),
             board,
             needs,
+            chat_progress,
         });
         let keeper = Self { inner };
         keeper.refresh().await?;
+        for row in keeper.rows() {
+            let keep = row.get("resident").and_then(Value::as_bool) == Some(true)
+                || matches!(
+                    row.get("activity").and_then(Value::as_str),
+                    Some("working" | "needs_input")
+                );
+            if keep
+                && let Some(session_id) = row.get("sessionId").and_then(Value::as_str)
+                && let Err(e) = keeper.attach(session_id).await
+            {
+                tracing::warn!(error = %e, session = %session_id, "startup attach failed");
+            }
+        }
         tokio::spawn(run(Arc::downgrade(&keeper.inner), rx));
         Ok(keeper)
     }
@@ -161,6 +184,10 @@ impl Keeper {
     pub fn needs_input(&self) -> broadcast::Receiver<NeedsInput> {
         self.inner.needs.subscribe()
     }
+
+    pub fn chat_progress(&self) -> broadcast::Receiver<ChatProgress> {
+        self.inner.chat_progress.subscribe()
+    }
 }
 
 impl Inner {
@@ -192,6 +219,7 @@ impl Inner {
         self.replace_rows(rows);
         let rows = lock(&self.state).rows.clone();
         let attached = lock(&self.state).attached.clone();
+        let mut restored = Vec::new();
         for sid in attached {
             let cwd = rows.iter().find_map(|r| {
                 (r.get("sessionId").and_then(Value::as_str) == Some(sid.as_str()))
@@ -199,14 +227,14 @@ impl Inner {
                     .flatten()
             });
             match cwd {
-                Some(cwd) => {
-                    if let Err(e) = load(&handle, &sid, &cwd).await {
-                        tracing::warn!(error = %e, session = %sid, "re-attach failed");
-                    }
-                }
+                Some(cwd) => match load(&handle, &sid, &cwd).await {
+                    Ok(()) => restored.push(sid),
+                    Err(e) => tracing::warn!(error = %e, session = %sid, "re-attach failed"),
+                },
                 None => tracing::warn!(session = %sid, "re-attach skipped: no cwd"),
             }
         }
+        lock(&self.state).attached = restored;
         *lock(&self.conn) = handle;
         Ok(rx)
     }
@@ -218,6 +246,7 @@ impl Inner {
         match method {
             "x.ai/sessions/changed" => self.apply_changed(params),
             "x.ai/session_notification" => self.apply_update(params),
+            "x.ai/chat/progress" => self.apply_chat_progress(params),
             _ => {}
         }
     }
@@ -265,6 +294,22 @@ impl Inner {
         if !removed.is_empty() {
             let _ = self.board.send(BoardEvent::Remove(removed));
         }
+    }
+
+    fn apply_chat_progress(&self, params: &Value) {
+        let (Some(request_id), Some(text)) = (
+            params.get("requestId").and_then(Value::as_str),
+            params.get("text").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        if request_id.is_empty() || text.len() > MAX_CHAT_PROGRESS_BYTES {
+            return;
+        }
+        let _ = self.chat_progress.send(ChatProgress {
+            request_id: request_id.to_owned(),
+            text: text.to_owned(),
+        });
     }
 
     fn apply_update(&self, params: &Value) {
@@ -412,7 +457,9 @@ async fn reconnect(weak: &Weak<Inner>) -> Option<mpsc::UnboundedReceiver<Value>>
 }
 
 async fn list(handle: &AgentHandle) -> anyhow::Result<Vec<Value>> {
-    let res = handle.request("_x.ai/sessions/list", json!({})).await?;
+    let res = handle
+        .request("_x.ai/sessions/list", json!({"includeSubagents": true}))
+        .await?;
     roster_rows(&res)
 }
 
@@ -433,7 +480,7 @@ async fn load(handle: &AgentHandle, session_id: &str, cwd: &Path) -> anyhow::Res
                 "sessionId": session_id,
                 "cwd": cwd.to_string_lossy(),
                 "mcpServers": [],
-                "_meta": {"yoloMode": false, "autoMode": false},
+                "_meta": {"yoloMode": false, "autoMode": false, "noReplay": true, "postudioHistoryPaging": true},
             }),
         )
         .await?;

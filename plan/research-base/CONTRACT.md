@@ -71,7 +71,7 @@ SEP 타입은 `src/sep.rs`(커밋됨)가 정본이다.
 | `GET /api/node` | `{host, version}` (기존) |
 | `GET /api/sessions` | keeper로 `_x.ai/sessions/list` → 그대로 `{sessions:[…]}` |
 | `WS /ws/board` | 연결 시 목록 한 번, 이후 keeper가 받는 `sessions/changed`를 `{t:"board.upsert", sessions:[…]}`/`{t:"board.remove", ids:[…]}`로 전달. keeper가 `pending_interaction`/`interaction_resolved`를 받으면 해당 행의 `activity`를 `needs_input`/`working`으로 바꿔 `board.upsert` |
-| `POST /api/sessions` | body `{cwd, worktree?: {name}, mode?: "ask"|"auto"|"always-approve", prompt?: string}`. `worktree`가 있으면 `_x.ai/git/worktree/create` 후 그 경로로 `session/new`. 초기 모드는 `_meta`로(`yoloMode`/`autoMode`). keeper가 붙는다. 응답 `{sessionId}` |
+| `POST /api/sessions` | body `{cwd, worktree?: {name}, mode?: "ask"|"auto"|"always-approve", prompt?: string}`. `worktree`가 있으면 keeper를 통해 `x.ai/git/worktree/create_from_worktree_sync`를 먼저 호출한다. 임의 correlation ID를 `newSessionId`로 보내고 응답 ID 일치·상태·경로를 확인한 뒤 그 경로로 `session/new`를 호출한다. 동기 응답 API이며 별도 비동기 `create` 호출이 아니다. leader가 확장 envelope로 보내도 응답 디코더가 처리한다. 초기 모드는 `_meta`로(`yoloMode`/`autoMode`). keeper가 붙는다. 응답 `{sessionId}` |
 | `WS /ws/session/:id` | 자식 하나 생성 → initialize/authenticate → `session/load` → SEP 스트림(재생, `replay.end`, 실시간). 받는 `ClientMsg`: `prompt` → `session/prompt`(이미지는 `{type:"image",mimeType,data}` 블록), `cancel` → `session/cancel` 알림, `permission` → 해당 id에 응답, `mode` → §2의 모드 알림(ask: `{yolo_mode:false,auto_mode:false,permission_mode:"ask"}`, auto: `{auto_mode:true,permission_mode:"auto"}`, always-approve: `{yolo_mode:true}`, 모두 `sessionId` 포함). WS가 닫히면 자식 종료 |
 
 ```rust
@@ -90,11 +90,13 @@ impl AgentConn {
 ## 5. 경계 보안 (트랙 B: `guard.rs`, `listen.rs`, `untrusted.rs`)
 
 - **신뢰 리스너**: Unix(Linux/macOS)는 `~/.distill/postudio/node.sock`, 디렉터리 0700, 기존 소켓 파일은 지우고 다시 만든다. Windows는 `127.0.0.1:7410`. `--listen tcp:127.0.0.1:PORT`로 바꿀 수 있다(개발용).
-- **비신뢰 리스너**: `--untrusted-listen`(기본 Unix `~/.distill/postudio/untrusted.sock`). 경로: `/p/:port/*rest` → `http://127.0.0.1:port/rest` 프록시(WS 포함), `/f/:sessionId/*path` → 세션 cwd 아래 파일. `/api`, `/ws`는 404.
+- **비신뢰 리스너**: `--untrusted-listen`(기본 Unix `~/.distill/postudio/untrusted.sock`). 경로: `/p/:port/*rest` → `http://127.0.0.1:port/rest` 프록시(WS 포함), `/f/:sessionId/*path` → 세션 cwd 아래 파일. `/api`, `/ws`는 404. TCP로 설정할 때 신뢰/비신뢰 리스너 포트는 서로 달라야 하고 프록시는 두 node 포트를 차단한다. 프록시의 WebSocket은 subprotocol을 전달하고 hop-by-hop 헤더를 제거한다. agent는 stdio이므로 agent TCP 포트는 없다.
 - **guard** (신뢰 리스너의 `/api/*`, `/ws/*`):
   1. `Tailscale-User-Login` == `--owner` (기존). 아니면 403.
   2. `Origin`이 있으면 허용 목록에 있어야 한다. 목록 = `--allow-origin`(여러 번) . WS는 `Origin` 필수. 아니면 403.
   3. `POST`/`PUT`/`DELETE`는 `Content-Type: application/json`만. 아니면 415.
+- **신뢰 출처 메타데이터**: `/api/node`는 선택적 `untrustedOrigin`을 반환한다. 해당 출처는 `--allow-origin`의 신뢰 출처와 달라야 한다. UI는 비신뢰 포트 미리보기를 그 별도 출처로 연다.
+- **비신뢰 경로**: 세션 파일은 `/f/:sessionId/*path`; 산출물 목록은 신뢰 API `GET /api/sessions/:id/artifacts`, 포트 목록은 `GET /api/ports`. fleet 발견은 `GET /api/fleet`이며 온라인 여부와 직접 접속 URL을 돌려준다. fleet 호스트에는 브라우저가 직접 연결한다. 산출물·포트 프록시 콘텐츠는 신뢰 Studio 출처에서 분리한다.
 - **파일 서빙**: 경로를 정규화해 세션 cwd 밖이면 404. `..`, 절대경로, 밖을 가리키는 심볼릭 링크 거부. 응답에 `Content-Security-Policy: sandbox` 없이 그대로 서빙해도 된다(출처가 분리되어 있으므로).
 - 시험 필수: 위조 Origin, Origin 없는 WS, 헤더 없음, 다른 사용자, `text/plain` POST, `..`, 심볼릭 링크 탈출, 비신뢰 리스너의 `/api` 접근.
 
@@ -125,6 +127,6 @@ impl Push {
 ## 8. A2 착수 시 결정 (2026-11-11)
 
 1. `AgentConn`은 액터로 바꾼다: `AgentConn::spawn(cfg) -> anyhow::Result<(AgentHandle, mpsc::UnboundedReceiver<Value>)>`. `AgentHandle`은 `Clone`이고 `request(&self, ..)`, `notify(&self, ..)`, `respond(&self, ..)`를 가진다(대기 중 요청은 id → oneshot 맵). 수신 채널에는 응답이 아닌 agent→client 메시지가 온다. 자식이 죽으면 채널이 닫힌다.
-2. `POST /api/sessions`의 `worktree`는 A2에서 구현하지 않는다(있으면 501). 통합 I2에서 실제 호출을 캡처해 정한다.
+2. `POST /api/sessions`의 worktree는 동기식 `x.ai/git/worktree/create_from_worktree_sync` 호출로 만든 뒤 `session/new`에 연결한다. 상관 ID를 검증하고 확장 envelope 응답도 디코딩한다. 이 결정은 아래 구현·검증 상태와 구분하며, 최종 자동 검사 결과는 §5 기록에서 확인한다.
 3. 확장 메서드 이름은 앞의 `_`를 떼고 비교한다(`_x.ai/session_notification`과 `x.ai/session_notification` 모두 처리). `params.method`로 감싼 형태(`{"method":"_x.ai/…","params":{"method":"x.ai/…","params":{…}}}`)도 풀어서 처리한다(leader `method_of`와 같은 규칙).
 4. `/api/node`는 `{host, version}`만 낸다. `agent_url`과 그 테스트는 지운다. `--insecure-no-owner`는 없앤다.

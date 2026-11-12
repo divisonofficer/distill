@@ -209,7 +209,10 @@ fn prepend_claude_code_identity(system: &mut Option<messages::SystemParam>) {
             },
         ]),
         Some(SystemParam::Blocks(mut blocks)) => {
-            if blocks.first().is_none_or(|first| first.text != CLAUDE_CODE_IDENTITY) {
+            if blocks
+                .first()
+                .is_none_or(|first| first.text != CLAUDE_CODE_IDENTITY)
+            {
                 blocks.insert(0, identity);
             }
             SystemParam::Blocks(blocks)
@@ -348,7 +351,10 @@ fn latch_messages_refusals(first: MessagesCacheOptions, accepted: MessagesCacheO
         ),
     ] {
         if was_on && !is_on && !refused.swap(true, Ordering::Relaxed) {
-            tracing::warn!(option, "messages API refused an option and took the request without it; it stays off for this process");
+            tracing::warn!(
+                option,
+                "messages API refused an option and took the request without it; it stays off for this process"
+            );
         }
     }
 }
@@ -1204,8 +1210,14 @@ impl SamplingClient {
         if self.codex_turn_affinity.is_none() || !is_codex_base_url(&self.base_url) {
             return None;
         }
-        let session = request.x_grok_session_id.as_deref().filter(|id| !id.is_empty())?;
-        let turn = request.x_grok_turn_idx.as_deref().filter(|idx| !idx.is_empty())?;
+        let session = request
+            .x_grok_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())?;
+        let turn = request
+            .x_grok_turn_idx
+            .as_deref()
+            .filter(|idx| !idx.is_empty())?;
         Some(CodexTurnKey {
             session: session.to_owned(),
             turn: turn.to_owned(),
@@ -1461,8 +1473,7 @@ impl SamplingClient {
     }
 
     fn should_set_openrouter_session_header(&self) -> bool {
-        is_openrouter_base_url(&self.base_url)
-            && !self.default_headers.contains_key("x-session-id")
+        is_openrouter_base_url(&self.base_url) && !self.default_headers.contains_key("x-session-id")
     }
 
     fn apply_defaults(&self, mut request: ChatCompletionRequest) -> Result<ChatCompletionRequest> {
@@ -2985,8 +2996,22 @@ impl SamplingClient {
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse> {
-        self.conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(300))
-            .await
+        self.conversation_collect_with_text(request, |_| {}).await
+    }
+
+    /// Collect a response and forward actual text deltas from any supported backend.
+    pub async fn conversation_collect_with_text(
+        &self,
+        request: ConversationRequest,
+        on_text: impl FnMut(&str) + Send,
+    ) -> Result<ConversationResponse> {
+        self.conversation_collect_with_text_and_idle_timeout(
+            request,
+            std::time::Duration::from_secs(300),
+            on_text,
+        )
+        .await
+        .0
     }
 
     /// [`Self::conversation_collect`] with a caller-chosen idle timeout, for short side calls (autocomplete, memory notes) that must give up fast.
@@ -2995,9 +3020,23 @@ impl SamplingClient {
         request: ConversationRequest,
         idle_timeout: std::time::Duration,
     ) -> Result<ConversationResponse> {
-        self.conversation_collect_with_idle_timeout_and_rejection(request, idle_timeout)
+        self.conversation_collect_with_text_and_idle_timeout(request, idle_timeout, |_| {})
             .await
             .0
+    }
+
+    async fn conversation_collect_with_text_and_idle_timeout(
+        &self,
+        request: ConversationRequest,
+        idle_timeout: std::time::Duration,
+        on_text: impl FnMut(&str) + Send,
+    ) -> (Result<ConversationResponse>, Option<ConversationResponse>) {
+        self.conversation_collect_with_text_and_idle_timeout_and_rejection(
+            request,
+            idle_timeout,
+            on_text,
+        )
+        .await
     }
 
     /// Collect a response and retain it when the existing length gate rejects
@@ -3009,6 +3048,20 @@ impl SamplingClient {
         request: ConversationRequest,
         idle_timeout: std::time::Duration,
     ) -> (Result<ConversationResponse>, Option<ConversationResponse>) {
+        self.conversation_collect_with_text_and_idle_timeout_and_rejection(
+            request,
+            idle_timeout,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn conversation_collect_with_text_and_idle_timeout_and_rejection(
+        &self,
+        request: ConversationRequest,
+        idle_timeout: std::time::Duration,
+        mut on_text: impl FnMut(&str) + Send,
+    ) -> (Result<ConversationResponse>, Option<ConversationResponse>) {
         let request_id = crate::types::RequestId::random();
         let length_policy = request.length_policy;
         let result = match self.api_backend() {
@@ -3019,7 +3072,7 @@ impl SamplingClient {
                 };
                 let events =
                     crate::stream::stream_chat_completions(raw, meta, request_id, idle_timeout);
-                crate::stream::collect_response(events).await
+                crate::stream::collect_response_with_text(events, &mut on_text).await
             }
             ApiBackend::Responses => {
                 let (raw, meta, doom_loop) = match self.conversation_stream_responses(request).await
@@ -3029,7 +3082,7 @@ impl SamplingClient {
                 };
                 let events =
                     crate::stream::stream_responses(raw, meta, request_id, idle_timeout, doom_loop);
-                crate::stream::collect_response(events).await
+                crate::stream::collect_response_with_text(events, &mut on_text).await
             }
             ApiBackend::Messages => {
                 let (raw, meta) = match self.conversation_stream_messages(request).await {
@@ -3037,7 +3090,7 @@ impl SamplingClient {
                     Err(error) => return (Err(error), None),
                 };
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
-                crate::stream::collect_response(events).await
+                crate::stream::collect_response_with_text(events, &mut on_text).await
             }
         };
         let response = match result {
@@ -3138,13 +3191,19 @@ mod tests {
         let openrouter = request_for("https://openrouter.ai/api/v1", "session-1");
         assert_eq!(openrouter.headers()["x-session-id"], "session-1");
         assert_eq!(openrouter.headers()["x-grok-session-id"], "session-1");
-        assert!(!request_for("https://api.x.ai/v1", "session-1")
-            .headers()
-            .contains_key("x-session-id"));
-        assert!(!request_for("https://openrouter.ai/api/v1", "")
-            .headers()
-            .contains_key("x-session-id"));
-        assert!(!is_openrouter_base_url("https://openrouter.ai.evil.test/api/v1"));
+        assert!(
+            !request_for("https://api.x.ai/v1", "session-1")
+                .headers()
+                .contains_key("x-session-id")
+        );
+        assert!(
+            !request_for("https://openrouter.ai/api/v1", "")
+                .headers()
+                .contains_key("x-session-id")
+        );
+        assert!(!is_openrouter_base_url(
+            "https://openrouter.ai.evil.test/api/v1"
+        ));
         // A verbatim fork routes with its parent's key, not its own session id: the header must
         // match the body's routing key or the two would pin different providers.
         let fork = request_with_key(
@@ -3321,15 +3380,9 @@ mod tests {
             response,
         );
 
-        assert!(matches!(
-            result,
-            Err(SamplingError::MaxTokensTruncation)
-        ));
+        assert!(matches!(result, Err(SamplingError::MaxTokensTruncation)));
         let rejected = rejected.expect("the rejected response remains available to billing");
-        assert_eq!(
-            rejected.usage.map(|usage| usage.total_tokens),
-            Some(18)
-        );
+        assert_eq!(rejected.usage.map(|usage| usage.total_tokens), Some(18));
         assert_eq!(rejected.cost_usd_ticks, Some(1234));
         assert_eq!(rejected.message_id.as_deref(), Some("msg-paid"));
     }
@@ -3608,8 +3661,7 @@ mod tests {
                 ..minimal_config()
             })
             .unwrap();
-            client.endpoint =
-                EndpointTemplate::new(&format!("http://{addr}/v1"), &IndexMap::new());
+            client.endpoint = EndpointTemplate::new(&format!("http://{addr}/v1"), &IndexMap::new());
             client
         };
         let affinity = CodexTurnAffinity::default();
@@ -3926,11 +3978,17 @@ mod tests {
         };
         let mut blocks = Some(messages::SystemParam::Blocks(vec![block("agent prompt")]));
         prepend_claude_code_identity(&mut blocks);
-        assert_eq!(system_texts(&blocks), [CLAUDE_CODE_IDENTITY, "agent prompt"]);
+        assert_eq!(
+            system_texts(&blocks),
+            [CLAUDE_CODE_IDENTITY, "agent prompt"]
+        );
 
         // Applying it twice (a retry rebuilds defaults) must not stack the line.
         prepend_claude_code_identity(&mut blocks);
-        assert_eq!(system_texts(&blocks), [CLAUDE_CODE_IDENTITY, "agent prompt"]);
+        assert_eq!(
+            system_texts(&blocks),
+            [CLAUDE_CODE_IDENTITY, "agent prompt"]
+        );
     }
 
     #[test]
@@ -3955,9 +4013,11 @@ mod tests {
         })
         .unwrap();
         assert!(!api_key.uses_claude_subscription_bearer());
-        assert!(!SamplingClient::new(minimal_config())
-            .unwrap()
-            .uses_claude_subscription_bearer());
+        assert!(
+            !SamplingClient::new(minimal_config())
+                .unwrap()
+                .uses_claude_subscription_bearer()
+        );
     }
 
     #[test]
@@ -4047,7 +4107,10 @@ mod tests {
         assert!(with.contains(MID_CONVERSATION_OUTPUT_CONFIG_BETA), "{with}");
         let without = sent_beta(false).await;
         assert!(without.contains("oauth-2025-04-20"), "{without}");
-        assert!(!without.contains(MID_CONVERSATION_OUTPUT_CONFIG_BETA), "{without}");
+        assert!(
+            !without.contains(MID_CONVERSATION_OUTPUT_CONFIG_BETA),
+            "{without}"
+        );
     }
 
     async fn capture_response_body(streaming: bool) -> serde_json::Value {
@@ -5613,12 +5676,22 @@ mod cache_ttl_tests {
             minutes(30)
         );
         assert_eq!(
-            cache_lifetime_for("https://api.x.ai/v1", &ApiBackend::Responses, "grok-4.5", false),
+            cache_lifetime_for(
+                "https://api.x.ai/v1",
+                &ApiBackend::Responses,
+                "grok-4.5",
+                false
+            ),
             minutes(10)
         );
         let openrouter = "https://openrouter.ai/api/v1";
         assert_eq!(
-            cache_lifetime_for(openrouter, &ApiBackend::ChatCompletions, "moonshotai/kimi-k3", false),
+            cache_lifetime_for(
+                openrouter,
+                &ApiBackend::ChatCompletions,
+                "moonshotai/kimi-k3",
+                false
+            ),
             minutes(10)
         );
         assert_eq!(
@@ -5631,7 +5704,12 @@ mod cache_ttl_tests {
             minutes(5)
         );
         assert_eq!(
-            cache_lifetime_for("https://llm.internal/v1", &ApiBackend::ChatCompletions, "m", false),
+            cache_lifetime_for(
+                "https://llm.internal/v1",
+                &ApiBackend::ChatCompletions,
+                "m",
+                false
+            ),
             None
         );
     }

@@ -1,6 +1,52 @@
+<script module lang="ts">
+export type LoginStatus = 'starting' | 'pending' | 'completed' | 'failed' | 'cancelled' | 'expired';
+export type LoginStart = { jobId: string; status: 'starting'; callbackMode: 'host_loopback' };
+export type LoginPoll = { status: LoginStatus; authorizationUrl?: string };
+
+const LOGIN_STATUSES: LoginStatus[] = ['starting', 'pending', 'completed', 'failed', 'cancelled', 'expired'];
+
+export function isLocalLoginHost(hostname: string): boolean {
+	const host = hostname.toLowerCase();
+	return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+}
+
+export function safeAuthorizationHref(value?: string): string | null {
+	if (!value) return null;
+	try {
+		const url = new URL(value);
+		return url.protocol === 'https:' && !url.username && !url.password ? url.href : null;
+	} catch {
+		return null;
+	}
+}
+
+export function parseLoginStart(value: unknown): LoginStart {
+	if (!value || typeof value !== 'object') throw new Error('Invalid login response.');
+	const response = value as Record<string, unknown>;
+	if (typeof response.jobId !== 'string' || !response.jobId || response.status !== 'starting' || response.callbackMode !== 'host_loopback') {
+		throw new Error('Invalid login response.');
+	}
+	return { jobId: response.jobId, status: 'starting', callbackMode: 'host_loopback' };
+}
+
+export function parseLoginPoll(value: unknown): LoginPoll {
+	if (!value || typeof value !== 'object') throw new Error('Invalid login status response.');
+	const response = value as Record<string, unknown>;
+	if (!LOGIN_STATUSES.includes(response.status as LoginStatus) || (response.authorizationUrl !== undefined && typeof response.authorizationUrl !== 'string')) {
+		throw new Error('Invalid login status response.');
+	}
+	return {
+		status: response.status as LoginStatus,
+		...(response.authorizationUrl === undefined ? {} : { authorizationUrl: response.authorizationUrl })
+	};
+}
+</script>
+
 <script lang="ts">
 import { onMount } from 'svelte';
 import { getJson, postJson } from '$lib/api';
+import { ui } from '$lib/ui.svelte';
+import AccountRouting from '$lib/components/AccountRouting.svelte';
 
 type Provider = 'chatgpt' | 'claude' | 'grok' | 'openrouter';
 type Quota = {
@@ -20,6 +66,16 @@ email: string | null;
 connection_error: 'unreadable' | 'configuration_required' | null;
 quota: Quota | null;
 };
+type AccountLogin = {
+jobId: string;
+status: LoginStatus;
+authorizationUrl?: string;
+message?: string;
+canceling?: boolean;
+startedAt: number;
+};
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+const WEB_LOGIN_PROVIDERS: Provider[] = ['chatgpt', 'claude', 'openrouter'];
 
 const PROVIDERS: Provider[] = ['chatgpt', 'claude', 'grok', 'openrouter'];
 const PROVIDER_LABEL: Record<Provider, string> = {
@@ -40,40 +96,167 @@ let usageOpen = $state<Record<string, boolean>>({});
 let loading = $state(false);
 let busy = $state(false);
 let error = $state('');
+let localBrowser = $state(false);
+let localLoginConfirmed = $state(false);
+let loginJobs = $state<Record<string, AccountLogin>>({});
+let loginTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let mounted = false;
 
 onMount(() => {
+mounted = true;
+localBrowser = isLocalLoginHost(window.location.hostname);
 void refresh();
+return () => {
+mounted = false;
+for (const timer of loginTimers.values()) clearTimeout(timer);
+loginTimers.clear();
+};
 });
 
-async function loadAccounts() {
+async function loadAccounts(): Promise<boolean> {
 loading = true;
 try {
 accounts = await getJson<Account[]>('/api/accounts');
+return true;
 } catch {
 accounts = [];
 error = '이 서버에서 계정 관리 API를 사용할 수 없습니다. 지원되는 Postudio node에서 다시 열어 주세요.';
+return false;
 } finally {
 loading = false;
 }
 }
 
-async function refresh() {
+async function refresh(announce = false) {
 if (busy) return;
 busy = true;
 error = '';
-await loadAccounts();
+const loaded = await loadAccounts();
+if (announce) ui.notify(loaded ? '계정 목록을 새로고침했습니다.' : '계정 목록을 새로고침하지 못했습니다.', loaded ? 'success' : 'error');
 busy = false;
 }
 
-async function mutate(path: string, body: unknown) {
+function setLoginJob(accountId: string, job: AccountLogin) {
+loginJobs = { ...loginJobs, [accountId]: job };
+}
+
+function stopLoginTimer(accountId: string) {
+const timer = loginTimers.get(accountId);
+if (timer !== undefined) clearTimeout(timer);
+loginTimers.delete(accountId);
+}
+
+function isActiveLogin(accountId: string): boolean {
+const status = loginJobs[accountId]?.status;
+return status === 'starting' || status === 'pending';
+}
+
+function canStartWebLogin(account: Account): boolean {
+return localBrowser && localLoginConfirmed && WEB_LOGIN_PROVIDERS.includes(account.provider);
+}
+
+function scheduleLoginPoll(accountId: string, jobId: string, delay: number) {
+stopLoginTimer(accountId);
+loginTimers.set(accountId, setTimeout(() => {
+loginTimers.delete(accountId);
+void pollLogin(accountId, jobId);
+}, delay));
+}
+
+async function startLogin(account: Account) {
+if (!canStartWebLogin(account) || isActiveLogin(account.id)) return;
+stopLoginTimer(account.id);
+const startedAt = Date.now();
+try {
+const response = parseLoginStart(await postJson<unknown>('/api/accounts/login', { id: account.id }));
+if (!mounted) return;
+setLoginJob(account.id, { jobId: response.jobId, status: response.status, startedAt });
+scheduleLoginPoll(account.id, response.jobId, 1000);
+} catch (cause) {
+if (!mounted) return;
+ui.notify('로그인 요청을 시작하지 못했습니다.', 'error');
+setLoginJob(account.id, {
+jobId: '',
+status: 'failed',
+message: cause instanceof Error ? cause.message : '로그인 요청을 시작하지 못했습니다.',
+startedAt
+});
+}
+}
+
+async function pollLogin(accountId: string, jobId: string) {
+const current = loginJobs[accountId];
+if (!mounted || !current || current.jobId !== jobId || !isActiveLogin(accountId)) return;
+if (Date.now() - current.startedAt >= LOGIN_TIMEOUT_MS) {
+setLoginJob(accountId, { ...current, status: 'expired', message: '로그인 대기 시간이 초과되었습니다. 다시 시도해 주세요.' });
+ui.notify('로그인이 만료되었습니다.', 'error');
+return;
+}
+try {
+const response = parseLoginPoll(await getJson<unknown>(`/api/accounts/login/${encodeURIComponent(jobId)}`));
+if (!mounted) return;
+const latest = loginJobs[accountId];
+if (!latest || latest.jobId !== jobId || !isActiveLogin(accountId)) return;
+const next = { ...latest, status: response.status, authorizationUrl: response.authorizationUrl, message: undefined };
+setLoginJob(accountId, next);
+if (response.status !== latest.status) {
+if (response.status === 'completed') ui.notify('로그인이 완료되었습니다.');
+else if (response.status === 'failed') ui.notify('로그인에 실패했습니다.', 'error');
+else if (response.status === 'expired') ui.notify('로그인이 만료되었습니다.', 'error');
+else if (response.status === 'cancelled') ui.notify('로그인이 취소되었습니다.', 'error');
+}
+if (response.status === 'completed') {
+stopLoginTimer(accountId);
+await loadAccounts();
+} else if (response.status === 'starting' || response.status === 'pending') {
+scheduleLoginPoll(accountId, jobId, 1500);
+} else {
+stopLoginTimer(accountId);
+}
+} catch (cause) {
+if (!mounted) return;
+const latest = loginJobs[accountId];
+if (!latest || latest.jobId !== jobId || !isActiveLogin(accountId)) return;
+setLoginJob(accountId, { ...latest, message: cause instanceof Error ? `로그인 상태를 확인하지 못했습니다. ${cause.message}` : '로그인 상태를 확인하지 못했습니다.' });
+scheduleLoginPoll(accountId, jobId, 3000);
+}
+}
+
+async function cancelLogin(accountId: string) {
+const current = loginJobs[accountId];
+if (!current || !isActiveLogin(accountId) || current.canceling) return;
+stopLoginTimer(accountId);
+setLoginJob(accountId, { ...current, canceling: true, message: undefined });
+try {
+await postJson<unknown>(`/api/accounts/login/${encodeURIComponent(current.jobId)}/cancel`, {});
+if (!mounted) return;
+const latest = loginJobs[accountId];
+if (latest?.jobId === current.jobId) {
+setLoginJob(accountId, { ...latest, status: 'cancelled', canceling: false });
+if (latest.status !== 'cancelled') ui.notify('로그인이 취소되었습니다.', 'error');
+}
+} catch (cause) {
+if (!mounted) return;
+const latest = loginJobs[accountId];
+if (latest?.jobId === current.jobId) {
+setLoginJob(accountId, { ...latest, canceling: false, message: cause instanceof Error ? `취소 요청에 실패했습니다. ${cause.message}` : '취소 요청에 실패했습니다.' });
+ui.notify('로그인 취소 요청에 실패했습니다.', 'error');
+scheduleLoginPoll(accountId, current.jobId, 1500);
+}
+}
+}
+
+async function mutate(path: string, body: unknown, operation: string) {
 if (busy) return;
 busy = true;
 error = '';
 try {
 await postJson<{ ok: boolean }>(path, body);
 await loadAccounts();
+if (!error) ui.notify(`${operation} 완료`);
 } catch {
 error = '계정 작업을 완료하지 못했습니다. 호스트의 계정 상태와 입력을 확인해 주세요.';
+ui.notify(`${operation} 실패`, 'error');
 } finally {
 busy = false;
 }
@@ -81,7 +264,7 @@ busy = false;
 
 async function addAccount(event: SubmitEvent) {
 event.preventDefault();
-await mutate('/api/accounts/add', { id: accountId, provider, label });
+await mutate('/api/accounts/add', { id: accountId, provider, label }, '계정 추가');
 if (!error) {
 accountId = '';
 label = '';
@@ -95,18 +278,29 @@ renameLabel = account.label;
 
 async function saveRename(event: SubmitEvent, id: string) {
 event.preventDefault();
-await mutate('/api/accounts/rename', { id, label: renameLabel });
+await mutate('/api/accounts/rename', { id, label: renameLabel }, '계정 이름 변경');
 if (!error) editingId = '';
 }
 
 async function logout(account: Account) {
 if (!window.confirm(`“${account.label}” 계정에서 로그아웃할까요?`)) return;
-await mutate('/api/accounts/logout', { id: account.id });
+await mutate('/api/accounts/logout', { id: account.id }, '로그아웃');
 }
 
 async function remove(account: Account) {
 if (!window.confirm(`“${account.label}” 계정을 제거할까요? 이 작업은 되돌릴 수 없습니다.`)) return;
-await mutate('/api/accounts/remove', { id: account.id });
+await mutate('/api/accounts/remove', { id: account.id }, '계정 제거');
+}
+
+function loginStatusText(status: LoginStatus): string {
+switch (status) {
+case 'starting': return '로그인 요청을 시작했습니다.';
+case 'pending': return '인증을 기다리는 중입니다.';
+case 'completed': return '로그인이 완료되었습니다.';
+case 'failed': return '로그인에 실패했습니다.';
+case 'cancelled': return '로그인이 취소되었습니다.';
+case 'expired': return '로그인이 만료되었습니다.';
+}
 }
 
 async function toggleUsage(id: string) {
@@ -128,20 +322,31 @@ busy = false;
 }
 </script>
 
-<section class="flex flex-col gap-4" aria-labelledby="accounts-h">
-<div class="flex items-center justify-between gap-3">
-<h2 id="accounts-h" class="text-sm font-semibold">호스트 계정</h2>
+<section id="accounts-h" class="settings-card flex flex-col gap-4 rounded-2xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-950 sm:p-5" aria-labelledby="accounts-title">
+<div class="flex flex-wrap items-end justify-between gap-3">
+<div class="min-w-0 flex-1"><h2 id="accounts-title" class="text-[22px] font-semibold tracking-tight">계정</h2><p class="mt-1 text-[13.5px] leading-relaxed text-neutral-600 dark:text-neutral-400">모델 제공자 계정을 연결하고 주간 사용량을 확인해요.</p></div>
 <button
  type="button"
  disabled={busy}
  class="min-h-10 rounded-xl border border-neutral-300 px-3 text-sm hover:bg-neutral-100 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800"
- onclick={refresh}
+ onclick={() => void refresh(true)}
 >
 새로고침
 </button>
 </div>
-<p class="text-sm text-neutral-600 dark:text-neutral-400">계정 목록과 연결 상태는 현재 Postudio node 호스트에서 가져옵니다. 로그인은 웹에서 지원하지 않습니다. 해당 호스트에서 <code>distill accounts login &lt;id&gt;</code>를 실행하세요. 로그인 정보는 브라우저에 저장하지 않습니다.</p>
-<p class="text-sm text-neutral-600 dark:text-neutral-400">모델별 계정 할당과 자동 라우팅 설정은 아직 구현되지 않았습니다.</p>
+<p class="text-sm text-neutral-600 dark:text-neutral-400">계정 목록과 연결 상태는 현재 Postudio node 호스트에서 가져옵니다. 로그인 정보는 브라우저에 저장하지 않습니다. 원격 호스트의 브라우저 로그인은 지원하지 않으며, 해당 node 호스트에서 <code>distill accounts login &lt;id&gt;</code>를 실행하세요.</p>
+{#if localBrowser}
+<div class="flex flex-col gap-2 rounded-xl border border-neutral-200 p-4 dark:border-neutral-800">
+	<p class="text-sm">이 로컬 페이지는 node 호스트에서 OAuth 로그인을 시작합니다. 인증 링크를 직접 열어 완료하세요. 자동으로 새 창을 열지 않습니다.</p>
+	<label class="flex min-h-11 items-center gap-3 text-sm">
+		<input type="checkbox" bind:checked={localLoginConfirmed} />
+		이 브라우저가 node와 같은 컴퓨터에서 실행 중
+	</label>
+</div>
+{/if}
+{#if !localBrowser}
+<p class="text-sm text-amber-700 dark:text-amber-300">이 페이지 주소가 localhost가 아니므로 브라우저 로그인은 사용할 수 없습니다. node 호스트에서 CLI 로그인을 실행하세요.</p>
+{/if}
 
 {#if error}
 <p role="alert" class="text-sm text-red-700 dark:text-red-300">{error}</p>
@@ -195,7 +400,7 @@ busy = false;
 {/if}
 <ul class="flex flex-col gap-3">
 {#each accounts as account (account.id)}
-<li class="flex flex-col gap-3 rounded-xl border border-neutral-200 p-4 dark:border-neutral-800">
+<li class="flex flex-col gap-3 rounded-2xl border border-neutral-200 bg-white p-4 sm:p-5 dark:border-neutral-800 dark:bg-neutral-950">
 <div class="flex flex-wrap items-start justify-between gap-3">
 <div class="min-w-0 flex-1">
 <p class="break-words text-sm font-medium">{account.label} <span class="font-normal text-neutral-500">({PROVIDER_LABEL[account.provider]})</span></p>
@@ -209,8 +414,12 @@ busy = false;
 {#if account.quota?.remaining_percent != null}
 <p class="text-xs text-neutral-500">남은 사용량 {Math.round(account.quota.remaining_percent)}%</p>
 {/if}
+{#if account.provider === 'grok'}
+<p class="text-xs text-amber-700 dark:text-amber-300">Grok 웹 로그인은 지원하지 않습니다. node 호스트에서 <code>distill accounts login {account.id}</code>를 실행하세요.</p>
+{/if}
 </div>
 <div class="flex flex-wrap gap-2">
+<button type="button" disabled={busy || !canStartWebLogin(account) || isActiveLogin(account.id)} title={account.provider === 'grok' ? 'Grok은 브라우저 로그인을 지원하지 않습니다. CLI를 사용하세요.' : undefined} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => void startLogin(account)}>{account.provider === 'grok' ? 'CLI 로그인' : account.connected ? '다시 로그인' : '연결'}</button>
 <button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => beginRename(account)}>이름 변경</button>
 <button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => toggleUsage(account.id)}>{Object.hasOwn(usageOpen, account.id) && usageOpen[account.id] ? '사용량 숨기기' : '사용량'}</button>
 <button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => logout(account)}>로그아웃</button>
@@ -225,6 +434,21 @@ busy = false;
 </button>
 </div>
 </div>
+{#if loginJobs[account.id]}
+	{@const job = loginJobs[account.id]!}
+	<div class="flex flex-col gap-2 rounded-lg bg-neutral-100 p-3 dark:bg-neutral-900">
+		<p role="status" class="text-sm">{loginStatusText(job.status)} {job.message ?? ''}</p>
+		{#if isActiveLogin(account.id)}
+			{@const authorizationHref = safeAuthorizationHref(job.authorizationUrl)}
+			{#if authorizationHref}
+				<a href={authorizationHref} target="_blank" rel="noopener noreferrer" class="min-h-10 self-start content-center rounded-lg border border-neutral-300 px-3 text-sm underline dark:border-neutral-700">OAuth 인증 링크 열기</a>
+			{:else if job.status === 'pending'}
+				<p class="text-sm text-neutral-600 dark:text-neutral-400">안전한 HTTPS 인증 링크를 기다리는 중입니다.</p>
+			{/if}
+			<button type="button" disabled={job.canceling} class="min-h-10 self-start rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => void cancelLogin(account.id)}>{job.canceling ? '취소 중…' : '로그인 취소'}</button>
+		{/if}
+	</div>
+{/if}
 {#if editingId === account.id}
 <form class="flex flex-wrap gap-2" onsubmit={(event) => saveRename(event, account.id)}>
 <label class="sr-only" for="rename-{account.id}">표시 이름</label>
@@ -240,3 +464,4 @@ busy = false;
 {/each}
 </ul>
 </section>
+<AccountRouting {accounts} />

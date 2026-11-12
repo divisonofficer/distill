@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::{Context as _, anyhow};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
@@ -35,6 +35,25 @@ impl Default for AgentConfig {
 }
 
 type Pending = Mutex<Option<HashMap<u64, oneshot::Sender<Value>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestFailure {
+    Rejected(String),
+    OutcomeUnknown,
+}
+
+struct PendingRequest {
+    pending: Arc<Pending>,
+    id: u64,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        if let Some(map) = lock(&self.pending).as_mut() {
+            map.remove(&self.id);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentHandle {
@@ -159,30 +178,78 @@ fn resolve(pending: &Pending, msg: Value) {
 
 impl AgentHandle {
     pub async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// Request that waits until response or agent connection closes.
+    pub async fn request_without_timeout(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Value> {
+        self.request_classified(method, params, None)
+            .await
+            .map_err(|failure| match failure {
+                RequestFailure::Rejected(message) => anyhow!("{method} failed: {message}"),
+                RequestFailure::OutcomeUnknown => anyhow!("{method} outcome is unknown"),
+            })
+    }
+
+    /// Request with a method-specific timeout, used for long-running model completion calls.
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        request_timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        self.request_with_timeout_classified(method, params, request_timeout)
+            .await
+            .map_err(|failure| match failure {
+                RequestFailure::Rejected(message) => anyhow!("{method} failed: {message}"),
+                RequestFailure::OutcomeUnknown => anyhow!("{method} outcome is unknown"),
+            })
+    }
+
+    pub async fn request_with_timeout_classified(
+        &self,
+        method: &str,
+        params: Value,
+        request_timeout: Duration,
+    ) -> Result<Value, RequestFailure> {
+        self.request_classified(method, params, Some(request_timeout))
+            .await
+    }
+
+    async fn request_classified(
+        &self,
+        method: &str,
+        params: Value,
+        request_timeout: Option<Duration>,
+    ) -> Result<Value, RequestFailure> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         match lock(&self.inner.pending).as_mut() {
             Some(map) => {
                 map.insert(id, tx);
             }
-            None => bail!("agent connection closed"),
+            None => return Err(RequestFailure::OutcomeUnknown),
         }
-        if let Err(e) =
-            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
-        {
-            self.forget(id);
-            return Err(e);
-        }
-        let msg = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(_)) => bail!("{method}: agent connection closed"),
-            Err(_) => {
-                self.forget(id);
-                bail!("{method}: no response in {}s", REQUEST_TIMEOUT.as_secs())
-            }
+        let _registration = PendingRequest {
+            pending: self.inner.pending.clone(),
+            id,
+        };
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .map_err(|_| RequestFailure::OutcomeUnknown)?;
+        let msg = match request_timeout {
+            Some(duration) => match tokio::time::timeout(duration, rx).await {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(_)) | Err(_) => return Err(RequestFailure::OutcomeUnknown),
+            },
+            None => rx.await.map_err(|_| RequestFailure::OutcomeUnknown)?,
         };
         if let Some(error) = msg.get("error") {
-            bail!("{method} failed: {error}");
+            return Err(RequestFailure::Rejected(error.to_string()));
         }
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -220,10 +287,14 @@ impl AgentHandle {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|m| m.get("id")?.as_str()).collect())
             .unwrap_or_default();
-        let method = ["xai.api_key", "cached_token"]
+        let Some(method) = ["xai.api_key", "cached_token"]
             .into_iter()
             .find(|w| offered.contains(w))
-            .ok_or_else(|| anyhow!("no usable auth method in {offered:?}"))?;
+        else {
+            // Subscription/provider models use their own stored accounts. Do not start
+            // an interactive primary-provider login merely to attach a web client.
+            return Ok(init);
+        };
         self.request(
             "authenticate",
             json!({"methodId": method, "_meta": {"headless": true}}),
@@ -237,12 +308,6 @@ impl AgentHandle {
             .lines
             .send(format!("{msg}\n"))
             .map_err(|_| anyhow!("agent connection closed"))
-    }
-
-    fn forget(&self, id: u64) {
-        if let Some(map) = lock(&self.inner.pending).as_mut() {
-            map.remove(&id);
-        }
     }
 }
 

@@ -6,10 +6,12 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Request, State};
+use axum::extract::{FromRequestParts, Path as AxumPath, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 
 /// Session id -> session cwd.
 pub type CwdResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
@@ -18,6 +20,7 @@ pub type CwdResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
 struct Edge {
     resolve_cwd: CwdResolver,
     client: reqwest::Client,
+    prohibited_ports: Arc<[u16]>,
 }
 
 const HOP_BY_HOP: [&str; 9] = [
@@ -33,7 +36,14 @@ const HOP_BY_HOP: [&str; 9] = [
 ];
 
 pub fn routes(resolve_cwd: CwdResolver) -> Router {
-    // Loopback-only upstream: no env proxy, no redirect following (the client gets the upstream reply as is).
+    routes_with_prohibited_ports(resolve_cwd, [])
+}
+
+/// Build untrusted routes while denying proxy access to node-owned TCP ports.
+pub fn routes_with_prohibited_ports(
+    resolve_cwd: CwdResolver,
+    prohibited_ports: impl IntoIterator<Item = u16>,
+) -> Router {
     #[allow(
         clippy::disallowed_methods,
         reason = "localhost-only proxy client to 127.0.0.1 ports; no TLS"
@@ -46,6 +56,7 @@ pub fn routes(resolve_cwd: CwdResolver) -> Router {
     let state = Edge {
         resolve_cwd,
         client,
+        prohibited_ports: prohibited_ports.into_iter().collect::<Vec<_>>().into(),
     };
     Router::new()
         .route("/p/{port}", any(proxy))
@@ -55,20 +66,37 @@ pub fn routes(resolve_cwd: CwdResolver) -> Router {
         .with_state(state)
 }
 
-/// Forward `/p/{port}/rest` to `http://127.0.0.1:{port}/rest`, streaming body and reply.
+/// Forward `/p/{port}/rest` to `http://127.0.0.1:{port}/rest`.
 async fn proxy(State(edge): State<Edge>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-
-    // Raw (undecoded) path: `/p/{port}` followed by `/rest`, if any.
-    let mut segments = parts.uri.path().splitn(4, '/');
-    let port = segments.nth(2).unwrap_or_default();
-    let after = format!("/{}", segments.next().unwrap_or_default());
-    let port: u16 = match port.parse() {
-        Ok(p) if p != 0 => p,
-        _ => return (StatusCode::BAD_REQUEST, "invalid port").into_response(),
+    let (mut parts, body) = req.into_parts();
+    let (port, after) = match proxy_target(&parts.uri) {
+        Ok(target) => target,
+        Err(status) => return (status, "invalid port").into_response(),
     };
-    if parts.headers.contains_key(header::UPGRADE) {
-        return (StatusCode::NOT_IMPLEMENTED, "websocket proxy not supported").into_response();
+    if edge.prohibited_ports.contains(&port) {
+        return (StatusCode::FORBIDDEN, "port is not proxyable").into_response();
+    }
+    if is_websocket(&parts.headers) {
+        let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(ws) => ws,
+            Err(rejection) => return rejection.into_response(),
+        };
+        let mut upstream = format!("ws://127.0.0.1:{port}{after}");
+        if let Some(query) = parts.uri.query() {
+            upstream.push('?');
+            upstream.push_str(query);
+        }
+        let headers = forward_headers(&parts.headers);
+        let upstream = match connect_websocket(&upstream, &headers).await {
+            Ok(upstream) => upstream,
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY, "upstream websocket unavailable").into_response();
+            }
+        };
+        let (upstream_socket, protocol) = upstream;
+        let protocols = protocol.into_iter().collect::<Vec<_>>();
+        let ws = ws.protocols(protocols);
+        return ws.on_upgrade(move |socket| websocket_tunnel(socket, upstream_socket));
     }
 
     let mut url = format!("http://127.0.0.1:{port}{after}");
@@ -76,7 +104,6 @@ async fn proxy(State(edge): State<Edge>, req: Request) -> Response {
         url.push('?');
         url.push_str(query);
     }
-
     let upstream = edge
         .client
         .request(parts.method.clone(), url)
@@ -88,7 +115,6 @@ async fn proxy(State(edge): State<Edge>, req: Request) -> Response {
         Ok(res) => res,
         Err(_) => return (StatusCode::BAD_GATEWAY, "upstream unreachable").into_response(),
     };
-
     let status = upstream.status();
     let headers = forward_headers(upstream.headers());
     let mut res = Response::new(Body::from_stream(upstream.bytes_stream()));
@@ -97,16 +123,190 @@ async fn proxy(State(edge): State<Edge>, req: Request) -> Response {
     res
 }
 
-/// Copy headers minus hop-by-hop, `Host`, `Content-Length` (reqwest sets it) and `Tailscale-*`.
+fn proxy_target(uri: &axum::http::Uri) -> Result<(u16, String), StatusCode> {
+    let mut segments = uri.path().splitn(4, '/');
+    let port = segments.nth(2).unwrap_or_default();
+    let after = format!("/{}", segments.next().unwrap_or_default());
+    let port = port.parse::<u16>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if port == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((port, after))
+}
+
+fn is_websocket(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+}
+
+async fn connect_websocket(
+    upstream_url: &str,
+    headers: &HeaderMap,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        Option<String>,
+    ),
+    (),
+> {
+    let Some(port) = upstream_url
+        .strip_prefix("ws://127.0.0.1:")
+        .and_then(|s| s.split('/').next())
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        return Err(());
+    };
+    let stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|_| ())?;
+    let mut request =
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+            upstream_url,
+        )
+        .map_err(|_| ())?;
+    for (name, value) in headers {
+        if name != header::HOST
+            && name != header::CONNECTION
+            && name != header::UPGRADE
+            && !name.as_str().starts_with("sec-websocket-")
+            && name != header::SEC_WEBSOCKET_PROTOCOL
+        {
+            request.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+    if let Some(protocols) = headers.get(header::SEC_WEBSOCKET_PROTOCOL) {
+        request
+            .headers_mut()
+            .insert(header::SEC_WEBSOCKET_PROTOCOL, protocols.clone());
+    }
+    let (upstream, response) = tokio_tungstenite::client_async(request, stream)
+        .await
+        .map_err(|_| ())?;
+    let selected = response
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    Ok((upstream, selected))
+}
+
+async fn websocket_tunnel(
+    downstream: axum::extract::ws::WebSocket,
+    upstream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) {
+    let (mut down_tx, mut down_rx) = downstream.split();
+    let (mut up_tx, mut up_rx) = upstream.split();
+    let downstream_to_upstream = async {
+        while let Some(message) = down_rx.next().await {
+            match message {
+                Ok(message) => {
+                    let message = match message {
+                        axum::extract::ws::Message::Text(text) => {
+                            Message::Text(text.as_str().into())
+                        }
+                        axum::extract::ws::Message::Binary(data) => Message::Binary(data),
+                        axum::extract::ws::Message::Ping(data) => Message::Ping(data),
+                        axum::extract::ws::Message::Pong(data) => Message::Pong(data),
+                        axum::extract::ws::Message::Close(frame) => {
+                            let frame = frame.map(|f| {
+                                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                    code: f.code.into(),
+                                    reason: f.reason.to_string().into(),
+                                }
+                            });
+                            let _ = up_tx.send(Message::Close(frame)).await;
+                            break;
+                        }
+                    };
+                    if up_tx.send(message).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    let upstream_to_downstream = async {
+        while let Some(message) = up_rx.next().await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    if down_tx
+                        .send(axum::extract::ws::Message::Text(text.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Binary(data)) => {
+                    if down_tx
+                        .send(axum::extract::ws::Message::Binary(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Ping(data)) => {
+                    if down_tx
+                        .send(axum::extract::ws::Message::Ping(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Pong(data)) => {
+                    if down_tx
+                        .send(axum::extract::ws::Message::Pong(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(Message::Close(frame)) => {
+                    let frame = frame.map(|f| axum::extract::ws::CloseFrame {
+                        code: f.code.into(),
+                        reason: f.reason.to_string().into(),
+                    });
+                    let _ = down_tx.send(axum::extract::ws::Message::Close(frame)).await;
+                    break;
+                }
+                Ok(Message::Frame(_)) => {}
+                Err(_) => break,
+            }
+        }
+    };
+    tokio::select! {
+        _ = downstream_to_upstream => {},
+        _ = upstream_to_downstream => {},
+    }
+}
+
+/// Copy headers minus hop-by-hop, `Host`, `Content-Length` and `Tailscale-*`.
 fn forward_headers(src: &HeaderMap) -> HeaderMap {
+    let nominated = connection_tokens(src);
     let mut out = HeaderMap::new();
     for (name, value) in src {
-        if is_dropped(name) {
+        if is_dropped(name) || nominated.contains(name.as_str()) {
             continue;
         }
         out.append(name.clone(), value.clone());
     }
     out
+}
+
+fn connection_tokens(headers: &HeaderMap) -> std::collections::HashSet<String> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .flat_map(|value| value.to_str().unwrap_or_default().split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 fn is_dropped(name: &HeaderName) -> bool {
@@ -120,7 +320,6 @@ async fn serve_file(
     AxumPath((session_id, path)): AxumPath<(String, String)>,
 ) -> Response {
     let not_found = || StatusCode::NOT_FOUND.into_response();
-
     let Some(cwd) = (edge.resolve_cwd)(&session_id) else {
         return not_found();
     };

@@ -43,6 +43,12 @@ struct Serve {
     /// Directory with the built web app, served with SPA fallback.
     #[arg(long)]
     web_dir: Option<PathBuf>,
+    /// Private local JSON file with pinned chat-sync peers and bearer tokens.
+    #[arg(long)]
+    chat_peer_config: Option<PathBuf>,
+    /// Separate public origin for untrusted files and proxied apps.
+    #[arg(long)]
+    untrusted_origin: Option<String>,
 }
 
 #[tokio::main]
@@ -74,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
         },
         state_dir,
         web_dir: args.web_dir,
+        chat_peer_config: args.chat_peer_config,
+        untrusted_origin: args.untrusted_origin,
     })
     .await
 }

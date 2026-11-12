@@ -11,6 +11,7 @@ let { request, connected, reply }: {
 let selected = $state<Record<string, string[]>>({});
 let freeText = $state<Record<string, string>>({});
 let feedback = $state('');
+let editingRequest = $state(false);
 
 const answers = $derived.by(() => {
 	if (request.t !== 'question.request') return {};
@@ -118,17 +119,19 @@ function planReply(outcome: 'approved' | 'cancelled' | 'abandoned') {
 	</div>
 </section>
 {:else}
-<section class="rounded-2xl border border-violet-400 bg-violet-50 p-4 shadow-lg dark:border-violet-700 dark:bg-violet-950" aria-label="계획 승인">
-	<h2 class="mb-3 text-sm font-semibold">계획을 검토해주세요</h2>
+<section class="rounded-xl border border-neutral-200 bg-white p-3 text-neutral-800 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-100" aria-label="계획 승인">
+	<h2 class="mb-2 flex items-center gap-2 text-sm font-semibold"><span aria-hidden="true">◆</span> 계획을 검토해주세요</h2>
 	{#if request.plan_content}
-		<div class="mb-4 rounded-xl bg-white/70 p-3 dark:bg-neutral-900"><Markdown text={request.plan_content} /></div>
+		<div class="mb-3 max-h-80 overflow-y-auto rounded-lg border border-neutral-200 p-3 text-sm dark:border-neutral-800"><Markdown text={request.plan_content} /></div>
 	{/if}
-	<div class="flex flex-wrap gap-2">
-		<button type="button" disabled={!connected} class="min-h-10 flex-1 rounded-xl bg-neutral-900 px-4 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={() => planReply('approved')}>승인</button>
-		<button type="button" disabled={!connected || !feedback.trim()} class="min-h-10 flex-1 rounded-xl border border-neutral-300 px-4 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => planReply('cancelled')}>수정 요청</button>
-		<button type="button" disabled={!connected} class="min-h-10 rounded-xl border border-neutral-300 px-4 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => planReply('abandoned')}>중단</button>
+	{#if editingRequest}
+		<label class="mb-2 block text-xs text-neutral-600 dark:text-neutral-300" for={`feedback-${request.id}`}>수정 의견</label>
+		<textarea id={`feedback-${request.id}`} bind:value={feedback} rows="2" class="mb-2 w-full resize-y rounded-lg border border-neutral-300 bg-white p-2 text-sm dark:border-neutral-700 dark:bg-neutral-950"></textarea>
+	{/if}
+	<div class="flex flex-wrap items-center gap-2">
+		<button type="button" disabled={!connected} class="h-9 min-w-0 rounded-lg bg-neutral-900 px-3 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={() => planReply('approved')}>계획대로 실행</button>
+		<button type="button" disabled={!connected || (editingRequest && !feedback.trim())} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => editingRequest ? planReply('cancelled') : (editingRequest = true)}>수정 요청</button>
+		<button type="button" disabled={!connected} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => planReply('abandoned')}>취소</button>
 	</div>
-	<label class="mt-3 block text-xs text-neutral-600 dark:text-neutral-300" for={`feedback-${request.id}`}>수정 의견</label>
-	<textarea id={`feedback-${request.id}`} bind:value={feedback} rows="2" class="mt-1 w-full resize-y rounded-xl border border-neutral-300 bg-white p-3 text-sm dark:border-neutral-700 dark:bg-neutral-900"></textarea>
 </section>
 {/if}

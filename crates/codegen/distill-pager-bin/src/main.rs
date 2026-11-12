@@ -1984,6 +1984,171 @@ fn dispatch_doctor_if_requested(args: &PagerArgs) -> bool {
     }
     true
 }
+const ACCOUNTS_LOGIN_WEB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn write_accounts_login_web_event(
+    writer: &mut impl std::io::Write,
+    event: &serde_json::Value,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut *writer, event)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn accounts_login_web_terminal_event(completed: bool) -> serde_json::Value {
+    serde_json::json!({ "status": if completed { "completed" } else { "failed" } })
+}
+
+fn supports_accounts_login_web(provider: distill_shell::accounts::Provider) -> bool {
+    provider != distill_shell::accounts::Provider::Grok
+}
+
+async fn run_accounts_login_web(store: &distill_shell::accounts::AccountStore, id: &str) -> bool {
+    let mut stdout = std::io::stdout().lock();
+    let account = match store.get(id) {
+        Ok(account) => account,
+        Err(_) => {
+            let _ = write_accounts_login_web_event(
+                &mut stdout,
+                &accounts_login_web_terminal_event(false),
+            );
+            return false;
+        }
+    };
+    if !supports_accounts_login_web(account.provider) {
+        eprintln!(
+            "Grok login-web is unsupported; use `distill accounts login <id>` for the existing Grok login flow."
+        );
+        let _ =
+            write_accounts_login_web_event(&mut stdout, &accounts_login_web_terminal_event(false));
+        return false;
+    }
+
+    #[cfg(unix)]
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(signal) => signal,
+        Err(_) => {
+            let _ = write_accounts_login_web_event(
+                &mut stdout,
+                &accounts_login_web_terminal_event(false),
+            );
+            return false;
+        }
+    };
+
+    let (feedback_tx, mut feedback_rx) = tokio::sync::mpsc::unbounded_channel();
+    let attempt = async {
+        let login = store.login_tui(id, None, feedback_tx);
+        tokio::pin!(login);
+        let feedback = tokio::select! {
+            result = &mut login => {
+                let _ = result;
+                return Err(());
+            }
+            feedback = feedback_rx.recv() => feedback.ok_or(())?,
+        };
+        let pending = serde_json::json!({
+            "status": "pending",
+            "authorizationUrl": feedback.authorization_url,
+            "callbackMode": "host_loopback",
+        });
+        write_accounts_login_web_event(&mut stdout, &pending).map_err(|_| ())?;
+        login.await.map_err(|_| ())
+    };
+
+    #[cfg(unix)]
+    let termination = sigterm.recv();
+    #[cfg(not(unix))]
+    let termination = std::future::pending::<()>();
+    let completed = tokio::select! {
+        result = tokio::time::timeout(ACCOUNTS_LOGIN_WEB_TIMEOUT, attempt) => {
+            matches!(result, Ok(Ok(())))
+        }
+        _ = termination => false,
+    };
+    let _ =
+        write_accounts_login_web_event(&mut stdout, &accounts_login_web_terminal_event(completed));
+    completed
+}
+
+#[cfg(test)]
+mod accounts_login_web_tests {
+    use super::{
+        accounts_login_web_terminal_event, supports_accounts_login_web,
+        write_accounts_login_web_event,
+    };
+    use std::io::{self, Write};
+
+    #[derive(Default)]
+    struct FlushWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn login_web_events_are_jsonl_flushed_and_redacted() {
+        let mut writer = FlushWriter::default();
+        let pending = serde_json::json!({
+            "status": "pending",
+            "authorizationUrl": "https://auth.example/authorize?state=state&code_challenge=challenge",
+            "callbackMode": "host_loopback",
+        });
+        write_accounts_login_web_event(&mut writer, &pending).unwrap();
+        write_accounts_login_web_event(&mut writer, &accounts_login_web_terminal_event(true))
+            .unwrap();
+        assert_eq!(writer.flushes, 2);
+        let lines: Vec<_> = std::str::from_utf8(&writer.bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect();
+        assert_eq!(lines[0], pending);
+        assert_eq!(lines[1], serde_json::json!({ "status": "completed" }));
+        assert!(!writer.bytes.windows(5).any(|window| window == b"token"));
+        assert!(
+            !writer
+                .bytes
+                .windows(10)
+                .any(|window| window == b"privateKey")
+        );
+    }
+
+    #[test]
+    fn login_web_failure_event_has_no_error_details() {
+        assert_eq!(
+            accounts_login_web_terminal_event(false),
+            serde_json::json!({ "status": "failed" })
+        );
+    }
+
+    #[test]
+    fn grok_is_not_supported_for_login_web() {
+        assert!(!supports_accounts_login_web(
+            distill_shell::accounts::Provider::Grok
+        ));
+        for provider in [
+            distill_shell::accounts::Provider::Chatgpt,
+            distill_shell::accounts::Provider::Claude,
+            distill_shell::accounts::Provider::Openrouter,
+        ] {
+            assert!(supports_accounts_login_web(provider));
+        }
+    }
+}
+
 fn main() {
     distill_version::set_full_version(env!("VERSION_WITH_COMMIT"));
     distill_telemetry::startup::mark_process_start();
@@ -2205,6 +2370,14 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                     AccountsCommand::Login { id, device_code } => {
                         store.login(&id, device_code, grok_config(&id)?).await?;
                         serde_json::json!({"ok": true})
+                    }
+                    AccountsCommand::LoginWeb { id } => {
+                        let completed = run_accounts_login_web(&store, &id).await;
+                        distill_shell::instrumentation::finalize_and_exit(if completed {
+                            0
+                        } else {
+                            1
+                        });
                     }
                     AccountsCommand::Logout { id } => {
                         store.logout(&id, grok_config(&id)?).await?;

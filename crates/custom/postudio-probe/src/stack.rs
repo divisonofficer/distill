@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -11,7 +11,8 @@ use distill_node::NodeConfig;
 use distill_node::agent::AgentConfig;
 use distill_node::listen::ListenAddr;
 use distill_test_support::{
-    Conversation, LeaderFixture, MockInferenceServer, MockToolCall, TestSandbox, Tool,
+    Conversation, LeaderFixture, MockInferenceServer, MockToolCall, ReadConversation,
+    ScriptViolation, TestSandbox, Tool,
 };
 use serde_json::json;
 use tokio::task::JoinHandle;
@@ -35,15 +36,53 @@ fn main() {
 pub struct Stack {
     pub url: String,
     pub cwd: PathBuf,
-    task: JoinHandle<anyhow::Result<()>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
+    node_config: NodeConfig,
     _leader: LeaderFixture,
     _server: MockInferenceServer,
     _sandbox: TestSandbox,
 }
 
+impl Stack {
+    pub fn set_conversations(&self, conversations: impl IntoIterator<Item = Conversation>) {
+        // Discard unserved startup scripts before installing a test-specific model script.
+        let _ = self._server.finish_scripts();
+        self._server.set_conversations(conversations);
+    }
+
+    pub fn conversations(&self) -> Vec<ReadConversation> {
+        self._server.conversations()
+    }
+
+    pub fn distill_home(&self) -> &Path {
+        self._sandbox.distill_home()
+    }
+
+    pub fn conversation_for_system_prompt(&self, text: &str) -> Option<ReadConversation> {
+        self._server.conversation_for_system_prompt(text)
+    }
+
+    pub fn script_violations(&self) -> Vec<ScriptViolation> {
+        self._server.script_violations()
+    }
+
+    pub async fn restart_node(&mut self) -> anyhow::Result<()> {
+        let task = self.task.take().context("node task missing")?;
+        task.abort();
+        match task.await {
+            Err(error) if error.is_cancelled() => {}
+            result => bail!("node did not stop cleanly before restart: {result:?}"),
+        }
+        self.task = Some(tokio::spawn(distill_node::run(self.node_config.clone())));
+        wait_healthy(self.task.as_mut().expect("restarted node task"), &self.url).await
+    }
+}
+
 impl Drop for Stack {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         // Scripts a caller never reached are not a failure for a dev stack.
         let _ = self._server.finish_scripts();
     }
@@ -59,17 +98,19 @@ pub async fn start(port: u16, web_dir: Option<PathBuf>) -> anyhow::Result<Stack>
     let sandbox = TestSandbox::builder().mock_url(server.url()).build();
     let booted = boot(&server, &sandbox, port, web_dir).await;
     match booted {
-        Ok((leader, task, cwd, port)) => {
+        Ok((leader, node_config, cwd, port)) => {
             let url = format!("http://127.0.0.1:{port}");
+            let task = tokio::spawn(distill_node::run(node_config.clone()));
             let mut stack = Stack {
                 url: url.clone(),
                 cwd,
-                task,
+                task: Some(task),
+                node_config,
                 _leader: leader,
                 _server: server,
                 _sandbox: sandbox,
             };
-            wait_healthy(&mut stack.task, &url).await?;
+            wait_healthy(stack.task.as_mut().expect("started node task"), &url).await?;
             Ok(stack)
         }
         Err(e) => {
@@ -85,7 +126,7 @@ async fn boot(
     sandbox: &TestSandbox,
     port: u16,
     web_dir: Option<PathBuf>,
-) -> anyhow::Result<(LeaderFixture, JoinHandle<anyhow::Result<()>>, PathBuf, u16)> {
+) -> anyhow::Result<(LeaderFixture, NodeConfig, PathBuf, u16)> {
     let root = sandbox.root().to_path_buf();
     let cwd = root.join("proj");
     std::fs::create_dir_all(&cwd).context("create proj")?;
@@ -152,14 +193,17 @@ async fn boot(
         untrusted_listen: ListenAddr::Tcp(SocketAddr::from(([127, 0, 0, 1], web_port))),
         allowed_origins: vec![
             "http://127.0.0.1:5173".into(),
+            "http://127.0.0.1:5180".into(),
+            "http://127.0.0.1:5182".into(),
             format!("http://127.0.0.1:{port}"),
         ],
         agent,
         state_dir: root.join("state"),
         web_dir,
+        chat_peer_config: None,
+        untrusted_origin: Some(format!("http://127.0.0.1:{web_port}")),
     };
-    let task = tokio::spawn(distill_node::run(cfg));
-    Ok((leader, task, cwd, port))
+    Ok((leader, cfg, cwd, port))
 }
 
 #[allow(

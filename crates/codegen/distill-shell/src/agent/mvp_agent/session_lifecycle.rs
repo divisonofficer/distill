@@ -211,12 +211,12 @@ impl MvpAgent {
     /// Remove a session without finalizing; it stays resumable on disk.
     pub(crate) fn remove_session(&self, id: &acp::SessionId) {
         self.retire_root_session(id);
-        let _ = self
-            .subagent_event_tx
-            .send(distill_tools::implementations::distill::task::types::SubagentEvent::TeardownSession {
+        let _ = self.subagent_event_tx.send(
+            distill_tools::implementations::distill::task::types::SubagentEvent::TeardownSession {
                 parent_session_id: id.0.to_string(),
                 respond_to: None,
-            });
+            },
+        );
         self.take_session(id);
         self.resident_roster_titles
             .borrow_mut()
@@ -456,7 +456,9 @@ impl MvpAgent {
             session_id,
             cwd,
             is_worktree,
+            parent_session_id: None,
             session_kind: None,
+            source_workspace_dir: None,
             model_id,
             reasoning_effort,
             yolo,
@@ -476,11 +478,24 @@ impl MvpAgent {
     }
     /// Full roster: resident actors plus recent on-disk sessions; resident wins an id collision.
     pub(crate) async fn build_roster(&self) -> Vec<crate::agent::roster::RosterEntry> {
+        self.build_roster_with_subagents(false).await
+    }
+
+    pub(crate) async fn build_roster_with_subagents(
+        &self,
+        include_subagents: bool,
+    ) -> Vec<crate::agent::roster::RosterEntry> {
         let resident = self.resident_roster_entries();
-        let summaries = crate::session::persistence::list_recent_summaries(200)
-            .await
-            .unwrap_or_default();
-        let entries = crate::agent::roster::merge_roster(resident, summaries);
+        let summaries = if include_subagents {
+            crate::session::persistence::list_recent_summaries_with_subagents(200).await
+        } else {
+            crate::session::persistence::list_recent_summaries(200).await
+        }.unwrap_or_default();
+        let entries = crate::agent::roster::merge_roster_with_subagents(
+            resident,
+            summaries,
+            include_subagents,
+        );
         self.cache_resident_titles(&entries);
         entries
     }

@@ -1306,53 +1306,40 @@ impl MvpAgent {
             return Vec::new();
         };
         let contents = match std::fs::read_to_string(updates_path) {
-            Ok(c) => c,
+            Ok(contents) => contents,
             Err(_) => return Vec::new(),
         };
-        let all_lines: Vec<&str> = contents
+        let lines = contents
             .lines()
-            .filter(|l| !l.trim().is_empty())
+            .filter(|line| !line.trim().is_empty())
             .collect();
-        let live_lines = crate::session::storage::filter_rewind_lines(all_lines);
+        let live_lines = crate::session::storage::filter_rewind_lines(lines);
         let mut pending = std::collections::HashMap::<String, OrphanedTask>::new();
         for line in live_lines {
             if !line.contains(&*TASK_BACKGROUNDED) && !line.contains(&*TASK_COMPLETED) {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            let Some(update) = v.get("params").and_then(|p| p.get("update")) else {
+            let Some(update) = value.get("params").and_then(|params| params.get("update")) else {
                 continue;
             };
-            match update.get("sessionUpdate").and_then(|s| s.as_str()) {
+            match update.get("sessionUpdate").and_then(serde_json::Value::as_str) {
                 Some(tag) if tag == *TASK_BACKGROUNDED => {
-                    if let Some(id) = update.get("task_id").and_then(|v| v.as_str()) {
-                        pending
-                            .insert(
-                                id.to_string(),
-                                OrphanedTask {
-                                    task_id: id.to_string(),
-                                    command: update
-                                        .get("command")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    cwd: update
-                                        .get("cwd")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                },
-                            );
+                    if let Some(id) = update.get("task_id").and_then(serde_json::Value::as_str) {
+                        pending.insert(
+                            id.to_owned(),
+                            OrphanedTask {
+                                task_id: id.to_owned(),
+                                command: update.get("command").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+                                cwd: update.get("cwd").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+                            },
+                        );
                     }
                 }
                 Some(tag) if tag == *TASK_COMPLETED => {
-                    if let Some(id) = update
-                        .get("task_snapshot")
-                        .and_then(|s| s.get("task_id"))
-                        .and_then(|v| v.as_str())
-                    {
+                    if let Some(id) = update.pointer("/task_snapshot/task_id").and_then(serde_json::Value::as_str) {
                         pending.remove(id);
                     }
                 }
@@ -1361,17 +1348,45 @@ impl MvpAgent {
         }
         pending.into_values().collect()
     }
+
+    fn find_orphaned_background_tasks_index(
+        updates_file_path: &Option<PathBuf>,
+    ) -> Vec<OrphanedTask> {
+        let Some(updates_path) = updates_file_path else {
+            return Vec::new();
+        };
+        crate::extensions::chat_conversation_history::orphaned_background_tasks(updates_path)
+            .map(|tasks| {
+                tasks
+                    .into_iter()
+                    .map(|(task_id, command, cwd)| OrphanedTask {
+                        task_id,
+                        command,
+                        cwd,
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "History index unavailable; scanning for orphaned tasks");
+                Self::find_orphaned_background_tasks(updates_file_path)
+            })
+    }
     /// Emit `task_completed` for background tasks that were replayed as "Running" but whose processes no longer exist (cold session load).
     /// Returns completion receivers so the caller can drain them before returning LoadSessionResponse.
     pub(super) fn reconcile_stale_background_tasks(
         &self,
         session_id: &acp::SessionId,
         updates_file_path: &Option<PathBuf>,
+        postudio_history_paging: bool,
     ) -> Vec<tokio::sync::oneshot::Receiver<distill_acp_lib::AcpResult<()>>> {
         if self.is_resident(session_id) {
             return Vec::new();
         }
-        let orphaned = Self::find_orphaned_background_tasks(updates_file_path);
+        let orphaned = if postudio_history_paging {
+            Self::find_orphaned_background_tasks_index(updates_file_path)
+        } else {
+            Self::find_orphaned_background_tasks(updates_file_path)
+        };
         let mut completions = Vec::with_capacity(orphaned.len());
         for task in &orphaned {
             let snapshot = distill_tools::types::TaskSnapshot {

@@ -40,6 +40,9 @@ const ID_NAMESPACE_SEP: char = '|';
 /// Cap on live notifications buffered per in-flight `session/load` (see `load_live_buffer`). A normal load resolves in well under a second, so the buffer is tiny; this bound prevents unbounded growth if a load stalls.
 /// On overflow we stop buffering and forward live normally. Correctness of the transcript is preserved by the client's eventId dedup; only the ordering nicety is lost in this degenerate case.
 const MAX_BUFFERED_LIVE_PER_LOAD: usize = 4096;
+const MAX_CHAT_PROGRESS_REQUESTS: usize = 4096;
+type ChatProgressRoutes = HashMap<String, (ClientId, String)>;
+type PendingChatProgress = HashMap<String, (ClientId, String)>;
 enum ServerEvent {
     Disconnected(ClientId),
     Registered(ClientId, ClientMode, ClientCapabilities, String),
@@ -406,6 +409,96 @@ fn parse_response_id(json: &mut serde_json::Value) -> Option<(ClientId, String)>
     }
     Some((ClientId(client_id), namespaced_id))
 }
+/// Extract a valid request correlation ID from a general chat completion call.
+fn extract_chat_completion_request_id(json: &serde_json::Value) -> Option<&str> {
+    if method_of(json) != Some("x.ai/chat/complete") {
+        return None;
+    }
+    let request_id = interaction_inner_params(json)?.get("requestId")?.as_str()?;
+    (!request_id.trim().is_empty()
+        && request_id.len() <= 128
+        && !request_id.chars().any(char::is_control))
+    .then_some(request_id)
+}
+
+/// Extract the correlation ID from a gateway-wrapped chat progress notification.
+fn extract_chat_progress_request_id(json: &serde_json::Value) -> Option<&str> {
+    if method_of(json) != Some("x.ai/chat/progress") {
+        return None;
+    }
+    interaction_inner_params(json)?.get("requestId")?.as_str()
+}
+
+fn rewrite_chat_request_id(json: &mut serde_json::Value, request_id: &str) -> bool {
+    if !matches!(
+        method_of(json),
+        Some("x.ai/chat/complete" | "x.ai/chat/progress")
+    ) {
+        return false;
+    }
+    let Some(slot) =
+        interaction_inner_params_mut(json).and_then(|params| params.get_mut("requestId"))
+    else {
+        return false;
+    };
+    *slot = serde_json::Value::String(request_id.to_owned());
+    true
+}
+
+fn make_chat_progress_error(id: serde_json::Value, message: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32003,
+            "message": message,
+        }
+    })
+    .to_string()
+}
+
+fn make_chat_progress_capacity_error(json: &serde_json::Value) -> Option<String> {
+    Some(make_chat_progress_error(
+        json.get("id")?.clone(),
+        "too_many_active_chat_requests",
+    ))
+}
+
+fn register_chat_progress_route(
+    routes: &mut ChatProgressRoutes,
+    internal_id: String,
+    client_id: ClientId,
+    original_id: String,
+) -> bool {
+    if routes.len() >= MAX_CHAT_PROGRESS_REQUESTS || routes.contains_key(&internal_id) {
+        return false;
+    }
+    routes.insert(internal_id, (client_id, original_id));
+    true
+}
+
+fn unregister_chat_progress_route(
+    routes: &mut ChatProgressRoutes,
+    internal_id: &str,
+    client_id: ClientId,
+) {
+    if routes
+        .get(internal_id)
+        .is_some_and(|(owner, _)| *owner == client_id)
+    {
+        routes.remove(internal_id);
+    }
+}
+
+fn chat_progress_target(
+    routes: &ChatProgressRoutes,
+    internal_id: &str,
+) -> Option<(ClientId, String)> {
+    routes
+        .get(internal_id)
+        .map(|(owner, original_id)| (*owner, original_id.clone()))
+}
+
 /// Extract session_id from a message's params (for session-based routing).
 fn extract_session_id(json: &serde_json::Value) -> Option<String> {
     let params = json.get("params")?;
@@ -501,6 +594,15 @@ fn interaction_inner_params(json: &serde_json::Value) -> Option<&serde_json::Val
         && let Some(inner) = params.get("params")
     {
         Some(inner)
+    } else {
+        Some(params)
+    }
+}
+
+fn interaction_inner_params_mut(json: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+    let params = json.get_mut("params")?;
+    if params.get("method").is_some() {
+        params.get_mut("params")
     } else {
         Some(params)
     }
@@ -1542,6 +1644,9 @@ pub async fn run_leader_server(
     let mut orphan_replay_warned: HashSet<ClientId> = HashSet::new();
     let mut load_replay_max_seq: HashMap<(ClientId, String), u64> = HashMap::new();
     let mut interaction_requests: HashMap<String, HashMap<String, Arc<str>>> = HashMap::new();
+    let mut chat_progress_routes = ChatProgressRoutes::new();
+    let mut pending_chat_progress = PendingChatProgress::new();
+    let mut next_chat_progress_id = 0u128;
     let mut last_active_client: Option<ClientId> = None;
     let mut had_clients = false;
     let mut pending_requests: usize = 0;
@@ -1660,6 +1765,8 @@ pub async fn run_leader_server(
                         );
                     }
                     pending_load_by_req.retain(|_, (c, _)| *c != id);
+                    pending_chat_progress.retain(|_, (owner, _)| *owner != id);
+                    chat_progress_routes.retain(|_, (owner, _)| *owner != id);
                     load_live_buffer.retain(|(c, _), _| *c != id);
                     load_replay_max_seq.retain(|(c, _), _| *c != id);
                     let mut detached_sessions: Vec<String> = Vec::new();
@@ -1826,6 +1933,22 @@ pub async fn run_leader_server(
                         }
                         continue;
                     }
+                    let chat_progress_original_id = json
+                        .as_ref()
+                        .filter(|request| request.get("id").is_some())
+                        .and_then(extract_chat_completion_request_id)
+                        .map(str::to_owned);
+                    if chat_progress_original_id.is_some()
+                        && chat_progress_routes.len() >= MAX_CHAT_PROGRESS_REQUESTS
+                    {
+                        if let Some(error) =
+                            json.as_ref().and_then(make_chat_progress_capacity_error)
+                            && let Some(client) = clients.get(&id)
+                        {
+                            let _ = client.tx.try_send(ClientOutbound::Acp(error.into()));
+                        }
+                        continue;
+                    }
                     if let Some(client) = clients.get(&id)
                         && client.mode == ClientMode::Stdio
                     {
@@ -1897,6 +2020,44 @@ pub async fn run_leader_server(
                     }
                     let rewritten = json.as_mut().and_then(|j| rewrite_request_id(j, id));
                     payload_mutated |= rewritten.is_some();
+                    if let (Some(json), Some(original_id), Some((rpc_id, original_rpc_id))) = (
+                        json.as_mut(),
+                        chat_progress_original_id.as_ref(),
+                        rewritten.as_ref(),
+                    ) {
+                        let Some(sequence) = next_chat_progress_id.checked_add(1) else {
+                            let error = make_chat_progress_error(
+                                original_rpc_id.clone(),
+                                "chat_progress_id_exhausted",
+                            );
+                            if let Some(client) = clients.get(&id) {
+                                let _ = client.tx.try_send(ClientOutbound::Acp(error.into()));
+                            }
+                            continue;
+                        };
+                        next_chat_progress_id = sequence;
+                        let internal_id =
+                            format!("{rpc_id}{ID_NAMESPACE_SEP}chat-progress-{sequence}");
+                        if !rewrite_chat_request_id(json, &internal_id)
+                            || !register_chat_progress_route(
+                                &mut chat_progress_routes,
+                                internal_id.clone(),
+                                id,
+                                original_id.clone(),
+                            )
+                        {
+                            let error = make_chat_progress_error(
+                                original_rpc_id.clone(),
+                                "chat_progress_registration_failed",
+                            );
+                            if let Some(client) = clients.get(&id) {
+                                let _ = client.tx.try_send(ClientOutbound::Acp(error.into()));
+                            }
+                            continue;
+                        }
+                        payload_mutated = true;
+                        pending_chat_progress.insert(rpc_id.clone(), (id, internal_id));
+                    }
                     if let Some(json) = json.as_ref()
                         && is_session_attach_request(json)
                         && let Some(load_sid) = extract_session_id(json)
@@ -1926,6 +2087,12 @@ pub async fn run_leader_server(
             LeaderServerPoll::Response(payload) => {
                 let mut json: Option<serde_json::Value> = serde_json::from_str(&payload).ok();
                 let parsed_response = json.as_mut().and_then(parse_response_id);
+                if let Some((client_id, rpc_id)) = parsed_response.as_ref()
+                    && let Some((owner, internal_id)) = pending_chat_progress.remove(rpc_id)
+                    && owner == *client_id
+                {
+                    unregister_chat_progress_route(&mut chat_progress_routes, &internal_id, owner);
+                }
                 if parsed_response.is_some() {
                     pending_requests = pending_requests.saturating_sub(1);
                     agent_busy.store(pending_requests > 0, Ordering::Relaxed);
@@ -2069,8 +2236,25 @@ pub async fn run_leader_server(
                     }
                     continue;
                 }
+                let mut json = json;
+                if let Some(internal_id) = json
+                    .as_ref()
+                    .and_then(extract_chat_progress_request_id)
+                    .map(str::to_owned)
+                {
+                    if let Some((target, original_id)) =
+                        chat_progress_target(&chat_progress_routes, &internal_id)
+                        && let Some(client) = clients.get(&target)
+                        && let Some(progress) = json.as_mut()
+                        && rewrite_chat_request_id(progress, &original_id)
+                    {
+                        let _ = client
+                            .tx
+                            .try_send(ClientOutbound::Acp(progress.to_string().into()));
+                    }
+                    continue;
+                }
                 let payload: Arc<str> = payload.into();
-                let json = json;
                 if json
                     .as_ref()
                     .is_some_and(is_machine_wide_broadcast_notification)

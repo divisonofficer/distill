@@ -11,11 +11,11 @@ fn nth<T>(xs: &[T], i: usize) -> &T {
     };
     x
 }
-use std::pin::pin;
 use distill_sampling_types::messages::{
     ContentBlock, MessageDeltaBody, MessageDeltaUsage, MessagesResponse, MessagesUsage,
     StreamDelta, StreamError,
 };
+use std::pin::pin;
 
 fn rid() -> RequestId {
     RequestId::from("msg-test")
@@ -148,6 +148,25 @@ async fn text_block_assembles_into_completed_response() {
         })
         .collect();
     assert_eq!(text_tokens, vec!["Hello, ", "world!"]);
+
+    let raw = stream::iter(vec![
+        Ok(message_start()),
+        Ok(text_block_start(0)),
+        Ok(text_delta(0, "Hello, ")),
+        Ok(text_delta(0, "world!")),
+        Ok(block_stop(0)),
+        Ok(message_delta_with_stop(messages::StopReason::EndTurn)),
+        Ok(MessageStreamEvent::MessageStop),
+    ])
+    .boxed();
+    let mut emitted = Vec::new();
+    let (response, _) = crate::stream::collect_response_with_text(
+        stream_messages(raw, None, rid(), Duration::from_secs(60)),
+        |text| emitted.push(text.to_owned()),
+    )
+    .await
+    .expect("Messages stream completes");
+    assert_eq!(emitted.concat(), response.assistant_text());
 
     match evs.last().unwrap() {
         SamplingEvent::Completed { response, .. } => {

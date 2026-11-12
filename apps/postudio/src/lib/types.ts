@@ -4,6 +4,7 @@ export type Mode = 'ask' | 'auto' | 'always-approve';
 export type Status = 'running' | 'waiting_permission' | 'idle' | 'error';
 
 export interface BoardRow {
+apiOrigin?: string;
 	sessionId: string;
 	cwd: string;
 	title: string;
@@ -14,6 +15,9 @@ export interface BoardRow {
 	modelId: string;
 	isWorktree: boolean;
 	lastChangeUnixMs: number;
+	parentSessionId?: string;
+	sessionKind?: string;
+	sourceWorkspaceDir?: string;
 }
 
 export function modeFromRow(row: Pick<BoardRow, 'autoMode' | 'yolo'> | undefined): Mode | undefined {
@@ -27,6 +31,7 @@ export function modeFromRow(row: Pick<BoardRow, 'autoMode' | 'yolo'> | undefined
 export interface NodeInfo {
 	host: string;
 	version: string;
+	untrustedOrigin?: string;
 }
 
 export interface Model {
@@ -45,6 +50,8 @@ export interface NewSession {
 	worktree?: { name: string };
 	mode?: Mode;
 	prompt?: string;
+	images?: ImageIn[];
+	text_files?: TextFileIn[];
 }
 
 export interface ImageIn {
@@ -52,6 +59,16 @@ export interface ImageIn {
 	/** base64 without the data: prefix */
 	data: string;
 }
+
+export interface TextFileIn {
+	name: string;
+	text: string;
+}
+
+export type UserAttachment =
+	| ({ kind: 'image' } & ImageIn & { name?: string })
+	| { kind: 'text'; name: string; text: string }
+	| { kind: 'file'; name: string; uri?: string };
 
 export type ToolContent =
 	| { type: 'text'; text: string }
@@ -99,6 +116,7 @@ export type Sep =
 	| { t: 'session.title'; title: string }
 	| { t: 'session.model'; model_id: string }
 	| { t: 'user.message'; text: string }
+	| { t: 'user.attachment'; attachment: UserAttachment }
 	| { t: 'message.delta'; text: string }
 	| { t: 'reasoning.delta'; text: string }
 	| {
@@ -120,14 +138,17 @@ export type Sep =
 	  }
 	| Extract<InteractionRequest, { t: 'question.request' }>
 	| Extract<InteractionRequest, { t: 'plan.request' }>
-	| { t: 'permission.resolved'; tool_call_id: string }
+	| { t: 'permission.expired'; id: unknown }
+| { t: 'permission.resolved'; tool_call_id: string }
 	| { t: 'usage'; used: number; size: number }
 	| { t: 'turn.end'; stop_reason: string; error?: string }
+	| { t: 'history.page'; items: Sep[]; cursor: string | null; has_more: boolean; initial: boolean; error?: string }
 	| { t: 'replay.end' }
 	| { t: 'error'; message: string };
 
 export type ClientMsg =
-	| { t: 'prompt'; text: string; images: ImageIn[] }
+	| { t: 'history.load'; cursor: string }
+	| { t: 'prompt'; text: string; images: ImageIn[]; text_files?: TextFileIn[] }
 	| { t: 'cancel' }
 	| { t: 'permission'; id: unknown; option_id: string }
 	| {

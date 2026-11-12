@@ -52,7 +52,8 @@ fn echo_params(m: &Value) -> &Value {
 
 /// Whether `m` is `x.ai/yolo_mode_changed` for `sid`, with or without the leading `_` and in direct or wrapped form.
 fn is_mode_echo_for(m: &Value, sid: &str) -> bool {
-    let direct = method_of(m).is_some_and(|mt| mt.trim_start_matches('_') == "x.ai/yolo_mode_changed");
+    let direct =
+        method_of(m).is_some_and(|mt| mt.trim_start_matches('_') == "x.ai/yolo_mode_changed");
     let wrapped = m
         .pointer("/params/method")
         .and_then(Value::as_str)
@@ -71,7 +72,8 @@ async fn wait_for_mode_echo(c: &mut RawClient, sid: &str, dur: Duration) -> bool
         if now >= deadline {
             return false;
         }
-        c.pump_for((deadline - now).min(Duration::from_millis(200))).await;
+        c.pump_for((deadline - now).min(Duration::from_millis(200)))
+            .await;
     }
 }
 
@@ -89,16 +91,28 @@ async fn l1_two_clients_share_session() {
     let sid = must("A session/new", a.new_session(&h.cwd).await);
     let mut b = client(&h).await;
     let loaded = must("B session/load", b.load_session(&sid, &h.cwd).await);
-    eprintln!("B session/load result keys: {:?}", loaded.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+    eprintln!(
+        "B session/load result keys: {:?}",
+        loaded.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
     a.settle().await;
     b.settle().await;
 
     let prompt_id = a.send_prompt(&sid, "go").await;
-    let perm_a = must("A permission", a.wait_permission(&sid, Duration::from_secs(30)).await);
-    let perm_b = must("B permission", b.wait_permission(&sid, Duration::from_secs(30)).await);
+    let perm_a = must(
+        "A permission",
+        a.wait_permission(&sid, Duration::from_secs(30)).await,
+    );
+    let perm_b = must(
+        "B permission",
+        b.wait_permission(&sid, Duration::from_secs(30)).await,
+    );
     eprintln!("permission request A: {perm_a}\npermission request B: {perm_b}");
     must("B allow", b.answer_permission(&perm_b, "allow_once").await);
-    let resp = must("A prompt response", a.await_response(prompt_id, Duration::from_secs(60)).await);
+    let resp = must(
+        "A prompt response",
+        a.await_response(prompt_id, Duration::from_secs(60)).await,
+    );
     eprintln!("A prompt response: {resp}");
     assert!(resp.get("error").is_none(), "prompt errored: {resp}");
     a.pump_for(Duration::from_secs(1)).await;
@@ -110,11 +124,24 @@ async fn l1_two_clients_share_session() {
     let b_updates = b.incoming().iter().filter(|m| is_update(m)).count();
     assert!(a_updates > 0, "A got no session/update: {}", a.summary());
     assert!(b_updates > 0, "B got no session/update: {}", b.summary());
-    let reply_seen = |c: &RawClient| c.incoming().iter().any(|m| m.to_string().contains("L1_DONE"));
-    assert!(reply_seen(&a) && reply_seen(&b), "scripted reply not seen by both");
+    let reply_seen = |c: &RawClient| {
+        c.incoming()
+            .iter()
+            .any(|m| m.to_string().contains("L1_DONE"))
+    };
+    assert!(
+        reply_seen(&a) && reply_seen(&b),
+        "scripted reply not seen by both"
+    );
     let a_labels = labels(a.incoming());
-    let from = a_labels.iter().position(|l| l == "session/request_permission").unwrap_or(0);
-    eprintln!("OBSERVE A incoming after permission request: {:?}", &a_labels[from..]);
+    let from = a_labels
+        .iter()
+        .position(|l| l == "session/request_permission")
+        .unwrap_or(0);
+    eprintln!(
+        "OBSERVE A incoming after permission request: {:?}",
+        &a_labels[from..]
+    );
     eprintln!("OBSERVE B incoming (all): {:?}", labels(b.incoming()));
     a.close().await;
     b.close().await;
@@ -125,20 +152,28 @@ async fn l1_two_clients_share_session() {
 async fn l1b_late_joiner_gets_pending_permission() {
     let h = Harness::start().await;
     let file = temp_file(&h, "a.txt");
-    h.server.set_conversations([edit_turn(1, &file, "L1B_DONE")]);
+    h.server
+        .set_conversations([edit_turn(1, &file, "L1B_DONE")]);
     let mut a = client(&h).await;
     let sid = must("A session/new", a.new_session(&h.cwd).await);
     let prompt_id = a.send_prompt(&sid, "go").await;
-    let perm_a = must("A permission", a.wait_permission(&sid, Duration::from_secs(30)).await);
+    let perm_a = must(
+        "A permission",
+        a.wait_permission(&sid, Duration::from_secs(30)).await,
+    );
 
     let mut c = client(&h).await;
     must("C session/load", c.load_session(&sid, &h.cwd).await);
     let perm_c = c.wait_permission(&sid, Duration::from_secs(15)).await;
     eprintln!("late joiner C incoming: {:?}", labels(c.incoming()));
     must("A allow", a.answer_permission(&perm_a, "allow_once").await);
-    let resp = must("A prompt response", a.await_response(prompt_id, Duration::from_secs(60)).await);
+    let resp = must(
+        "A prompt response",
+        a.await_response(prompt_id, Duration::from_secs(60)).await,
+    );
     assert!(resp.get("error").is_none(), "prompt errored: {resp}");
-    let perm_c = perm_c.unwrap_or_else(|e| panic!("late joiner never got pending request_permission: {e}"));
+    let perm_c =
+        perm_c.unwrap_or_else(|e| panic!("late joiner never got pending request_permission: {e}"));
     eprintln!("late joiner C permission: {perm_c}");
     a.close().await;
     c.close().await;
@@ -161,13 +196,16 @@ async fn run_background_turn(h: &Harness, a: &mut RawClient) -> (String, u32) {
     assert!(resp.get("error").is_none(), "prompt errored: {resp}");
     let mut pid = None;
     for _ in 0..50 {
-        pid = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
+        pid = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
         if pid.is_some() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let pid = pid.unwrap_or_else(|| panic!("background command never wrote its pid: {}", a.summary()));
+    let pid =
+        pid.unwrap_or_else(|| panic!("background command never wrote its pid: {}", a.summary()));
     (sid, pid)
 }
 
@@ -180,11 +218,17 @@ async fn l2_background_process_survives_disconnect() {
     let mut a = client(&h).await;
     let (sid, pid) = run_background_turn(&h, &mut a).await;
     let _guard = PidGuard(pid);
-    assert!(pid_alive(pid), "background pid {pid} not alive before disconnect");
+    assert!(
+        pid_alive(pid),
+        "background pid {pid} not alive before disconnect"
+    );
 
     a.close().await;
     tokio::time::sleep(Duration::from_secs(8)).await;
-    assert!(pid_alive(pid), "background pid {pid} died after all clients disconnected");
+    assert!(
+        pid_alive(pid),
+        "background pid {pid} died after all clients disconnected"
+    );
 
     let mut n = client(&h).await;
     let loaded = n.load_session(&sid, &h.cwd).await;
@@ -200,7 +244,10 @@ async fn l2b_background_process_with_one_client_still_attached() {
     let mut a = client(&h).await;
     let (sid, pid) = run_background_turn(&h, &mut a).await;
     let _guard = PidGuard(pid);
-    assert!(pid_alive(pid), "background pid {pid} not alive before disconnect");
+    assert!(
+        pid_alive(pid),
+        "background pid {pid} not alive before disconnect"
+    );
 
     let mut b = client(&h).await;
     must("B session/load", b.load_session(&sid, &h.cwd).await);
@@ -208,26 +255,39 @@ async fn l2b_background_process_with_one_client_still_attached() {
     tokio::time::sleep(Duration::from_secs(8)).await;
     let alive_with_b = pid_alive(pid);
     eprintln!("OBSERVE l2b: pid {pid} alive after A left, B attached: {alive_with_b}");
-    assert!(alive_with_b, "background pid {pid} died although client B stayed attached");
+    assert!(
+        alive_with_b,
+        "background pid {pid} died although client B stayed attached"
+    );
 
     b.close().await;
     tokio::time::sleep(Duration::from_secs(8)).await;
-    eprintln!("OBSERVE l2b: pid {pid} alive after B also left: {}", pid_alive(pid));
+    eprintln!(
+        "OBSERVE l2b: pid {pid} alive after B also left: {}",
+        pid_alive(pid)
+    );
 }
 
 #[tokio::test]
 #[ignore = "needs the distill binary; set GROK_BINARY"]
 async fn l3_leader_survives_zero_clients() {
     let h = Harness::start().await;
-    h.server.set_conversations([Conversation::nth(1).reply("L3_DONE")]);
+    h.server
+        .set_conversations([Conversation::nth(1).reply("L3_DONE")]);
     let leader_pid = h.leader.leader_pid().expect("leader pid");
     let mut a = client(&h).await;
     let sid = must("A session/new", a.new_session(&h.cwd).await);
     let prompt_id = a.send_prompt(&sid, "go").await;
-    must("A prompt response", a.await_response(prompt_id, Duration::from_secs(60)).await);
+    must(
+        "A prompt response",
+        a.await_response(prompt_id, Duration::from_secs(60)).await,
+    );
     a.close().await;
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(pid_alive(leader_pid), "leader pid {leader_pid} died with zero clients");
+    assert!(
+        pid_alive(leader_pid),
+        "leader pid {leader_pid} died with zero clients"
+    );
 
     let mut n = client(&h).await;
     let mut listed = None;
@@ -243,7 +303,10 @@ async fn l3_leader_survives_zero_clients() {
     }
     let (method, result) = listed.expect("no list method reachable from this client");
     eprintln!("session list method used: {method}");
-    assert!(result.to_string().contains(&sid), "session {sid} missing from {method} result: {result}");
+    assert!(
+        result.to_string().contains(&sid),
+        "session {sid} missing from {method} result: {result}"
+    );
     n.close().await;
 }
 
@@ -267,15 +330,28 @@ async fn l4_session_scoped_mode_change() {
     b.settle().await;
     a.settle().await;
 
-    a.notify("_x.ai/yolo_mode_changed", json!({"yolo_mode": true, "sessionId": s1})).await;
+    a.notify(
+        "_x.ai/yolo_mode_changed",
+        json!({"yolo_mode": true, "sessionId": s1}),
+    )
+    .await;
     let echo_seen = wait_for_mode_echo(&mut b, &s1, Duration::from_secs(10)).await;
     assert!(
         echo_seen,
         "B (attached to S1) did not receive x.ai/yolo_mode_changed for S1 within 10 s; saw {:?}",
         labels(b.incoming())
     );
-    let echo = b.incoming().iter().find(|m| is_mode_echo_for(m, &s1)).cloned().expect("echo present");
-    assert_eq!(echo_params(&echo).get("yolo_mode"), Some(&json!(true)), "echo carries new mode: {echo}");
+    let echo = b
+        .incoming()
+        .iter()
+        .find(|m| is_mode_echo_for(m, &s1))
+        .cloned()
+        .expect("echo present");
+    assert_eq!(
+        echo_params(&echo).get("yolo_mode"),
+        Some(&json!(true)),
+        "echo carries new mode: {echo}"
+    );
     a.pump_for(Duration::from_millis(500)).await;
     eprintln!("OBSERVE B after mode change: {:?}", labels(b.incoming()));
     eprintln!("OBSERVE A after mode change: {:?}", labels(a.incoming()));
@@ -286,14 +362,22 @@ async fn l4_session_scoped_mode_change() {
     let p2 = a.send_prompt(&s2, "go").await;
     let (r2, asked2) = must("S2 turn", a.finish_turn(p2, "allow_once").await);
     eprintln!("S2: response {r2}; permission requests: {asked2}");
-    eprintln!("files: s1={:?} s2={:?}", std::fs::read_to_string(&f1), std::fs::read_to_string(&f2));
+    eprintln!(
+        "files: s1={:?} s2={:?}",
+        std::fs::read_to_string(&f1),
+        std::fs::read_to_string(&f2)
+    );
     let s3 = must("S3", a.new_session(&h.cwd).await);
     let p3 = a.send_prompt(&s3, "go").await;
     let (r3, asked3) = must("S3 turn", a.finish_turn(p3, "allow_once").await);
     eprintln!("S3: response {r3}; permission requests: {asked3}");
     eprintln!("OBSERVE l4 permission counts: S1={asked1} S2={asked2} S3={asked3}");
     assert_eq!(asked1, 0, "S1 (yolo) still sent session/request_permission");
-    assert_eq!(std::fs::read_to_string(&f1).unwrap(), "after\n", "S1 tool did not run");
+    assert_eq!(
+        std::fs::read_to_string(&f1).unwrap(),
+        "after\n",
+        "S1 tool did not run"
+    );
     assert!(asked2 >= 1, "S2 did not send session/request_permission");
     assert!(
         asked3 >= 1,
@@ -313,7 +397,10 @@ async fn l7_roster_broadcast_on_needs_input() {
     let mut a = client(&h).await;
     let sid = must("A session/new", a.new_session(&h.cwd).await);
     let prompt_id = a.send_prompt(&sid, "go").await;
-    let perm = must("A permission", a.wait_permission(&sid, Duration::from_secs(30)).await);
+    let perm = must(
+        "A permission",
+        a.wait_permission(&sid, Duration::from_secs(30)).await,
+    );
 
     let roster_for_sid = |c: &RawClient| -> Vec<Value> {
         c.incoming()
@@ -324,17 +411,28 @@ async fn l7_roster_broadcast_on_needs_input() {
             .collect()
     };
     let first = d
-        .wait_for("roster notification for session", Duration::from_secs(15), |m| {
-            method_of(m).is_some_and(|x| x.contains("sessions/changed")) && m.to_string().contains(&sid)
-        })
+        .wait_for(
+            "roster notification for session",
+            Duration::from_secs(15),
+            |m| {
+                method_of(m).is_some_and(|x| x.contains("sessions/changed"))
+                    && m.to_string().contains(&sid)
+            },
+        )
         .await;
     d.pump_for(Duration::from_secs(3)).await;
-    let listed = must("D _x.ai/sessions/list", d.request("_x.ai/sessions/list", json!({})).await);
+    let listed = must(
+        "D _x.ai/sessions/list",
+        d.request("_x.ai/sessions/list", json!({})).await,
+    );
     let entry = listed
         .pointer("/result/sessions")
         .or_else(|| listed.get("sessions"))
         .and_then(Value::as_array)
-        .and_then(|rows| rows.iter().find(|r| r.get("sessionId").and_then(Value::as_str) == Some(sid.as_str())))
+        .and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("sessionId").and_then(Value::as_str) == Some(sid.as_str()))
+        })
         .cloned();
     eprintln!("D sessions/list entry while pending: {entry:?}");
     let all = roster_for_sid(&d);
@@ -345,10 +443,20 @@ async fn l7_roster_broadcast_on_needs_input() {
     eprintln!("D roster activities in order: {acts:?}");
     eprintln!("D all incoming: {:?}", labels(d.incoming()));
     must("A allow", a.answer_permission(&perm, "allow_once").await);
-    must("A prompt response", a.await_response(prompt_id, Duration::from_secs(60)).await);
+    must(
+        "A prompt response",
+        a.await_response(prompt_id, Duration::from_secs(60)).await,
+    );
     must("D roster notification", first);
-    let activity = entry.as_ref().and_then(|e| e.get("activity")).and_then(Value::as_str);
-    assert_eq!(activity, Some("needs_input"), "list entry while permission pending: {entry:?}");
+    let activity = entry
+        .as_ref()
+        .and_then(|e| e.get("activity"))
+        .and_then(Value::as_str);
+    assert_eq!(
+        activity,
+        Some("needs_input"),
+        "list entry while permission pending: {entry:?}"
+    );
     d.close().await;
     a.close().await;
 }
@@ -399,7 +507,9 @@ async fn capture_fixtures() {
             .reply("Read done."),
         edit_turn(3, &edit3, "Edit allowed."),
         edit_turn(4, &edit4, "Edit denied."),
-        Conversation::nth(5).refuse(StatusFailure::new(400).with_body("mock model failure")).reply("unreached"),
+        Conversation::nth(5)
+            .refuse(StatusFailure::new(400).with_body("mock model failure"))
+            .reply("unreached"),
         Conversation::nth(6)
             .calls([MockToolCall::new(Tool::Read, json!({"target_file": png}))])
             .reply("Image done."),
@@ -442,15 +552,29 @@ async fn capture_fixtures() {
     let image_ok = saved
         .iter()
         .find(|(n, _)| *n == "image_output")
-        .is_some_and(|(_, log)| log.iter().any(|e| e.to_string().contains("\"type\":\"image\"")));
+        .is_some_and(|(_, log)| {
+            log.iter()
+                .any(|e| e.to_string().contains("\"type\":\"image\""))
+        });
     eprintln!("image content block present: {image_ok}");
 
     let mut l = h.spawn_client();
     must("loader initialize", l.initialize().await);
-    must("session/load replay", l.load_session(&sids[1], &h.cwd).await);
+    must(
+        "session/load replay",
+        l.load_session(&sids[1], &h.cwd).await,
+    );
     l.pump_for(Duration::from_secs(2)).await;
     let replay = l.log();
-    eprintln!("replay log labels: {:?}", labels(&replay.iter().filter_map(|e| e.get("msg").cloned()).collect::<Vec<_>>()));
+    eprintln!(
+        "replay log labels: {:?}",
+        labels(
+            &replay
+                .iter()
+                .filter_map(|e| e.get("msg").cloned())
+                .collect::<Vec<_>>()
+        )
+    );
     saved.push(("session_load_replay", replay));
 
     if write {

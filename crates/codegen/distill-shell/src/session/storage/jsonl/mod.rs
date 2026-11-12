@@ -173,6 +173,53 @@ impl JsonlStorageAdapter {
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
+    pub(crate) fn load_session_without_chat_history(
+        &self,
+        info: &Info,
+    ) -> io::Result<super::PersistedDataLight> {
+        self.load_session_without_updates_inner(info, false)
+    }
+    fn load_session_without_updates_inner(
+        &self,
+        info: &Info,
+        load_chat_history: bool,
+    ) -> io::Result<super::PersistedDataLight> {
+        let summary = self.read_summary_sync(info)?;
+        let chat_history = if load_chat_history {
+            let chat_file = self.chat_file(info);
+            self.ensure_chat_history(info, summary.chat_format_version)?;
+            self.read_chat_history_sync(chat_file, summary.chat_format_version)?
+        } else {
+            Vec::new()
+        };
+        let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
+        let plan_mode_state = self
+            .read_optional_json_sync::<crate::session::plan_mode::PlanModeSnapshot>(
+                &self.plan_mode_state_file(info),
+            )?;
+        let signals = self.read_optional_json_sync::<crate::session::signals::SessionSignals>(
+            &self.signals_file(info),
+        )?;
+        let announcement_state = self
+            .read_optional_json_sync::<crate::session::announcement_state::AnnouncementState>(
+                &self.announcement_state_file(info),
+            )?;
+        let goal_mode_state = self
+            .read_optional_json_sync::<crate::session::goal_tracker::GoalOrchestration>(
+                &self.goal_mode_state_file(info),
+            )?;
+        let workflow_runs = self.load_workflow_runs_sync(info)?;
+        Ok(super::PersistedDataLight {
+            summary,
+            chat_history,
+            plan_state,
+            plan_mode_state,
+            signals,
+            announcement_state,
+            goal_mode_state,
+            workflow_runs,
+        })
+    }
     /// Read a durable transcript snapshot while enforcing caller-owned input caps.
     pub(crate) fn load_chat_history_bounded_from_dir(
         &self,
@@ -322,7 +369,15 @@ impl JsonlStorageAdapter {
             .await
             .map_err(io::Error::other)?
     }
+    pub async fn list_sessions_recent_with_subagents(&self, limit: usize) -> io::Result<Vec<Summary>> {
+        let adapter = self.clone();
+        tokio::task::spawn_blocking(move || adapter.list_sessions_recent_filtered(limit, true))
+            .await.map_err(io::Error::other)?
+    }
     fn list_sessions_recent_sync(&self, limit: usize) -> io::Result<Vec<Summary>> {
+        self.list_sessions_recent_filtered(limit, false)
+    }
+    fn list_sessions_recent_filtered(&self, limit: usize, include_subagents: bool) -> io::Result<Vec<Summary>> {
         let session_dirs = self.scan_session_dirs(None)?;
         let mut candidates: Vec<(PathBuf, std::time::SystemTime)> =
             Vec::with_capacity(session_dirs.len());
@@ -346,7 +401,7 @@ impl JsonlStorageAdapter {
             match std::fs::read(&summary_path) {
                 Ok(bytes) => {
                     if let Ok(mut summary) = serde_json::from_slice::<Summary>(&bytes)
-                        && !summary.is_hidden()
+                        && (!summary.is_hidden() || (include_subagents && summary.session_kind.as_deref().is_some_and(|kind| kind.starts_with("subagent"))))
                         && !summary.is_headless()
                     {
                         let lock_path =
@@ -1705,37 +1760,7 @@ impl StorageAdapter for JsonlStorageAdapter {
         info: &Info,
     ) -> io::Result<super::PersistedDataLight> {
         tracing::info!("Loading session data (without updates) from JSONL");
-        let summary = self.read_summary_sync(info)?;
-        let chat_file = self.chat_file(info);
-        self.ensure_chat_history(info, summary.chat_format_version)?;
-        let chat_history = self.read_chat_history_sync(chat_file, summary.chat_format_version)?;
-        let plan_state = self.read_optional_json_sync::<TodoState>(&self.plan_file(info))?;
-        let plan_mode_state = self
-            .read_optional_json_sync::<crate::session::plan_mode::PlanModeSnapshot>(
-                &self.plan_mode_state_file(info),
-            )?;
-        let signals = self.read_optional_json_sync::<crate::session::signals::SessionSignals>(
-            &self.signals_file(info),
-        )?;
-        let announcement_state = self
-            .read_optional_json_sync::<crate::session::announcement_state::AnnouncementState>(
-                &self.announcement_state_file(info),
-            )?;
-        let goal_mode_state = self
-            .read_optional_json_sync::<crate::session::goal_tracker::GoalOrchestration>(
-                &self.goal_mode_state_file(info),
-            )?;
-        let workflow_runs = self.load_workflow_runs_sync(info)?;
-        let result = super::PersistedDataLight {
-            summary,
-            chat_history,
-            plan_state,
-            plan_mode_state,
-            signals,
-            announcement_state,
-            goal_mode_state,
-            workflow_runs,
-        };
+        let result = self.load_session_without_updates_inner(info, true)?;
         tracing::info!(
             session_id = %info.id,
             num_chat_messages = result.chat_history.len(),

@@ -3,7 +3,8 @@
 
 use serde_json::Value;
 
-use crate::sep::{PermissionOption, Sep, Status, ToolContent};
+use crate::attachments::{content_attachment, prompt_attachments};
+use crate::sep::{Attachment, PermissionOption, Sep, Status, ToolContent};
 
 /// Client requests whose responses produce events.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,8 +19,14 @@ pub struct Reducer {
     pending: Vec<(Value, Pending)>,
     /// Whether the latest prompt already produced `turn.end`.
     turn_ended: bool,
-    /// Text sent by the latest prompt, awaiting its echoed user update.
-    pending_user_echo: Option<String>,
+    /// User content awaiting its live echo; duplicates remain distinct submissions.
+    pending_user_echoes: Vec<UserEcho>,
+}
+
+#[derive(PartialEq, Eq)]
+enum UserEcho {
+    Text(String),
+    Attachment(Attachment),
 }
 
 impl Reducer {
@@ -28,7 +35,7 @@ impl Reducer {
             session_id,
             pending: Vec::new(),
             turn_ended: true,
-            pending_user_echo: None,
+            pending_user_echoes: Vec::new(),
         }
     }
 
@@ -48,12 +55,21 @@ impl Reducer {
         match kind {
             Pending::Prompt => {
                 self.turn_ended = false;
-                self.pending_user_echo = prompt_text(msg);
                 let mut events = vec![Sep::SessionState {
                     status: Status::Running,
                 }];
-                if let Some(text) = &self.pending_user_echo {
-                    events.push(Sep::UserMessage { text: text.clone() });
+                if let Some(text) = prompt_text(msg) {
+                    self.pending_user_echoes.push(UserEcho::Text(text.clone()));
+                    events.push(Sep::UserMessage { text });
+                }
+                if let Some(blocks) = msg.pointer("/params/prompt").and_then(Value::as_array)
+                    && let Ok(attachments) = prompt_attachments(blocks)
+                {
+                    for attachment in attachments {
+                        self.pending_user_echoes
+                            .push(UserEcho::Attachment(attachment.clone()));
+                        events.push(Sep::UserAttachment { attachment });
+                    }
                 }
                 events
             }
@@ -93,16 +109,26 @@ impl Reducer {
         };
         match kind {
             "user_message_chunk" => {
-                let Some(text) = text_of(update) else {
+                let content = update.get("content").unwrap_or(&Value::Null);
+                if hidden_from_scrollback(update, content) {
                     return Vec::new();
-                };
-                if self.pending_user_echo.as_deref() == Some(text) {
-                    self.pending_user_echo = None;
-                    Vec::new()
+                }
+                if let Some(text) = text_of(update) {
+                    if self.consume_echo(&UserEcho::Text(text.to_owned())) {
+                        Vec::new()
+                    } else {
+                        vec![Sep::UserMessage {
+                            text: text.to_owned(),
+                        }]
+                    }
+                } else if let Some(attachment) = content_attachment(content) {
+                    if self.consume_echo(&UserEcho::Attachment(attachment.clone())) {
+                        Vec::new()
+                    } else {
+                        vec![Sep::UserAttachment { attachment }]
+                    }
                 } else {
-                    vec![Sep::UserMessage {
-                        text: text.to_owned(),
-                    }]
+                    Vec::new()
                 }
             }
             "agent_message_chunk" => text_of(update)
@@ -186,7 +212,7 @@ impl Reducer {
                     return Vec::new();
                 };
                 self.turn_ended = true;
-                self.pending_user_echo = None;
+                self.pending_user_echoes.clear();
                 let is_error = stop_reason == "error";
                 let error = if is_error {
                     str_field(update, "agent_result").map(str::to_owned)
@@ -210,6 +236,18 @@ impl Reducer {
         }
     }
 
+    fn consume_echo(&mut self, echo: &UserEcho) -> bool {
+        let Some(index) = self
+            .pending_user_echoes
+            .iter()
+            .position(|pending| user_echo_matches(pending, echo))
+        else {
+            return false;
+        };
+        self.pending_user_echoes.remove(index);
+        true
+    }
+
     fn response(&mut self, msg: &Value) -> Vec<Sep> {
         let Some(id) = request_id(msg) else {
             return Vec::new();
@@ -228,7 +266,7 @@ impl Reducer {
                 let Some(error) = msg.get("error") else {
                     return Vec::new();
                 };
-                self.pending_user_echo = None;
+                self.pending_user_echoes.clear();
                 if self.turn_ended {
                     return Vec::new();
                 }
@@ -339,6 +377,38 @@ fn status_of(update: &Value) -> Option<String> {
     } else {
         Some(status)
     }
+}
+
+fn user_echo_matches(left: &UserEcho, right: &UserEcho) -> bool {
+    match (left, right) {
+        (UserEcho::Text(left), UserEcho::Text(right)) => left == right,
+        (
+            UserEcho::Attachment(Attachment::Image {
+                mime: left_mime,
+                data: left_data,
+                ..
+            }),
+            UserEcho::Attachment(Attachment::Image {
+                mime: right_mime,
+                data: right_data,
+                ..
+            }),
+        ) => left_mime == right_mime && left_data == right_data,
+        (UserEcho::Attachment(left), UserEcho::Attachment(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn hidden_from_scrollback(update: &Value, content: &Value) -> bool {
+    [update, content].into_iter().any(|value| {
+        ["_meta", "meta"].into_iter().any(|key| {
+            value
+                .get(key)
+                .and_then(|meta| meta.get("hideFromScrollback"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+    })
 }
 
 fn text_of(update: &Value) -> Option<&str> {

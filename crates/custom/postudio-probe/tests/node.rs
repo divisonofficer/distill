@@ -1,7 +1,6 @@
 //! Postudio node against the real distill leader and the mock model.
 //! Needs GROK_BINARY: `cargo test -p postudio-probe --test node -- --ignored --nocapture --test-threads=1`.
 
-use std::net::TcpListener;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -366,4 +365,275 @@ async fn permission_mode_survives_browser_reconnect() {
             .any(|r| r["sessionId"] == sid && r["autoMode"] == true)
     );
     reopened.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the distill binary; set GROK_BINARY"]
+async fn creates_real_leader_worktree_session() {
+    use std::process::Command;
+
+    let stack = stack::start(0, None).await.expect("start stack");
+    let run_git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&stack.cwd)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init"]);
+    run_git(&[
+        "-c",
+        "user.name=Probe Test",
+        "-c",
+        "user.email=probe@example.test",
+        "add",
+        ".",
+    ]);
+    run_git(&[
+        "-c",
+        "user.name=Probe Test",
+        "-c",
+        "user.email=probe@example.test",
+        "commit",
+        "-m",
+        "test fixture",
+    ]);
+
+    let marker = stack.cwd.join("worktree-marker.txt");
+    std::fs::write(&marker, "copied from source\n").expect("write marker");
+    run_git(&["add", "worktree-marker.txt"]);
+    run_git(&[
+        "-c",
+        "user.name=Probe Test",
+        "-c",
+        "user.email=probe@example.test",
+        "commit",
+        "-m",
+        "add marker",
+    ]);
+
+    let source = std::fs::canonicalize(&stack.cwd).expect("canonicalize source cwd");
+    let resp = post_json(
+        &stack,
+        "/api/sessions",
+        json!({"cwd": stack.cwd.display().to_string(), "worktree": {"name": "probe-worktree"}}),
+    )
+    .send()
+    .await
+    .expect("POST /api/sessions worktree");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("worktree response json");
+    assert!(
+        status.is_success(),
+        "POST /api/sessions worktree {status}: {body}"
+    );
+    let sid = body["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no sessionId in {body}"));
+
+    let resp = get(&stack, "/api/sessions")
+        .send()
+        .await
+        .expect("GET /api/sessions");
+    let status = resp.status();
+    let listing: Value = resp.json().await.expect("GET /api/sessions json");
+    assert!(status.is_success(), "GET /api/sessions {status}: {listing}");
+    let row = listing["sessions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["sessionId"] == sid))
+        .unwrap_or_else(|| panic!("session {sid} missing from listing: {listing}"));
+    let cwd = row["cwd"]
+        .as_str()
+        .unwrap_or_else(|| panic!("session has no cwd: {row}"));
+    assert_ne!(
+        cwd,
+        source.display().to_string(),
+        "session cwd remained source: {row}"
+    );
+    let target = std::path::Path::new(cwd);
+    assert!(target.is_dir(), "worktree directory missing: {target:?}");
+    assert_eq!(
+        std::fs::read_to_string(target.join("worktree-marker.txt")).expect("read copied marker"),
+        "copied from source\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the distill binary; set GROK_BINARY"]
+async fn node_restart_reconnects_to_persistent_leader_and_history() {
+    let mut stack = stack::start(0, None).await.expect("start stack");
+    let sid = create_session(&stack).await;
+    let mut session = Feed::open(&stack, &format!("/ws/session/{sid}")).await;
+    session
+        .until("replay.end", |f| is_type(f, "replay.end"))
+        .await;
+
+    session.send(json!({"t": "prompt", "text": "go"})).await;
+    let permission = session
+        .until("permission.request", |f| is_type(f, "permission.request"))
+        .await;
+    session
+        .send(json!({
+            "t": "permission",
+            "id": permission["id"],
+            "option_id": "allow-once"
+        }))
+        .await;
+    session.until("turn.end", |f| is_type(f, "turn.end")).await;
+    session.close().await;
+
+    stack.restart_node().await.expect("restart node");
+    let listing: Value = get(&stack, "/api/sessions")
+        .send()
+        .await
+        .expect("GET /api/sessions after node restart")
+        .json()
+        .await
+        .expect("session listing json");
+    let row = listing["sessions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["sessionId"] == sid))
+        .unwrap_or_else(|| panic!("session {sid} missing after restart: {listing}"));
+    assert_eq!(row["sessionId"], sid, "saved session missing: {row}");
+
+    let mut reopened = Feed::open(&stack, &format!("/ws/session/{sid}")).await;
+    reopened
+        .until("replay.end after restart", |f| is_type(f, "replay.end"))
+        .await;
+    let page = reopened
+        .log
+        .iter()
+        .find(|frame| frame["t"] == "history.page")
+        .unwrap_or_else(|| panic!("no replay history after restart: {}", tail(&reopened.log)));
+    assert!(
+        page["items"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|item| item["t"] == "user.message" && item["text"] == "go")),
+        "prompt history missing after restart: {page}"
+    );
+    let listing: Value = get(&stack, "/api/sessions").send().await.unwrap().json().await.unwrap();
+    assert!(listing["sessions"].as_array().unwrap().iter().any(|row| row["sessionId"] == sid && row["resident"] == true));
+    reopened.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the distill binary; set GROK_BINARY"]
+async fn real_subagent_parent_metadata_reaches_node_roster() {
+    let stack = stack::start(0, None).await.expect("start stack");
+    stack.set_conversations([
+        distill_test_support::Conversation::nth(1)
+            .calls([distill_test_support::MockToolCall::new(
+                distill_test_support::Tool::Task,
+                json!({
+                    "description": "persist hierarchy probe",
+                    "prompt": "Return the exact text CHILD_PROBE_DONE.",
+                    "subagent_type": "general-purpose",
+                    "run_in_background": false
+                }),
+            )])
+            .reply("Parent received child result."),
+        distill_test_support::Conversation::for_system_prompt(
+            "Complete the assigned task directly.",
+        )
+        .reply("CHILD_PROBE_DONE"),
+    ]);
+
+    let sid = create_session(&stack).await;
+    let mut session = Feed::open(&stack, &format!("/ws/session/{sid}")).await;
+    session
+        .until("replay.end", |f| is_type(f, "replay.end"))
+        .await;
+    session
+        .send(json!({"t": "prompt", "text": "Delegate the probe."}))
+        .await;
+    let permission = session
+        .until("permission.request", |f| is_type(f, "permission.request"))
+        .await;
+    session
+        .send(json!({
+            "t": "permission",
+            "id": permission["id"],
+            "option_id": "allow-once"
+        }))
+        .await;
+    let end = session.until("turn.end", |f| is_type(f, "turn.end")).await;
+    assert_eq!(end["stop_reason"], "end_turn", "turn.end: {end}");
+    assert!(
+        stack.script_violations().is_empty(),
+        "mock script violation: {:?}; frames: {}",
+        stack.script_violations(),
+        tail(&session.log)
+    );
+    let conversations = stack.conversations();
+    let parent = conversations
+        .iter()
+        .find(|conversation| conversation.number() == 1)
+        .unwrap_or_else(|| panic!("parent model conversation missing: {conversations:?}"));
+    assert!(
+        parent.saw_tool_call(distill_test_support::Tool::Task),
+        "parent did not make real Task tool call: {parent:?}"
+    );
+    assert!(
+        stack
+            .conversation_for_system_prompt("Complete the assigned task directly.")
+            .is_some(),
+        "mock model never opened child conversation; conversations: {conversations:?}; frames: {}",
+        tail(&session.log)
+    );
+    let sessions_dir = stack.distill_home().join("sessions");
+    let mut summaries = Vec::new();
+    for cwd_entry in std::fs::read_dir(&sessions_dir).expect("read persisted sessions") {
+        let cwd_path = cwd_entry.expect("session cwd entry").path();
+        if !cwd_path.is_dir() {
+            continue;
+        }
+        for session_entry in std::fs::read_dir(cwd_path).expect("read cwd sessions") {
+            let session_path = session_entry.expect("session entry").path();
+            if !session_path.is_dir() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(session_path.join("summary.json"))
+                && let Ok(summary) = serde_json::from_slice::<Value>(&bytes)
+            {
+                summaries.push(summary);
+            }
+        }
+    }
+    let persisted_child = summaries
+        .iter()
+        .find(|summary| {
+            summary["info"]["id"] != sid
+                && summary["session_kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("subagent"))
+        })
+        .unwrap_or_else(|| panic!("actual child summary missing: {summaries:?}"));
+    let child_id = persisted_child["info"]["id"]
+        .as_str()
+        .expect("persisted child session id");
+    let listing: Value = get(&stack, "/api/sessions")
+        .send()
+        .await
+        .expect("GET /api/sessions")
+        .json()
+        .await
+        .expect("session listing json");
+    let child = listing["sessions"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["sessionId"] == child_id));
+    assert_eq!(
+        persisted_child["parent_session_id"], sid,
+        "actual child summary lost parent metadata; node roster: {listing}"
+    );
+    let child = child
+        .unwrap_or_else(|| panic!("persisted child {child_id} absent from node roster: {listing}"));
+    assert_eq!(child["parentSessionId"], sid, "child row: {child}");
+    assert_eq!(child["sessionKind"], persisted_child["session_kind"]);
+    session.close().await;
 }

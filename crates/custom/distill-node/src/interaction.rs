@@ -232,6 +232,10 @@ impl Outstanding {
         self.0.retain(|item| item.tool_call_id() != tool_call_id);
     }
 
+    pub fn contains_id(&self, id: &Value) -> bool {
+        self.0.iter().any(|item| item.id() == id)
+    }
+
     pub fn clear(&mut self) {
         self.0.clear();
     }

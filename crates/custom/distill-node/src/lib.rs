@@ -3,14 +3,23 @@
 //! Trusted listener: web app, session list, board and session WebSockets, Web Push,
 //! all behind the owner/Origin guard. Untrusted listener: session file and port proxy.
 
+pub mod account_login;
 pub mod accounts;
 pub mod agent;
+pub mod artifacts;
+pub mod attachments;
 pub mod board;
+pub mod chat_store;
+pub mod chat_sync;
+pub mod chats;
+pub mod configuration;
+pub mod fleet;
 pub mod guard;
 pub mod interaction;
 pub mod keeper;
 pub mod listen;
 pub mod models;
+pub mod ports;
 pub mod push;
 pub mod reduce;
 pub mod sep;
@@ -30,6 +39,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use agent::AgentConfig;
+use configuration::{listener_ports, validate_node_config};
 use guard::GuardConfig;
 use keeper::Keeper;
 use listen::ListenAddr;
@@ -47,39 +57,69 @@ pub struct NodeConfig {
     pub agent: AgentConfig,
     pub state_dir: PathBuf,
     pub web_dir: Option<PathBuf>,
+    pub chat_peer_config: Option<PathBuf>,
+    pub untrusted_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct NodeInfo {
     pub host: String,
     pub version: &'static str,
+    #[serde(rename = "untrustedOrigin", skip_serializing_if = "Option::is_none")]
+    pub untrusted_origin: Option<String>,
 }
 
 /// Start the keeper and push sender, then serve both listeners until one fails.
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
+    validate_node_config(&cfg)?;
     let keeper = Keeper::start(cfg.agent.clone()).await?;
     let push = Arc::new(Push::load_or_create(&cfg.state_dir)?);
-    tokio::spawn(notify_needs_input(keeper.clone(), push.clone()));
+    let chat_store = chat_store::Store::open(&cfg.state_dir.join("chats"))?;
+    let peer_sync = cfg
+        .chat_peer_config
+        .as_deref()
+        .map(|path| chat_sync::PeerSync::load(path, chat_store.clone()))
+        .transpose()?;
+    let completion: Arc<dyn chats::ChatCompleter> =
+        Arc::new(chats::AcpChatCompleter::new(keeper.clone()));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut background = tokio::task::JoinSet::new();
+    if let Some(sync) = peer_sync.clone() {
+        background.spawn(async move { sync.run(shutdown_rx).await });
+    }
+    background.spawn(notify_needs_input(keeper.clone(), push.clone()));
 
     let guard = Arc::new(GuardConfig {
         owner: cfg.owner.clone(),
         allowed_origins: cfg.allowed_origins.clone(),
     });
-    let trusted = trusted_router(
+    let blocked_ports = listener_ports(&cfg);
+    let trusted = trusted_services_router(
         keeper.clone(),
         push,
         cfg.agent.clone(),
         guard,
         cfg.web_dir.clone(),
+        chat_store,
+        (Some(completion), peer_sync.clone()),
+        WebConfig {
+            untrusted_origin: cfg.untrusted_origin.clone(),
+            blocked_ports: blocked_ports.clone(),
+        },
     );
     let resolver: untrusted::CwdResolver = {
         let keeper = keeper.clone();
         Arc::new(move |sid: &str| keeper.cwd_of(sid))
     };
-    tokio::try_join!(
+    let result = tokio::try_join!(
         listen::serve(cfg.listen, trusted),
-        listen::serve(cfg.untrusted_listen, untrusted::routes(resolver)),
-    )?;
+        listen::serve(
+            cfg.untrusted_listen,
+            untrusted::routes_with_prohibited_ports(resolver, blocked_ports)
+        ),
+    );
+    let _ = shutdown_tx.send(true);
+    result?;
     Ok(())
 }
 
@@ -124,28 +164,94 @@ pub fn trusted_router(
     agent: AgentConfig,
     guard: Arc<GuardConfig>,
     web_dir: Option<PathBuf>,
+    chat_store: chat_store::Store,
 ) -> Router {
+    trusted_router_with_chat_services(keeper, push, agent, guard, web_dir, chat_store, None, None)
+}
+
+pub fn trusted_router_with_chat_services(
+    keeper: Keeper,
+    push: Arc<Push>,
+    agent: AgentConfig,
+    guard: Arc<GuardConfig>,
+    web_dir: Option<PathBuf>,
+    chat_store: chat_store::Store,
+    completion: Option<Arc<dyn chats::ChatCompleter>>,
+    peer_sync: Option<chat_sync::PeerSync>,
+) -> Router {
+    trusted_services_router(
+        keeper,
+        push,
+        agent,
+        guard,
+        web_dir,
+        chat_store,
+        (completion, peer_sync),
+        WebConfig::default(),
+    )
+}
+
+#[derive(Default)]
+struct WebConfig {
+    untrusted_origin: Option<String>,
+    blocked_ports: Vec<u16>,
+}
+
+fn trusted_services_router(
+    keeper: Keeper,
+    push: Arc<Push>,
+    agent: AgentConfig,
+    guard: Arc<GuardConfig>,
+    web_dir: Option<PathBuf>,
+    chat_store: chat_store::Store,
+    services: (
+        Option<Arc<dyn chats::ChatCompleter>>,
+        Option<chat_sync::PeerSync>,
+    ),
+    web: WebConfig,
+) -> Router {
+    let (completion, peer_sync) = services;
+    let sync_status = peer_sync
+        .as_ref()
+        .map(chat_sync::PeerSync::status)
+        .unwrap_or_else(chat_sync::SyncStatus::disabled);
     let guarded = Router::new()
-        .route("/api/node", get(node_info))
+        .route(
+            "/api/node",
+            get(move || node_info(web.untrusted_origin.clone())),
+        )
+        .merge(fleet::routes())
+        .merge(artifacts::routes(keeper.clone()))
+        .merge(ports::routes(web.blocked_ports))
+        .merge(chats::routes_with_services(
+            chat_store,
+            completion,
+            sync_status,
+        ))
         .merge(accounts::routes(agent.clone()))
+        .merge(account_login::routes(agent.clone()))
         .merge(board::routes(keeper.clone()))
         .merge(models::routes(keeper.clone()))
         .merge(session::routes(agent, keeper))
         .merge(push.routes())
         .layer(middleware::from_fn_with_state(guard, guard::guard));
-    Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(guarded)
-        .fallback(move |req: Request| {
-            let web_dir = web_dir.clone();
-            async move { serve_web(web_dir.as_deref(), req).await }
-        })
+        .merge(guarded);
+    if let Some(peer_sync) = peer_sync {
+        app = app.merge(peer_sync.routes());
+    }
+    app.fallback(move |req: Request| {
+        let web_dir = web_dir.clone();
+        async move { serve_web(web_dir.as_deref(), req).await }
+    })
 }
 
-async fn node_info() -> Json<NodeInfo> {
+async fn node_info(untrusted_origin: Option<String>) -> Json<NodeInfo> {
     Json(NodeInfo {
         host: gethostname::gethostname().to_string_lossy().into_owned(),
         version: distill_version::VERSION,
+        untrusted_origin,
     })
 }
 

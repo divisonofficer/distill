@@ -32,6 +32,10 @@ pub enum AccountsCommand {
         #[arg(long)]
         device_code: bool,
     },
+    /// Start local-browser login (ChatGPT, Claude, OpenRouter only). Callback runs on this host; remote device handoff is unsupported.
+    LoginWeb {
+        id: String,
+    },
     Logout {
         id: String,
     },
@@ -1604,9 +1608,18 @@ mod tests {
         assert!(!defaults.ultrasave);
         for flag in ["--ultrafast", "--ultrasave"] {
             let args = PagerArgs::try_parse_from([
-                "distill", "-p", "task", flag, "--model", "chatgpt/gpt-6.1-sol",
-                "--effort", "high", "--permission-mode", "default",
-            ]).unwrap();
+                "distill",
+                "-p",
+                "task",
+                flag,
+                "--model",
+                "chatgpt/gpt-6.1-sol",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "default",
+            ])
+            .unwrap();
             assert_eq!(args.ultrafast, flag == "--ultrafast");
             assert_eq!(args.ultrasave, flag == "--ultrasave");
             assert!(!args.ultracode);
@@ -1620,9 +1633,8 @@ mod tests {
             ("--ultrafast", "--ultrasave"),
             ("--ultracode", "--ultrasave"),
         ] {
-            let error = PagerArgs::try_parse_from([
-                "distill", "-p", "task", first, second,
-            ]).unwrap_err();
+            let error =
+                PagerArgs::try_parse_from(["distill", "-p", "task", first, second]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
@@ -1647,6 +1659,14 @@ mod tests {
                     ..
                 }
             }))
+        ));
+        let login_web = PagerArgs::try_parse_from(["distill", "accounts", "login-web", "work"])
+            .expect("accounts login-web parses");
+        assert!(matches!(
+            login_web.command,
+            Some(Command::Accounts(AccountsArgs {
+                command: AccountsCommand::LoginWeb { id }
+            })) if id == "work"
         ));
         for argv in [
             vec!["distill", "accounts", "list"],

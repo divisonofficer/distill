@@ -5,15 +5,20 @@ export type Tone = 'run' | 'wait' | 'idle' | 'err' | 'off' | 'sleep';
 export function activityBadge(activity: string): { label: string; tone: Tone } {
 	switch (activity) {
 		case 'needs_input':
-			return { label: '승인 대기', tone: 'wait' };
+			return { label: '응답 필요', tone: 'wait' };
 		case 'working':
 			return { label: '실행 중', tone: 'run' };
+		case 'idle':
+			return { label: '유휴', tone: 'idle' };
+		case 'completed':
+			return { label: '완료', tone: 'off' };
+		case 'dead':
 		case 'error':
 			return { label: '오류', tone: 'err' };
 		case 'dormant':
-			return { label: '휴면', tone: 'sleep' };
+			return { label: '비상주', tone: 'idle' };
 		default:
-			return { label: '유휴', tone: 'idle' };
+			return { label: '확인 중', tone: 'off' };
 	}
 }
 
@@ -22,7 +27,7 @@ export function statusBadge(status: Status | 'offline'): { label: string; tone: 
 		case 'running':
 			return { label: '실행 중', tone: 'run' };
 		case 'waiting_permission':
-			return { label: '승인 대기', tone: 'wait' };
+			return { label: '응답 필요', tone: 'wait' };
 		case 'error':
 			return { label: '오류', tone: 'err' };
 		case 'offline':

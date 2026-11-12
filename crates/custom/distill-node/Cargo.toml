@@ -21,6 +21,7 @@ futures-util = { workspace = true }
 gethostname = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
+tokio-tungstenite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -30,6 +31,7 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 url = { workspace = true }
 urlencoding = { workspace = true }
 distill-version = { workspace = true }
+distill-extra-ca = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

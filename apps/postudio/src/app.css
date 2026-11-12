@@ -1,9 +1,24 @@
 @import 'tailwindcss';
 
 :root {
-	color-scheme: light dark;
+color-scheme: light;
+font-family: Inter, 'Noto Sans KR', system-ui, sans-serif;
+font-synthesis: none;
+text-rendering: optimizeLegibility;
+--ink: #1a1a1c;
+--muted: #66666b;
+--line: #e6e6e8;
+--surface: #f6f6f7;
+--accent: #2b59c3;
 }
 
-body {
-	@apply bg-white text-neutral-900 antialiased dark:bg-neutral-950 dark:text-neutral-100;
+body { margin: 0; @apply bg-white text-neutral-900 antialiased; }
+.shell-sidebar { width: 272px; background: var(--surface); border-color: var(--line); }
+.mode-tabs { background: #e8e8eb; }
+.tool-details-panel { width: 500px; background: #fafafb; border-color: var(--line); }
+@media (max-width: 1279px) {
+.tool-details-panel.mobile-open { width: min(500px, 92vw); }
+}
+@media (max-width: 760px) {
+.tool-details-panel.mobile-open { inset: 0 0 0 auto; width: min(500px, 94vw); }
 }

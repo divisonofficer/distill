@@ -941,23 +941,35 @@ pub(crate) async fn run_shell_child(
         .parent_execution_policy
         .as_ref()
         .is_some_and(|policy| policy.is_enabled());
-    let inherited_mode_active = request.runtime_overrides.execution_policy.as_ref().is_some_and(|policy| policy.is_enabled());
-    let execution_mode = ctx.parent_execution_policy.as_ref()
+    let inherited_mode_active = request
+        .runtime_overrides
+        .execution_policy
+        .as_ref()
+        .is_some_and(|policy| policy.is_enabled());
+    let execution_mode = ctx
+        .parent_execution_policy
+        .as_ref()
         .map(|policy| Arc::new(policy.mode.inherited()));
-    let mut execution_policy = request.runtime_overrides.execution_policy.clone().filter(|_| {
-        ctx.parent_execution_policy.is_some()
-            && !request.owner.is_workflow()
-            && request.runtime_overrides.harness_agent_type.is_none()
-            && request.runtime_overrides.model_override_provenance
-                == distill::task::types::ModelOverrideProvenance::Tool
-    });
+    let mut execution_policy = request
+        .runtime_overrides
+        .execution_policy
+        .clone()
+        .filter(|_| {
+            ctx.parent_execution_policy.is_some()
+                && !request.owner.is_workflow()
+                && request.runtime_overrides.harness_agent_type.is_none()
+                && request.runtime_overrides.model_override_provenance
+                    == distill::task::types::ModelOverrideProvenance::Tool
+        });
     if let (Some(policy), Some(root)) = (
         execution_policy.as_mut(),
         ctx.parent_execution_policy.as_ref(),
     ) {
         // Wake requests may hold an old switch after the root was reloaded.
         // Current root state and configuration remain the authority.
-        policy.mode = execution_mode.clone().expect("parent execution policy checked");
+        policy.mode = execution_mode
+            .clone()
+            .expect("parent execution policy checked");
         policy.max_depth = policy.max_depth.min(root.max_depth);
         policy.off_max_depth = policy.off_max_depth.min(root.off_max_depth);
     }
@@ -1471,7 +1483,7 @@ pub(crate) async fn run_shell_child(
     };
     let turn_number = wake_persistence.turn_number(completion_data.turn_number);
     completion_data.turn_number = Some(turn_number);
-    let persistence = match session::persistence::new_with_explicit_dir(
+    let persistence = match session::persistence::new_with_explicit_dir_with_parent(
         &child_session_info,
         persistence_dir,
         effective_model_id.clone(),
@@ -1487,6 +1499,7 @@ pub(crate) async fn run_shell_child(
                 next_trace_turn: Some(turn_number.saturating_add(1)),
             }
         },
+        Some(ctx.parent_session_id.as_str()),
     )
     .await
     {

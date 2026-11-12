@@ -234,7 +234,7 @@ async fn port_proxy_rejects_bad_port_and_maps_connect_failure_to_502() {
 }
 
 #[tokio::test]
-async fn port_proxy_websocket_upgrade_is_not_implemented() {
+async fn port_proxy_rejects_incomplete_websocket_handshake() {
     let dir = tempfile::tempdir().unwrap();
     let req = Request::get("/p/8080/ws")
         .header(header::CONNECTION, "Upgrade")
@@ -243,7 +243,7 @@ async fn port_proxy_websocket_upgrade_is_not_implemented() {
         .unwrap();
     assert_eq!(
         send(untrusted(dir.path().to_path_buf()), req).await,
-        StatusCode::NOT_IMPLEMENTED
+        StatusCode::BAD_REQUEST
     );
 }
 

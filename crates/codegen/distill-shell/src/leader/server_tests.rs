@@ -2912,6 +2912,45 @@ async fn agent_busy_set_when_request_forwarded() {
 }
 
 #[tokio::test]
+async fn global_chat_completion_extension_is_forwarded_without_session() {
+    let temp = TempDir::new().unwrap();
+    let sock_path = temp.path().join("chat_complete_global.sock");
+    let mut handle = spawn_leader_server(sock_path.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let stream = LeaderStream::connect(&sock_path).await.unwrap();
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    write_message(
+        &mut writer,
+        &ClientMessage::Register {
+            client_type: "test".into(),
+            mode: ClientMode::Stdio,
+            capabilities: ClientCapabilities::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let _: ServerMessage = read_message(&mut reader).await.unwrap();
+    write_message(
+        &mut writer,
+        &ClientMessage::Acp {
+            payload: r#"{"jsonrpc":"2.0","method":"_x.ai/chat/complete","params":{"method":"x.ai/chat/complete","params":{"modelId":"configured-model","messages":[{"role":"user","text":"question"}]}},"id":1}"#.into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let forwarded = handle.acp_rx.recv().await.unwrap();
+    let request: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
+    assert_eq!(request["method"], "_x.ai/chat/complete");
+    assert_eq!(request["params"]["method"], "x.ai/chat/complete");
+    assert_eq!(request["params"]["params"]["modelId"], "configured-model");
+    assert!(request["params"]["params"].get("sessionId").is_none());
+
+    handle.cancel.cancel();
+}
+
+#[tokio::test]
 async fn agent_busy_cleared_when_response_received() {
     let temp = TempDir::new().unwrap();
     let sock_path = temp.path().join("busy_clear.sock");
@@ -4468,7 +4507,9 @@ async fn roster_merge_round_trips_namespaced_ids_and_broadcasts_changes() {
         title: Some("External agent bc-1".to_owned()),
         cwd: "/home/u/.grok/worktrees/proj/cursor-bc-1".to_owned(),
         is_worktree: true,
+        parent_session_id: None,
         session_kind: Some("cursor-worker".to_owned()),
+        source_workspace_dir: None,
         model_id: None,
         reasoning_effort: None,
         yolo: false,
@@ -4669,6 +4710,244 @@ fn machine_wide_broadcast_classifier_matches_both_wire_forms() {
     assert!(!is_machine_wide_broadcast_notification(&pv(
         r#"{"jsonrpc":"2.0","method":"x.ai/settings/update","params":{}}"#
     )));
+}
+
+#[test]
+fn chat_progress_routes_use_internal_ids_and_restore_direct_and_wrapped_ids() {
+    let mut direct_completion =
+        pv(r#"{"method":"x.ai/chat/complete","id":1,"params":{"requestId":"shared"}}"#);
+    let mut wrapped_completion = pv(
+        r#"{"method":"_x.ai/chat/complete","id":1,"params":{"method":"x.ai/chat/complete","params":{"requestId":"shared"}}}"#,
+    );
+    assert_eq!(
+        extract_chat_completion_request_id(&direct_completion),
+        Some("shared")
+    );
+    assert_eq!(
+        extract_chat_completion_request_id(&wrapped_completion),
+        Some("shared")
+    );
+    assert!(rewrite_chat_request_id(
+        &mut direct_completion,
+        "internal-a"
+    ));
+    assert!(rewrite_chat_request_id(
+        &mut wrapped_completion,
+        "internal-b"
+    ));
+    assert_eq!(direct_completion["params"]["requestId"], "internal-a");
+    assert_eq!(
+        wrapped_completion["params"]["params"]["requestId"],
+        "internal-b"
+    );
+
+    let mut routes = ChatProgressRoutes::new();
+    assert!(register_chat_progress_route(
+        &mut routes,
+        "internal-a".into(),
+        ClientId(1),
+        "shared".into(),
+    ));
+    assert!(register_chat_progress_route(
+        &mut routes,
+        "internal-b".into(),
+        ClientId(2),
+        "shared".into(),
+    ));
+    assert_eq!(
+        chat_progress_target(&routes, "internal-a"),
+        Some((ClientId(1), "shared".into()))
+    );
+    assert_eq!(
+        chat_progress_target(&routes, "internal-b"),
+        Some((ClientId(2), "shared".into()))
+    );
+
+    let mut direct_progress = pv(
+        r#"{"method":"x.ai/chat/progress","params":{"requestId":"internal-a","text":"partial"}}"#,
+    );
+    assert_eq!(
+        extract_chat_progress_request_id(&direct_progress),
+        Some("internal-a")
+    );
+    assert!(rewrite_chat_request_id(&mut direct_progress, "shared"));
+    assert_eq!(direct_progress["params"]["requestId"], "shared");
+
+    let mut wrapped_progress = pv(
+        r#"{"method":"_x.ai/chat/progress","params":{"method":"x.ai/chat/progress","params":{"requestId":"internal-b","text":"partial"}}}"#,
+    );
+    assert_eq!(
+        extract_chat_progress_request_id(&wrapped_progress),
+        Some("internal-b")
+    );
+    assert!(rewrite_chat_request_id(&mut wrapped_progress, "shared"));
+    assert_eq!(wrapped_progress["params"]["params"]["requestId"], "shared");
+
+    unregister_chat_progress_route(&mut routes, "internal-a", ClientId(1));
+    assert_eq!(chat_progress_target(&routes, "internal-a"), None);
+    assert_eq!(
+        chat_progress_target(&routes, "internal-b"),
+        Some((ClientId(2), "shared".into()))
+    );
+}
+
+#[tokio::test]
+async fn chat_progress_forwards_unique_ids_and_drops_disconnected_owner_progress() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, response_tx, mut acp_rx) =
+        setup_persistent_server_with_agent(&temp).await;
+    let (mut reader_a, mut writer_a) = connect_and_register(&sock_path, "client-a").await;
+    let (mut reader_b, mut writer_b) = connect_and_register(&sock_path, "client-b").await;
+
+    write_message(
+        &mut writer_a,
+        &ClientMessage::Acp {
+            payload: r#"{"jsonrpc":"2.0","method":"_x.ai/chat/complete","id":1,"params":{"method":"x.ai/chat/complete","params":{"requestId":"shared"}}}"#.into(),
+        },
+    )
+    .await
+    .unwrap();
+    write_message(
+        &mut writer_b,
+        &ClientMessage::Acp {
+            payload: r#"{"jsonrpc":"2.0","method":"x.ai/chat/complete","id":1,"params":{"requestId":"shared"}}"#.into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let forwarded_a: serde_json::Value =
+        serde_json::from_str(&acp_rx.recv().await.unwrap()).unwrap();
+    let forwarded_b: serde_json::Value =
+        serde_json::from_str(&acp_rx.recv().await.unwrap()).unwrap();
+    let internal_a = forwarded_a["params"]["params"]["requestId"]
+        .as_str()
+        .unwrap();
+    let internal_b = forwarded_b["params"]["requestId"].as_str().unwrap();
+    assert_ne!(internal_a, "shared");
+    assert_ne!(internal_b, "shared");
+    assert_ne!(internal_a, internal_b);
+
+    drop((reader_a, writer_a));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    response_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "x.ai/chat/progress",
+                "params": {"requestId": internal_a, "text": "late A"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            read_message::<_, ServerMessage>(&mut reader_b)
+        )
+        .await
+        .is_err(),
+        "late progress for disconnected client A must not reach client B"
+    );
+
+    response_tx
+        .send(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "_x.ai/chat/progress",
+                "params": {
+                    "method": "x.ai/chat/progress",
+                    "params": {"requestId": internal_b, "text": "B progress"},
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let ServerMessage::Acp { payload } =
+        tokio::time::timeout(Duration::from_secs(1), read_message(&mut reader_b))
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected client B progress");
+    };
+    let progress: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(progress["params"]["params"]["requestId"], "shared");
+    assert_eq!(progress["params"]["params"]["text"], "B progress");
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn chat_progress_capacity_rejects_without_forwarding_and_preserves_other_calls() {
+    let temp = TempDir::new().unwrap();
+    let (sock_path, cancel, _response_tx, mut acp_rx) =
+        setup_persistent_server_with_agent(&temp).await;
+    let (mut reader, mut writer) = connect_and_register(&sock_path, "test-client").await;
+
+    for index in 0..MAX_CHAT_PROGRESS_REQUESTS {
+        write_message(
+            &mut writer,
+            &ClientMessage::Acp {
+                payload: serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "x.ai/chat/complete",
+                    "id": index,
+                    "params": {"requestId": format!("stream-{index}")},
+                })
+                .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    for _ in 0..MAX_CHAT_PROGRESS_REQUESTS {
+        tokio::time::timeout(Duration::from_secs(5), acp_rx.recv())
+            .await
+            .expect("active chat request should forward")
+            .expect("agent channel should stay open");
+    }
+
+    write_message(
+        &mut writer,
+        &ClientMessage::Acp {
+            payload: r#"{"jsonrpc":"2.0","method":"x.ai/chat/complete","id":9000,"params":{"requestId":"overflow"}}"#.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let ServerMessage::Acp { payload } =
+        tokio::time::timeout(Duration::from_secs(1), read_message(&mut reader))
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("expected JSON-RPC capacity error");
+    };
+    let error: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(error["id"], 9000);
+    assert_eq!(error["error"]["code"], -32003);
+    assert_eq!(error["error"]["message"], "too_many_active_chat_requests");
+    assert!(acp_rx.try_recv().is_err(), "overflow call must not forward");
+
+    write_message(
+        &mut writer,
+        &ClientMessage::Acp {
+            payload: r#"{"jsonrpc":"2.0","method":"session/new","id":9001,"params":{}}"#.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let forwarded: serde_json::Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(1), acp_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(forwarded["method"], "session/new");
+
+    cancel.cancel();
 }
 
 // =========================================================================

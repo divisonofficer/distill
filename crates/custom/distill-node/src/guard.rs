@@ -27,27 +27,76 @@ pub async fn guard(State(cfg): State<Arc<GuardConfig>>, req: Request, next: Next
         return (StatusCode::FORBIDDEN, "not the node owner").into_response();
     }
 
-    let origin = headers.get(header::ORIGIN);
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let origin_ok = origin
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|o| cfg.allowed_origins.iter().any(|a| a == o));
+        .as_deref()
+        .is_some_and(|origin| cfg.allowed_origins.iter().any(|allowed| allowed == origin));
     if (origin.is_some() || is_websocket_upgrade(headers)) && !origin_ok {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
+
+    if req.method() == Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        add_cors_headers(&mut response, origin.as_deref());
+        if origin.is_some() {
+            let headers = response.headers_mut();
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                "GET, POST".parse().unwrap(),
+            );
+            headers.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "Content-Type".parse().unwrap(),
+            );
+        }
+        return response;
     }
 
     let is_write = matches!(
         *req.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
-    if is_write && !is_json(headers) {
-        return (
+    let json_body = is_json(headers);
+    let response = if is_write && !json_body {
+        (
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "expected application/json",
         )
-            .into_response();
-    }
+            .into_response()
+    } else {
+        next.run(req).await
+    };
+    let mut response = response;
+    add_cors_headers(&mut response, origin.as_deref());
+    response
+}
 
-    next.run(req).await
+fn add_cors_headers(response: &mut Response, origin: Option<&str>) {
+    let Some(origin) = origin else {
+        return;
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        origin.parse().expect("validated origin"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        "true".parse().unwrap(),
+    );
+    let mut vary_values = headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(',').map(str::trim))
+        .filter(|value| !value.eq_ignore_ascii_case("origin"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    vary_values.push("Origin".to_owned());
+    headers.insert(header::VARY, vary_values.join(", ").parse().unwrap());
 }
 
 fn is_websocket_upgrade(headers: &HeaderMap) -> bool {

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use distill_node::reduce::Reducer;
-use distill_node::sep::{Sep, Status, ToolContent};
+use distill_node::sep::{Attachment, Sep, Status, ToolContent};
 use serde_json::{Value, json};
 
 fn fixtures() -> PathBuf {
@@ -258,4 +258,127 @@ fn foreign_session_prompt_and_echo_are_filtered() {
         }
     });
     assert!(reducer.on_agent(&own_echo).is_empty());
+}
+
+#[test]
+fn replayed_inline_image_and_resource_text_become_attachments() {
+    let mut reducer = Reducer::new("s1".into());
+    let image = reducer.on_agent(&json!({
+        "method": "session/update",
+        "params": {"sessionId":"s1", "update": {
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}
+        }}
+    }));
+    assert_eq!(
+        image,
+        vec![Sep::UserAttachment {
+            attachment: Attachment::Image {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+                name: None,
+            }
+        }]
+    );
+
+    let resource = reducer.on_agent(&json!({
+        "method": "session/update",
+        "params": {"sessionId":"s1", "update": {
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"resource", "resource": {
+                "uri":"file:///tmp/notes.md", "mimeType":"text/markdown", "text":"saved notes"
+            }}
+        }}
+    }));
+    assert_eq!(
+        resource,
+        vec![Sep::UserAttachment {
+            attachment: Attachment::Text {
+                name: "notes.md".into(),
+                text: "saved notes".into(),
+            }
+        }]
+    );
+}
+
+#[test]
+fn prompt_resource_and_resource_link_map_to_attachments() {
+    let mut reducer = Reducer::new("s1".into());
+    let events = reducer.on_client(&json!({
+        "id": 5,
+        "method": "session/prompt",
+        "params": {"sessionId":"s1", "prompt":[
+            {"type":"resource", "resource":{"uri":"file:///attachments/a.txt", "text":"A"}},
+            {"type":"resource_link", "name":"b.txt", "uri":"https://example.test/b.txt"}
+        ]}
+    }));
+    assert_eq!(
+        events,
+        vec![
+            Sep::SessionState {
+                status: Status::Running
+            },
+            Sep::UserAttachment {
+                attachment: Attachment::Text {
+                    name: "a.txt".into(),
+                    text: "A".into()
+                }
+            },
+            Sep::UserAttachment {
+                attachment: Attachment::File {
+                    name: "b.txt".into(),
+                    uri: Some("https://example.test/b.txt".into())
+                }
+            },
+        ]
+    );
+}
+
+#[test]
+fn foreign_and_hidden_user_attachments_are_ignored() {
+    let mut reducer = Reducer::new("s1".into());
+    for message in [
+        json!({"method":"session/update", "params":{"sessionId":"s2", "update":{
+            "sessionUpdate":"user_message_chunk", "content":{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}
+        }}}),
+        json!({"method":"session/update", "params":{"sessionId":"s1", "update":{
+            "sessionUpdate":"user_message_chunk", "_meta":{"hideFromScrollback":true},
+            "content":{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}
+        }}}),
+        json!({"method":"session/update", "params":{"sessionId":"s1", "update":{
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text", "text":"internal", "_meta":{"hideFromScrollback":true}}
+        }}}),
+    ] {
+        assert!(reducer.on_agent(&message).is_empty());
+    }
+}
+
+#[test]
+fn repeated_attachment_submissions_consume_one_matching_echo_each() {
+    let mut reducer = Reducer::new("s1".into());
+    let prompt = json!({"id":1, "method":"session/prompt", "params":{
+        "sessionId":"s1", "prompt":[{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}]
+    }});
+    let echo = json!({"method":"session/update", "params":{"sessionId":"s1", "update":{
+        "sessionUpdate":"user_message_chunk",
+        "content":{"type":"image", "mimeType":"image/png", "data":"aGVsbG8="}
+    }}});
+    for id in [1, 2] {
+        let mut submitted = prompt.clone();
+        submitted["id"] = json!(id);
+        assert_eq!(reducer.on_client(&submitted).len(), 2);
+    }
+    assert!(reducer.on_agent(&echo).is_empty());
+    assert!(reducer.on_agent(&echo).is_empty());
+    assert_eq!(
+        reducer.on_agent(&echo),
+        vec![Sep::UserAttachment {
+            attachment: Attachment::Image {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+                name: None,
+            }
+        }]
+    );
 }

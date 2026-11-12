@@ -3720,6 +3720,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "distill-extra-ca",
  "distill-version",
  "dunce",
  "futures-util",

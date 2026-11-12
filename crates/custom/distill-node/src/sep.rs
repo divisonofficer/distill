@@ -88,6 +88,8 @@ pub enum Sep {
     SessionModel { model_id: String },
     #[serde(rename = "user.message")]
     UserMessage { text: String },
+    #[serde(rename = "user.attachment")]
+    UserAttachment { attachment: Attachment },
     #[serde(rename = "message.delta")]
     MessageDelta { text: String },
     #[serde(rename = "reasoning.delta")]
@@ -136,6 +138,8 @@ pub enum Sep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan_content: Option<String>,
     },
+    #[serde(rename = "permission.expired")]
+    PermissionExpired { id: Value },
     #[serde(rename = "permission.resolved")]
     PermissionResolved { tool_call_id: String },
     #[serde(rename = "usage")]
@@ -147,6 +151,16 @@ pub enum Sep {
         error: Option<String>,
     },
     /// History replay after attaching is complete; later events are live.
+    #[serde(rename = "history.page")]
+    HistoryPage {
+        items: Vec<Sep>,
+        #[serde(default)]
+        cursor: Option<String>,
+        has_more: bool,
+        initial: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     #[serde(rename = "replay.end")]
     ReplayEnd,
     #[serde(rename = "error")]
@@ -162,20 +176,55 @@ pub enum PermissionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Attachment {
+    Image {
+        mime: String,
+        /// base64
+        data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    Text {
+        name: String,
+        text: String,
+    },
+    File {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageIn {
     pub mime: String,
     /// base64
     pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextFileIn {
+    pub name: String,
+    pub text: String,
 }
 
 /// Client to node, on the session WebSocket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
+    #[serde(rename = "history.load")]
+    HistoryLoad {
+        cursor: String,
+    },
     Prompt {
         text: String,
         #[serde(default)]
         images: Vec<ImageIn>,
+        #[serde(default)]
+        text_files: Vec<TextFileIn>,
     },
     Cancel,
     Permission {
@@ -253,7 +302,8 @@ mod tests {
             msg,
             ClientMsg::Prompt {
                 text: "hi".into(),
-                images: vec![]
+                images: vec![],
+                text_files: vec![]
             }
         );
         let msg: ClientMsg = serde_json::from_str(r#"{"t":"model","model_id":"model-x"}"#).unwrap();
@@ -269,6 +319,27 @@ mod tests {
             })
             .unwrap(),
             r#"{"t":"session.model","model_id":"model-x"}"#
+        );
+    }
+
+    #[test]
+    fn history_page_and_request_wire_shapes_are_stable() {
+        let page = Sep::HistoryPage {
+            items: vec![Sep::UserMessage { text: "old".into() }],
+            cursor: Some("9:3".into()),
+            has_more: true,
+            initial: true,
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&page).unwrap(),
+            r#"{"t":"history.page","items":[{"t":"user.message","text":"old"}],"cursor":"9:3","has_more":true,"initial":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"t":"history.load","cursor":"9:3"}"#).unwrap(),
+            ClientMsg::HistoryLoad {
+                cursor: "9:3".into()
+            }
         );
     }
 }

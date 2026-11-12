@@ -3034,6 +3034,17 @@ pub(crate) async fn new_with_explicit_dir(
     title: String,
     open: ExplicitSessionOpen,
 ) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_with_parent(info, target_dir, model_id, title, open, None).await
+}
+
+pub(crate) async fn new_with_explicit_dir_with_parent(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    title: String,
+    open: ExplicitSessionOpen,
+    parent_session_id: Option<&str>,
+) -> io::Result<PersistenceHandle> {
     let storage = JsonlStorageAdapter::with_explicit_session_dir(target_dir);
 
     let is_wake = matches!(open, ExplicitSessionOpen::Wake);
@@ -3050,6 +3061,16 @@ pub(crate) async fn new_with_explicit_dir(
         storage.init_session(info, model_id.clone()).await?
     };
     touch_worktree_for_session(info).await;
+    let parent_stamped = if summary.parent_session_id.is_none() {
+        if let Some(parent_session_id) = parent_session_id {
+            summary.parent_session_id = Some(parent_session_id.to_owned());
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     if !is_wake {
         if summary
             .session_kind
@@ -3059,6 +3080,8 @@ pub(crate) async fn new_with_explicit_dir(
             summary.session_kind = Some("subagent".to_string());
             summary.source_workspace_dir = None;
         }
+    }
+    if !is_wake || parent_stamped {
         storage.write_summary_sync(info, &summary)?;
     }
 
@@ -3162,6 +3185,18 @@ async fn pull_on_miss(
     try_pull_from_remote(info, client).await.ok_or(err)
 }
 
+async fn load_light_data(
+    storage: &JsonlStorageAdapter,
+    info: &Info,
+    metadata_only: bool,
+) -> io::Result<crate::session::storage::PersistedDataLight> {
+    if metadata_only {
+        storage.load_session_without_chat_history(info)
+    } else {
+        storage.load_session_without_updates(info).await
+    }
+}
+
 /// Load a session without reading updates into memory.
 /// Instead, provides the path to the updates file for streaming reads.
 /// `starts_attempt` is false unless the caller already won cold actor creation.
@@ -3169,6 +3204,7 @@ pub(crate) async fn load_light(
     info: &Info,
     backend: Option<&crate::remote::BackendClient>,
     starts_attempt: bool,
+    metadata_only: bool,
     deps: SessionDeps,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let SessionDeps {
@@ -3186,12 +3222,12 @@ pub(crate) async fn load_light(
     let root_dir = distill_home();
     let storage = JsonlStorageAdapter::with_root(root_dir.clone());
 
-    let (mut persisted, loaded_info) = match storage.load_session_without_updates(info).await {
+    let (mut persisted, loaded_info) = match load_light_data(&storage, info, metadata_only).await {
         Ok(p) => (p, info.clone()),
         Err(e) => match backend {
             Some(client) => {
                 let pulled = pull_on_miss(info, client, e).await?;
-                let p = storage.load_session_without_updates(&pulled).await?;
+                let p = load_light_data(&storage, &pulled, metadata_only).await?;
                 (p, pulled)
             }
             None => return Err(e),
@@ -3445,6 +3481,11 @@ mod worktree_stamp_tests;
 
 /// List the `limit` most recently modified session summaries across all workspaces.
 /// Uses stat-based mtime sorting to avoid reading every summary file on disk; final order uses `last_active_at` else `updated_at`.
+pub(crate) async fn list_recent_summaries_with_subagents(limit: usize) -> io::Result<Vec<Summary>> {
+    JsonlStorageAdapter::with_root(crate::util::distill_home::distill_home())
+        .list_sessions_recent_with_subagents(limit).await
+}
+
 pub async fn list_recent_summaries(limit: usize) -> io::Result<Vec<Summary>> {
     let root_dir = crate::util::distill_home::distill_home();
     let storage = JsonlStorageAdapter::with_root(root_dir);
