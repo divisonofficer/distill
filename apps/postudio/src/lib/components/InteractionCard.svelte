@@ -73,19 +73,19 @@ function planReply(outcome: 'approved' | 'cancelled' | 'abandoned') {
 </script>
 
 {#if request.t === 'question.request'}
-<section class="rounded-2xl border border-sky-400 bg-sky-50 p-4 shadow-lg dark:border-sky-700 dark:bg-sky-950" aria-label="답변이 필요한 질문">
-	<h2 class="mb-3 text-sm font-semibold">질문에 답해주세요</h2>
+<section class="rounded-xl border border-neutral-200 bg-white p-3 text-neutral-800 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-100" aria-label="답변이 필요한 질문">
+	<h2 class="mb-2 text-sm font-semibold">질문에 답해주세요</h2>
 	{#if request.preview}
-		<div class="mb-4 rounded-xl bg-white/70 p-3 dark:bg-neutral-900"><Markdown text={request.preview} /></div>
+		<div class="mb-3 rounded-lg border border-neutral-200 bg-neutral-50 p-2 text-sm dark:border-neutral-800 dark:bg-neutral-950"><Markdown text={request.preview} /></div>
 	{/if}
-	<div class="flex flex-col gap-4">
+	<div class="flex flex-col gap-3">
 		{#each request.questions as question (question.question)}
 			<fieldset class="min-w-0">
-				<legend class="mb-2 text-sm font-medium">{question.question}</legend>
+				<legend class="mb-1 text-sm font-medium">{question.question}</legend>
 				{#if question.options.length}
-					<div class="flex flex-col gap-2">
+					<div class="flex flex-col gap-1">
 						{#each question.options as option (option.label)}
-							<label class="flex min-h-10 cursor-pointer items-start gap-3 rounded-xl border border-neutral-300 bg-white px-3 py-2 dark:border-neutral-700 dark:bg-neutral-900">
+							<label class="flex min-w-0 cursor-pointer items-start gap-2 rounded-lg border border-neutral-200 bg-white px-2 py-1.5 has-[:checked]:border-neutral-500 has-[:checked]:bg-neutral-50 focus-within:ring-2 focus-within:ring-neutral-400 dark:border-neutral-700 dark:bg-neutral-900 dark:has-[:checked]:border-neutral-500 dark:has-[:checked]:bg-neutral-800">
 								<input
 									type={question.multiSelect ? 'checkbox' : 'radio'}
 									name={`question-${request.id}-${question.question}`}
@@ -113,9 +113,9 @@ function planReply(outcome: 'approved' | 'cancelled' | 'abandoned') {
 			</fieldset>
 		{/each}
 	</div>
-	<div class="mt-4 flex gap-2">
-		<button type="button" disabled={!connected} class="min-h-10 rounded-xl border border-neutral-300 px-4 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={cancelQuestion}>취소</button>
-		<button type="button" disabled={!connected || !canSubmit} class="min-h-10 flex-1 rounded-xl bg-neutral-900 px-4 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={submitQuestion}>답변 제출</button>
+	<div class="mt-3 flex justify-end gap-2">
+		<button type="button" disabled={!connected} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={cancelQuestion}>취소</button>
+		<button type="button" disabled={!connected || !canSubmit} class="h-9 min-w-0 rounded-lg bg-neutral-900 px-3 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={submitQuestion}>답변 제출</button>
 	</div>
 </section>
 {:else}

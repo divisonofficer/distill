@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::sep::TextFileIn;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -41,6 +42,8 @@ pub enum ChatEvent {
         text: String,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        text_files: Vec<TextFileIn>,
     },
     Title {
         chat_id: String,
@@ -64,6 +67,8 @@ pub struct ChatMessage {
     pub role: String,
     pub text: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_files: Vec<TextFileIn>,
     pub author: String,
     pub seq: u64,
 }
@@ -372,6 +377,7 @@ fn validate_event(event: &ChatEvent) -> Result<()> {
             parent_id,
             role,
             text,
+            text_files,
             ..
         } => {
             validate_id(chat_id, "chat_id")?;
@@ -384,6 +390,14 @@ fn validate_event(event: &ChatEvent) -> Result<()> {
             }
             if text.len() > MAX_TEXT_BYTES {
                 bail!("message text exceeds 1 MiB");
+            }
+            if role == "assistant" && !text_files.is_empty() {
+                bail!("assistant messages cannot contain text files");
+            }
+            let normalized =
+                crate::attachments::chat_text_files(text_files).map_err(|error| anyhow!(error))?;
+            if &normalized != text_files {
+                bail!("text file names must be canonical basenames");
             }
             Ok(())
         }
@@ -489,6 +503,7 @@ fn conversation_from_state(state: &State, chat_id: &str) -> Option<Conversation>
                 role,
                 text,
                 model,
+                text_files,
             } if id == chat_id => {
                 conversation.messages.push(ChatMessage {
                     message_id: message_id.clone(),
@@ -496,6 +511,7 @@ fn conversation_from_state(state: &State, chat_id: &str) -> Option<Conversation>
                     role: role.clone(),
                     text: text.clone(),
                     model: model.clone(),
+                    text_files: text_files.clone(),
                     author: envelope.author.clone(),
                     seq: envelope.seq,
                 });
@@ -540,6 +556,7 @@ fn conversations_from_events(events: &[Envelope]) -> Vec<Conversation> {
                 role,
                 text,
                 model,
+                text_files,
                 ..
             } => conversation.messages.push(ChatMessage {
                 message_id: message_id.clone(),
@@ -547,6 +564,7 @@ fn conversations_from_events(events: &[Envelope]) -> Vec<Conversation> {
                 role: role.clone(),
                 text: text.clone(),
                 model: model.clone(),
+                text_files: text_files.clone(),
                 author: envelope.author.clone(),
                 seq: envelope.seq,
             }),
@@ -872,6 +890,7 @@ mod tests {
             role: role.into(),
             text: message_id.into(),
             model: None,
+            text_files: Vec::new(),
         }
     }
 

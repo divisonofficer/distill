@@ -26,6 +26,7 @@ fn store_with_chat(path: &Path, chat_id: &str, count: usize) -> Store {
                 role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
                 text: format!("text-{index:03}"),
                 model: (index % 2 == 1).then(|| "model-a".into()),
+                text_files: Vec::new(),
             })
             .unwrap();
         parent_id = Some(message_id);

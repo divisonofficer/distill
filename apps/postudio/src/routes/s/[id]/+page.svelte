@@ -5,6 +5,7 @@ import { getJson } from '$lib/api';
 import { sessionHref, sessionOrigin } from '$lib/fleet';
 import { basename, sessionTitle } from '$lib/format';
 import WorkbenchPane from '$lib/components/WorkbenchPane.svelte';
+import Icon from '$lib/components/Icon.svelte';
 import { ui } from '$lib/ui.svelte';
 import type { BoardRow } from '$lib/types';
 
@@ -67,5 +68,5 @@ function selectConversation(sessionId: string) {
  {#if metadataError}<p role="alert" class="shrink-0 px-4 py-2 text-sm text-red-700">{metadataError}</p>{/if}
  {#if ready}
   <WorkbenchPane sessionId={id} host={destination.host} {workspaceId} {conversations} sessionRows={roster} blocked={!!destination.error} onConversationSelect={selectConversation} />
- {:else}<p role="status" class="p-6 text-sm text-neutral-500">작업공간을 불러오는 중입니다.</p>{/if}
+ {:else}<div class="flex min-h-0 flex-1 flex-col"><nav class="flex h-10 shrink-0 items-center border-b border-neutral-200 px-2" aria-label="탐색"><button class="flex size-9 items-center justify-center rounded-xl hover:bg-neutral-200/70 lg:hidden" type="button" aria-label="메뉴 열기" onclick={() => (ui.drawerOpen = true)}><Icon name="menu" /></button>{#if ui.sidebarHidden}<button class="hidden size-9 items-center justify-center rounded-xl hover:bg-neutral-200/70 lg:flex" type="button" aria-label="사이드바 펼치기" title="사이드바 펼치기" onclick={() => ui.toggleSidebar()}><Icon name="sidebar" /></button>{/if}</nav><p role="status" class="p-6 text-sm text-neutral-500">작업공간을 불러오는 중입니다.</p></div>{/if}
 </div>

@@ -39,6 +39,7 @@ fn add_local_branch(store: &Store, message_id: &str, text: &str) {
             role: "user".into(),
             text: text.into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
 }

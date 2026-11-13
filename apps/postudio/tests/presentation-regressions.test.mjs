@@ -184,15 +184,14 @@ assert.match(source, /\{#if fleetError\}<p role="alert"/);
 assert.match(source, /prefers-reduced-motion: reduce/);
 });
 
-test('session header moves to common workbar and keeps accessible route heading', async () => {
+test('session has no duplicate shell header and keeps accessible route heading', async () => {
 const source = await readFile(resolve(root, 'src/routes/s/[id]/+page.svelte'), 'utf8');
 const layout = await readFile(resolve(root, 'src/routes/+layout.svelte'), 'utf8');
 const sidebar = await readFile(resolve(root, 'src/lib/components/Sidebar.svelte'), 'utf8');
 assert.doesNotMatch(source, /<header/);
 assert.match(source, /<h1 class="sr-only">/);
-assert.match(layout, /page\.route\.id === '\/s\/\[id\]' && \(!desktop \|\| ui\.sidebarHidden\)/);
-assert.match(layout, /sessionOrigin\(page\.url\.search\) \?\? page\.url\.origin/);
-assert.match(layout, /workContext\.sessionId\)\}\/artifacts\{page\.url\.search\}/);
+assert.match(layout, /page\.route\.id !== '\/s\/\[id\]' && page\.route\.id !== '\/c\/\[id\]'/);
+assert.doesNotMatch(layout, /workContext/);
 assert.match(sidebar, /selectedRow\.sessionId\)\}\/artifacts\{page\.url\.search\}/);
 assert.match(source, /<WorkbenchPane /);
 assert.match(source, /host=\{destination\.host\}/);

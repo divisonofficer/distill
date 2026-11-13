@@ -24,8 +24,9 @@ use crate::chat_store::{
 };
 use crate::chat_sync::{SyncHealth, SyncStatus};
 use crate::keeper::{Keeper, MAX_CHAT_PROGRESS_BYTES};
+use crate::sep::TextFileIn;
 
-const MAX_REQUEST_BODY_BYTES: usize = 6 * 1024 * 1024 + 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 12 * 1024 * 1024 + 64 * 1024;
 const HISTORY_PAGE_SIZE: usize = 50;
 const MAX_HISTORY_CURSOR_BYTES: usize = 4096;
 const ID_RANDOM_BYTES: usize = 18;
@@ -271,9 +272,19 @@ struct CompletedInference {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CapabilitiesResponse {
     completion: CompletionCapability,
     sync: SyncHealth,
+    text_attachments: TextAttachmentsCapability,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextAttachmentsCapability {
+    supported: bool,
+    max_files: usize,
+    max_total_bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -335,6 +346,8 @@ struct MessageDto {
     model: Option<String>,
     author: String,
     seq: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    text_files: Vec<TextFileIn>,
 }
 
 impl From<ChatMessage> for MessageDto {
@@ -347,6 +360,7 @@ impl From<ChatMessage> for MessageDto {
             model: message.model,
             author: message.author,
             seq: message.seq,
+            text_files: message.text_files,
         }
     }
 }
@@ -389,6 +403,8 @@ struct CreateMessageRequest {
     text: String,
     #[serde(default)]
     parent_id: Option<String>,
+    #[serde(default)]
+    text_files: Vec<TextFileIn>,
 }
 
 #[derive(Serialize)]
@@ -446,6 +462,11 @@ async fn capabilities(State(state): State<ChatState>) -> Response {
             configured: state.completer.is_some(),
         },
         sync: state.sync_status.snapshot(),
+        text_attachments: TextAttachmentsCapability {
+            supported: true,
+            max_files: 10,
+            max_total_bytes: MAX_TEXT_BYTES,
+        },
     })
     .into_response()
 }
@@ -628,6 +649,11 @@ async fn create_message(
         return api_error(StatusCode::BAD_REQUEST, "message_too_long");
     }
 
+    let text_files = match crate::attachments::chat_text_files(&request.text_files) {
+        Ok(files) => files,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_text_files"),
+    };
+
     let Some(conversation) = existing_chat(&state.store, &chat_id) else {
         return api_error(StatusCode::NOT_FOUND, "chat_not_found");
     };
@@ -650,6 +676,7 @@ async fn create_message(
         role: "user".to_owned(),
         text: request.text,
         model: None,
+        text_files,
     };
     let envelope = match state.store.append(event) {
         Ok(envelope) => envelope,
@@ -661,6 +688,7 @@ async fn create_message(
         role,
         text,
         model,
+        text_files,
         ..
     } = envelope.event
     else {
@@ -678,6 +706,7 @@ async fn create_message(
                 model,
                 author: envelope.author,
                 seq: envelope.seq,
+                text_files,
             },
             inference: InferenceStatus {
                 status: "unavailable",
@@ -721,8 +750,20 @@ async fn complete_message(
         return api_error(StatusCode::CONFLICT, "completion_not_locally_owned");
     }
     let Some(messages) = ancestry_to_target(&conversation, &message_id) else {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_target_message");
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_or_oversized_completion_ancestry",
+        );
     };
+    if messages.len() > 128
+        || messages
+            .iter()
+            .map(|message| message.text.len())
+            .sum::<usize>()
+            > MAX_TEXT_BYTES
+    {
+        return api_error(StatusCode::BAD_REQUEST, "completion_input_too_large");
+    }
     let Some(completer) = state.completer.clone() else {
         return api_error(StatusCode::BAD_GATEWAY, "completion_failed");
     };
@@ -940,6 +981,7 @@ fn persist_completion(
             role: "assistant".to_owned(),
             text: result.text,
             model: Some(result.model_id),
+            text_files: Vec::new(),
         })
         .map_err(|_| ())?;
     let ChatEvent::Message {
@@ -959,6 +1001,7 @@ fn persist_completion(
         role,
         text,
         model,
+        text_files: Vec::new(),
         author: envelope.author,
         seq: envelope.seq,
     })
@@ -992,14 +1035,36 @@ fn ancestry_to_target(
     let mut path = Vec::new();
     let mut next = Some(target_id);
     let mut seen = HashSet::new();
+    let mut input_bytes = 0usize;
     while let Some(message_id) = next {
         if !seen.insert(message_id) {
             return None;
         }
         let message = by_id.get(message_id)?;
+        let message_bytes =
+            message
+                .text_files
+                .iter()
+                .try_fold(message.text.len(), |bytes, file| {
+                    bytes.checked_add(
+                        "\n\nAttached file: ".len() + file.name.len() + 1 + file.text.len(),
+                    )
+                })?;
+        input_bytes = input_bytes.checked_add(message_bytes)?;
+        if path.len() >= 128 || input_bytes > MAX_TEXT_BYTES {
+            return None;
+        }
         path.push(CompletionPromptMessage {
             role: message.role.clone(),
-            text: message.text.clone(),
+            // ponytail: Text files use the existing text contract; images need native content blocks.
+            text: message
+                .text_files
+                .iter()
+                .fold(message.text.clone(), |mut text, file| {
+                    use std::fmt::Write as _;
+                    let _ = write!(text, "\n\nAttached file: {}\n{}", file.name, file.text);
+                    text
+                }),
         });
         next = message.parent_id.as_deref();
     }

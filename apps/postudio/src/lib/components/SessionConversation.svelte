@@ -29,7 +29,7 @@ import { permissionActions, permissionOptionLabel, permissionPromptState } from 
 import { TaskHistoryScroll, type HistoryReplayMode, type HistoryScrollTarget, type ScrollMetrics } from '$lib/task-history-scroll';
 import type { ClientMsg, InteractionRequest, Mode, Sep } from '$lib/types';
 
-let { sessionId, host, blocked = false, initialDraft, onDraftChange, onTitle, onTools, onOpenTool, onPending, onControlChange }: { sessionId: string; host: string; blocked?: boolean; initialDraft?: { text: string; attachments: DraftAttachment[] }; onDraftChange?: (draft: { text: string; attachments: DraftAttachment[] }) => void; onTitle?: (title: string) => void; onTools?: (tools: ToolItem[]) => void; onOpenTool?: (tool: ToolItem) => void; onPending?: (pending: boolean) => void; onControlChange?: (control: { connected: boolean; running: boolean; cancel: () => boolean } | null) => void } = $props();
+let { sessionId, host, blocked = false, initialDraft, onDraftChange, onTitle, onTools, onOpenTool, onPending, onControlChange, runningAgentCount = 0 }: { sessionId: string; host: string; blocked?: boolean; initialDraft?: { text: string; attachments: DraftAttachment[] }; onDraftChange?: (draft: { text: string; attachments: DraftAttachment[] }) => void; onTitle?: (title: string) => void; onTools?: (tools: ToolItem[]) => void; onOpenTool?: (tool: ToolItem) => void; onPending?: (pending: boolean) => void; onControlChange?: (control: { connected: boolean; running: boolean; cancel: () => boolean } | null) => void; runningAgentCount?: number } = $props();
 const id = $derived(sessionId);
 const composerId = $derived(`composer-${sessionId}`);
 const modelId = $derived(`session-model-${sessionId}`);
@@ -56,6 +56,7 @@ const title = $derived(view.title || (row ? sessionTitle(row) : id));
 const hostAddress = $derived(new URL(sessionHost).host);
 const activePending = $derived(permissionPromptState(view.permissions.length, interactions.length));
 const tools = $derived.by(() => { void view.revision; return view.items.filter((item): item is ToolItem => item.kind === 'tool'); });
+const runningCommandCount = $derived(tools.filter((item) => item.status === 'in_progress' && ((item.toolKind ?? '').toLowerCase() === 'execute' || /(^|[_:/-])(bash|shell|execute|exec|terminal)([_:/-]|$)|(^|_)run_(?:terminal_)?command([_:/-]|$)/i.test(item.name ?? ''))).length);
 $effect(() => { const value = title; if (onTitle) untrack(() => onTitle(value)); });
 $effect(() => { const value = tools; if (onTools) untrack(() => onTools(value)); });
 $effect(() => { const value = activePending; if (onPending) untrack(() => onPending(value)); });
@@ -593,7 +594,7 @@ composer?.focus();
 {/if}
 {#each timeline as entry (entry.kind === 'item' ? `item-${entry.item.key}` : `tools-${entry.items[0].key}`)}
 {#if entry.kind === 'tools'}
-{#each entry.items as tool (tool.key)}<ToolRow item={tool} id={toolDomId(tool.id)} onselect={(tool) => onOpenTool?.(tool)} />{/each}
+<div class="flex flex-col gap-0 rounded-xl border border-neutral-200 dark:border-neutral-800">{#each entry.items as tool (tool.key)}<ToolRow item={tool} id={toolDomId(tool.id)} onselect={(tool) => onOpenTool?.(tool)} grouped />{/each}</div>
 {:else}
 {@const item = entry.item}
 {#if item.kind === 'attachment'}
@@ -662,7 +663,7 @@ composer?.focus();
 </div>
 
 <div class="relative mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-2 bg-white px-4 pt-2 pb-3 dark:bg-neutral-950">
-{#if view.running}<div role="status" class="flex min-h-9 items-center gap-2 rounded-lg bg-neutral-100 px-3 text-sm dark:bg-neutral-800"><span>작업 실행 중</span><button type="button" class="ml-auto min-h-8 rounded-lg px-3 hover:bg-neutral-200 dark:hover:bg-neutral-700" aria-label="중단" onclick={cancelCurrent}>중단</button></div>{/if}
+{#if view.running}<div role="status" class="flex min-h-9 items-center gap-2 rounded-lg bg-neutral-100 px-3 text-sm dark:bg-neutral-800"><span>{[runningCommandCount > 0 ? `명령 ${runningCommandCount}개 실행 중` : '', runningAgentCount > 0 ? `에이전트 ${runningAgentCount}개 실행 중` : ''].filter(Boolean).join(' · ') || '작업 실행 중'}</span><button type="button" class="ml-auto min-h-8 rounded-lg px-3 hover:bg-neutral-200 dark:hover:bg-neutral-700" aria-label="중단" onclick={cancelCurrent}>중단</button></div>{/if}
 {#if modelError?.id === id}<p role="alert" class="text-sm text-red-600">{modelError.message}</p>{/if}
 {#if modeError?.id === id}<p role="alert" class="text-sm text-red-600">{modeError.message}</p>{/if}
 <form
@@ -696,14 +697,14 @@ class="max-h-60 min-h-12 w-full resize-none bg-transparent p-0 text-[15px] leadi
 <p role="alert" class="px-2 text-sm text-red-700 dark:text-red-300">{sendError}</p>
 {/if}
 <div class="flex min-w-0 flex-nowrap items-center gap-0.5">
-<div class="min-w-0 max-w-[180px] shrink"><ComposerRouting id={`composer-routing-${encodeURIComponent(sessionId)}`} host={sessionHost} value={view.modelId || row?.modelId || 'Auto'} onselect={chooseModel} disabled={!view.connected || view.running || modelPending?.id === id} /></div>
+<label class="flex h-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg px-1 hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 또는 텍스트 파일 첨부"><Icon name="image" class="size-4" /><span class="sr-only">이미지 또는 TXT/MD 파일 첨부</span><input type="file" accept="image/*,.txt,.md,text/plain,text/markdown" multiple class="sr-only" onchange={attachFiles} /></label>
+<div class="min-w-0 max-w-[180px] basis-[180px] shrink"><ComposerRouting id={`composer-routing-${encodeURIComponent(sessionId)}`} host={sessionHost} value={view.modelId || row?.modelId || 'Auto'} onselect={chooseModel} disabled={!view.connected || view.running || modelPending?.id === id} /></div>
 <div class="min-w-0 flex-1"></div>
 {#if contextUsage}
-<button type="button" popovertarget={contextId} aria-haspopup="dialog" aria-label={`컨텍스트 사용량 ${contextUsage.percent}%`} title={`컨텍스트 ${contextUsage.used.toLocaleString()} / ${contextUsage.size.toLocaleString()} 토큰`} class="inline-flex h-[30px] shrink-0 items-center gap-1 rounded-lg px-1 text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800"><svg aria-hidden="true" class="size-4 -rotate-90" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="#e3e3e7" stroke-width="3" /><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" pathLength="100" stroke-dasharray={`${Math.min(100, contextUsage.percent)} 100`} /></svg><span>{contextUsage.percent}%</span></button>
+<button type="button" popovertarget={contextId} aria-haspopup="dialog" aria-label={`컨텍스트 사용량 ${contextUsage.percent}%`} title={`컨텍스트 ${contextUsage.used.toLocaleString()} / ${contextUsage.size.toLocaleString()} 토큰`} class="inline-flex h-[34px] shrink-0 items-center gap-1 rounded-lg px-1 text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800"><svg aria-hidden="true" class="size-4 -rotate-90" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="#e3e3e7" stroke-width="3" /><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" pathLength="100" stroke-dasharray={`${Math.min(100, contextUsage.percent)} 100`} /></svg><span>{contextUsage.percent}%</span></button>
 <div id={contextId} popover="auto" data-composer-popover onbeforetoggle={positionComposerPopover} role="dialog" aria-label="컨텍스트 사용량" class="fixed inset-auto m-0 overflow-auto rounded-[14px] border border-neutral-200 bg-white p-3.5 text-[13px] shadow-xl dark:border-neutral-700 dark:bg-neutral-900"><h3 class="font-semibold">컨텍스트 사용량 · {contextUsage.percent}%</h3><p class="mt-2 font-mono text-xs">{contextUsage.used.toLocaleString()} / {contextUsage.size.toLocaleString()} 토큰</p><p class="mt-2 text-xs leading-5 text-neutral-500">현재 세션에서 보고한 사용량입니다.</p></div>
-{:else}<span role="img" aria-label="컨텍스트 사용량 알 수 없음" title="컨텍스트 사용량 정보 없음" class="flex size-[30px] shrink-0 items-center justify-center text-xs text-neutral-500">—</span>{/if}
-<label class="flex size-[30px] shrink-0 cursor-pointer items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 또는 텍스트 파일 첨부"><Icon name="image" class="size-4" /><span class="sr-only">이미지 또는 TXT/MD 파일 첨부</span><input type="file" accept="image/*,.txt,.md,text/plain,text/markdown" multiple class="sr-only" onchange={attachFiles} /></label>
-<details class="relative shrink-0"><summary aria-label={`승인 정책: ${modeLabel}`} title={`승인 정책 · ${modeLabel}`} class="flex size-[30px] cursor-pointer list-none items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800"><Icon name="shield" class="size-3.5" /><span class="sr-only">승인 정책 · {modeLabel}</span></summary><div class="absolute bottom-full right-0 z-20 mb-2 w-56 max-w-[calc(100vw-48px)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-xl dark:border-neutral-700 dark:bg-neutral-900">
+{:else}<span role="img" aria-label="컨텍스트 사용량 알 수 없음" title="컨텍스트 사용량 정보 없음" class="flex h-[34px] w-[30px] shrink-0 items-center justify-center text-xs text-neutral-500">—</span>{/if}
+<details class="relative shrink-0"><summary aria-label={`승인 정책: ${modeLabel}`} title={`승인 정책 · ${modeLabel}`} class="flex h-[34px] w-[34px] cursor-pointer list-none items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800"><Icon name="shield" class="size-3.5" /><span class="sr-only">승인 정책 · {modeLabel}</span></summary><div class="absolute bottom-full right-0 z-20 mb-2 w-56 max-w-[calc(100vw-48px)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-xl dark:border-neutral-700 dark:bg-neutral-900">
 {#each MODES as candidate (candidate)}<button type="button" disabled={!view.connected || mode === undefined || modePending?.id === id || candidate === mode} class="flex min-h-10 w-full items-start gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={(event) => { const parent = event.currentTarget.closest('details'); if (parent) parent.open = false; setMode(candidate); }}><span class="mt-0.5 w-4 shrink-0">{#if candidate === mode}<Icon name="check" class="size-3.5" />{/if}</span><span>{MODE_LABEL[candidate]}<small class="mt-0.5 block text-xs leading-4 text-neutral-500">{candidate === 'ask' ? '도구 사용 전 확인' : candidate === 'auto' ? '자동 승인 정책 사용' : '확인 없이 항상 승인'}</small></span></button>{/each}
 </div></details>
 {#if !view.running}<button type="submit" disabled={!canSend} aria-label="보내기" class="flex size-[38px] shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white hover:bg-neutral-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 disabled:opacity-30 dark:bg-white dark:text-neutral-950"><Icon name="send" class="size-4" /></button>{/if}

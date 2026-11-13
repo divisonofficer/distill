@@ -1,4 +1,5 @@
 import { get, writable, type Writable } from 'svelte/store';
+import type { TextFileIn } from './types';
 
 export interface ChatSummary {
 chatId: string;
@@ -13,6 +14,7 @@ text: string;
 model: string | null;
 author: string;
 seq: number;
+textFiles: TextFileIn[];
 }
 
 export interface ChatHistory extends ChatSummary {
@@ -43,6 +45,7 @@ return first ? first.text.trim().replace(/\s+/g, ' ').slice(0, 64) : previews[ch
 }
 
 const drafts = new Map<string, Writable<string>>();
+const textDrafts = new Map<string, Writable<TextFileIn[]>>();
 const draftRevisions = new Map<string, number>();
 const selectedParents = new Map<string, string | null>();
 const composerModes = writable<Record<string, ChatComposerMode>>({});
@@ -61,6 +64,7 @@ export interface ChatComposerMode {
 export const chatComposerModeStore = { subscribe: composerModes.subscribe };
 
 export interface ChatCapabilities {
+textAttachments?: { supported: true; maxFiles: 10; maxTotalBytes: 1048576 };
 completion: { configured: boolean };
 sync: {
 available: boolean;
@@ -211,6 +215,31 @@ text: string;
 revision: number;
 }
 
+export function canSaveChatTextFiles(capabilities: ChatCapabilities | null, loadError: string, files: TextFileIn[]): boolean {
+return files.length === 0 || (!loadError && capabilities?.textAttachments?.supported === true);
+}
+
+export function savedTextFilesMatch(saved: TextFileIn[], submitted: TextFileIn[]): boolean {
+const canonicalName = (name: string) => Array.from(name.trim().split(/[\\/]/).at(-1)!.split(/[?#]/)[0]).map(ch => /^[a-zA-Z0-9._-]$/.test(ch) ? ch : '_').join('');
+return saved.length === submitted.length && saved.every((file, index) =>
+file.text === submitted[index].text && canonicalName(file.name) === canonicalName(submitted[index].name));
+}
+
+export function chatTextFilesStore(chatId: string): Writable<TextFileIn[]> {
+let store = textDrafts.get(chatId);
+if (!store) { store = writable([]); textDrafts.set(chatId, store); }
+return store;
+}
+export function setChatTextFiles(chatId: string, files: TextFileIn[]): void {
+chatTextFilesStore(chatId).set(files);
+}
+export function getChatTextFiles(chatId: string): TextFileIn[] { return get(chatTextFilesStore(chatId)); }
+export function clearChatTextFilesIfUnchanged(chatId: string, files: TextFileIn[]): boolean {
+const current = getChatTextFiles(chatId);
+if (current.length !== files.length || current.some((f, i) => f !== files[i])) return false;
+setChatTextFiles(chatId, []); return true;
+}
+
 export function chatDraftStore(chatId: string): Writable<string> {
 let store = drafts.get(chatId);
 if (!store) {
@@ -335,6 +364,21 @@ const item = record(value);
 return { chatId: stringField(item.chatId, 'chatId'), title: stringField(item.title, 'title') };
 }
 
+function parseTextFiles(value: unknown): TextFileIn[] {
+if (value === undefined) return [];
+if (!Array.isArray(value) || value.length > 10) throw new Error('텍스트 파일 첨부 형식이 올바르지 않습니다.');
+let total = 0;
+return value.map((entry) => {
+const item = record(entry);
+const name = stringField(item.name, 'text file name');
+const text = stringField(item.text, 'text file text');
+if (!/\.(txt|md)$/i.test(name)) throw new Error('TXT 또는 MD 파일만 첨부할 수 있습니다.');
+const size = new TextEncoder().encode(text).byteLength; total += size;
+if (total > 1048576) throw new Error('첨부 전체 크기는 1 MiB 이하여야 합니다.');
+return { name, text };
+});
+}
+
 function parseMessage(value: unknown): ChatMessage {
 const item = record(value);
 if (item.parentId !== null && typeof item.parentId !== 'string') throw new Error('채팅 응답의 parentId 값이 올바르지 않습니다.');
@@ -347,7 +391,8 @@ role: stringField(item.role, 'role'),
 text: stringField(item.text, 'text'),
 model: item.model,
 author: stringField(item.author, 'author'),
-seq: item.seq
+seq: item.seq,
+textFiles: parseTextFiles(item.textFiles)
 };
 }
 
@@ -421,7 +466,18 @@ const lastError = sync.lastError;
 if (lastError !== null && lastError !== undefined && typeof lastError !== 'string') {
 throw new Error('동기화 오류 상태 형식이 올바르지 않습니다.');
 }
+const rawTextAttachments = item.textAttachments;
+let textAttachments: ChatCapabilities['textAttachments'];
+if (rawTextAttachments !== undefined) {
+const text = record(rawTextAttachments);
+if (text.supported !== false && text.supported !== true) throw new Error('텍스트 첨부 기능 상태 형식이 올바르지 않습니다.');
+if (text.supported === true) {
+if (text.maxFiles !== 10 || text.maxTotalBytes !== 1048576) throw new Error('텍스트 첨부 제한 형식이 올바르지 않습니다.');
+textAttachments = { supported: true, maxFiles: 10, maxTotalBytes: 1048576 };
+}
+}
 return {
+...(textAttachments ? { textAttachments } : {}),
 completion: { configured: completion.configured },
 sync: {
 available: sync.available,

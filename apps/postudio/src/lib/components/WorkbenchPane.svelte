@@ -191,6 +191,7 @@ $effect(() => {
   <header class="group-header" class:mobile-hidden={currentGroup.id !== group.id}>
    <strong>작업 그룹 {index + 1}</strong>
    <div class="tabstrip" role="tablist" tabindex="-1" aria-label={`작업 그룹 ${index + 1}`} ondragover={(event) => { if (acceptsTabDrag(event)) event.preventDefault(); }} ondragleave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) dropMarker = null; }} ondrop={transfer} data-group={group.id}>
+   <span class="navigation-controls" role="presentation"><button class="mobile-menu" type="button" aria-label="메뉴 열기" onclick={() => (ui.drawerOpen = true)}><Icon name="menu" /></button>{#if index === 0 && ui.sidebarHidden}<button class="desktop-sidebar" type="button" aria-label="사이드바 펼치기" title="사이드바 펼치기" onclick={() => ui.toggleSidebar()}><Icon name="sidebar" /></button>{/if}</span>
    {#each group.tabs as id (id)}{@const tab = layout.tabs[id]}
     <div class="tab" class:current={group.active === id} class:drop-before={dropMarker?.groupId === group.id && dropMarker.tabId === id && !dropMarker.after} class:drop-after={dropMarker?.groupId === group.id && dropMarker.tabId === id && dropMarker.after}>
      <button type="button" role="tab" draggable="true" ondragstart={(event) => transfer(event, id)} ondragend={() => dropMarker = null} ondragover={(event) => dragOverTab(event, group.id, id)} ondrop={(event) => dropOnTab(event, group.id, id)} id={`tab-${id}`} aria-selected={group.active === id} tabindex={group.active === id ? 0 : -1} aria-label={tab.title} title={pending[cacheKey(tab.sessionId)] ? `${tab.title} · 응답 필요` : tab.title} onclick={() => selectTab(id)} onkeydown={(event) => { keyTab(event, group, id); if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); openMenu(event.currentTarget, id, group.id); } }} oncontextmenu={(event) => { event.preventDefault(); openMenu(event.currentTarget as HTMLElement, id, group.id); }} aria-haspopup="menu" aria-expanded={menuTab === id && menuOpen}><Icon name={tab.kind === 'conversation' ? 'chat' : tab.kind === 'explorer' ? 'folder' : tab.kind === 'file' ? 'document' : tab.kind === 'tool' ? 'terminal' : 'globe'} class="tab-icon"/><span class="tab-title">{tab.title}</span>{#if tab.kind === 'conversation' && pending[cacheKey(tab.sessionId)]}<span class="pending-mark" role="status" aria-label="응답 필요">●</span>{/if}</button><button class="close" type="button" aria-label={`닫기 ${tab.title}`} onclick={() => close(id)}>×</button>
@@ -207,7 +208,7 @@ $effect(() => {
   {@const owner = layout.groups.find(group => group.tabs.includes(tab.id))}
   {@const ownerIndex = owner ? layout.groups.indexOf(owner) : 0}
   <section class="panel" class:mobile-hidden={currentGroup.id !== owner?.id} style={`grid-column:${ownerIndex + 1}`} hidden={!owner || owner.active !== tab.id} inert={!owner || owner.active !== tab.id}>
-   {#if tab.kind === 'conversation'}<div class="conversation-panel">{#if childrenFor(tab.sessionId).length}<SessionMonitor sessions={childrenFor(tab.sessionId)} onopen={(id) => { if (childrenFor(tab.sessionId).some(row => row.sessionId === id)) openConversation(id, owner?.id); }} {canCancel} oncancel={cancelChild} />{/if}<SessionConversation sessionId={tab.sessionId} host={host} blocked={blocked || readyKey !== storageKey} initialDraft={drafts.get(draftKey)} onDraftChange={(draft) => drafts.set(draftKey, draft)} onTitle={(title) => updateTitle(tab.sessionId, title)} onTools={(tools) => updateTools(tab.sessionId, tools)} onOpenTool={(tool) => openTool(tab.sessionId, tool)} onPending={(value) => pending = { ...pending, [draftKey]: value }} onControlChange={controlCallback(tab.sessionId, storageKey)} /></div>
+   {#if tab.kind === 'conversation'}<div class="conversation-panel">{#if childrenFor(tab.sessionId).length}<SessionMonitor sessions={childrenFor(tab.sessionId)} onopen={(id) => { if (childrenFor(tab.sessionId).some(row => row.sessionId === id)) openConversation(id, owner?.id); }} {canCancel} oncancel={cancelChild} />{/if}<SessionConversation sessionId={tab.sessionId} host={host} runningAgentCount={childrenFor(tab.sessionId).filter(row => row.activity === 'working').length} blocked={blocked || readyKey !== storageKey} initialDraft={drafts.get(draftKey)} onDraftChange={(draft) => drafts.set(draftKey, draft)} onTitle={(title) => updateTitle(tab.sessionId, title)} onTools={(tools) => updateTools(tab.sessionId, tools)} onOpenTool={(tool) => openTool(tab.sessionId, tool)} onPending={(value) => pending = { ...pending, [draftKey]: value }} onControlChange={controlCallback(tab.sessionId, storageKey)} /></div>
    {:else}<WorkspaceDocument {tab} {host} blocked={blocked || readyKey !== storageKey} tools={toolCache[cacheKey(tab.sessionId)] ?? []} onOpenFile={(entry, sid) => openedFile(entry, sid, owner?.id)} onOpenPreview={(port) => openPreview(port, owner?.id)} onOpenTool={(tool, view) => openTool(tab.sessionId, tool, view)} />{/if}
   </section>
  {/each}
@@ -243,7 +244,7 @@ $effect(() => {
 .group-header:nth-child(2){grid-column:2}
 .group-header:nth-child(3){grid-column:3}
 .group-header strong{padding:0 6px;white-space:nowrap;font-size:11px}
-.tabstrip{display:flex;flex:1;min-width:0;overflow-x:auto}
+.tabstrip{display:flex;flex:1;min-width:0;overflow-x:auto}.navigation-controls{display:flex;flex:none;align-items:center}.navigation-controls button{display:flex;width:34px;height:34px;align-items:center;justify-content:center;border:0;background:transparent}.desktop-sidebar{display:none}.mobile-menu{display:flex}
 .tab{display:flex;flex:none;align-items:center;height:40px;border-top:2px solid transparent}
 .tab.current{background:white;border-top-color:#2b59c3}
 .tab.drop-before{box-shadow:inset 2px 0 #2b59c3}.tab.drop-after{box-shadow:inset -2px 0 #2b59c3}
@@ -254,6 +255,7 @@ $effect(() => {
 .group-picker{display:none}
 .empty{grid-row:2;padding:16px}
 button:focus-visible,select:focus-visible{outline:2px solid #2b59c3}
+@media(min-width:1024px){.mobile-menu{display:none}.desktop-sidebar{display:flex}}
 @media(max-width:640px){
  .groups{display:block;position:relative;width:100%}
  .group-header{position:relative;height:42px}

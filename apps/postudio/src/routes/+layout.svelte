@@ -5,7 +5,6 @@ import { board } from '$lib/board.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import Sidebar from '$lib/components/Sidebar.svelte';
 import Snackbar from '$lib/components/Snackbar.svelte';
-import { sessionOrigin } from '$lib/fleet';
 import { ui } from '$lib/ui.svelte';
 import { onMount, type Snippet } from 'svelte';
 
@@ -17,11 +16,6 @@ let content: HTMLElement;
 let returnFocus: HTMLElement | null = null;
 const mode = $derived(page.url.pathname.startsWith('/c') ? 'chat' : 'work');
 const sidebarVisible = $derived(desktop ? !ui.sidebarHidden : ui.drawerOpen);
-const workContext = $derived.by(() => {
-if (page.route.id !== '/s/[id]' || !ui.workContext || ui.workContext.sessionId !== page.params.id) return null;
-try { return (sessionOrigin(page.url.search) ?? page.url.origin) === ui.workContext.host ? ui.workContext : null; }
-catch { return null; }
-});
 let previousMode: string;
 
 onMount(() => {
@@ -112,7 +106,7 @@ ui.drawerOpen = false;
 </aside>
 
 <div class="flex min-w-0 flex-1 flex-col">
-{#if (page.route.id === '/s/[id]' && (!desktop || ui.sidebarHidden)) || (page.route.id !== '/s/[id]' && page.route.id !== '/c/[id]')}
+{#if page.route.id !== '/s/[id]' && page.route.id !== '/c/[id]'}
 <header class="flex h-9 shrink-0 items-center gap-1 border-b border-neutral-200 px-2 pt-[env(safe-area-inset-top)]">
 <button
 type="button"
@@ -131,10 +125,7 @@ onclick={() => ui.toggleSidebar()}
 >
 <Icon name="sidebar" />
 </button>
-{#if workContext}
-<span class="min-w-0 flex-1 truncate text-xs font-medium">{workContext.workspaceName} · {new URL(workContext.host).host}</span>
-<a href="/s/{encodeURIComponent(workContext.sessionId)}/artifacts{page.url.search}" class="shrink-0 rounded px-2 py-1 text-xs">아티팩트</a>
-{:else}<a href="/" aria-label="Postudio 홈" class="ml-1 min-h-10 content-center text-sm font-semibold tracking-tight">{page.url.pathname === '/settings' ? '설정' : page.url.pathname === '/new' ? '새 작업' : 'Postudio'}</a>{/if}
+<a href="/" aria-label="Postudio 홈" class="ml-1 min-h-10 content-center text-sm font-semibold tracking-tight">{page.url.pathname === '/settings' ? '설정' : page.url.pathname === '/new' ? '새 작업' : 'Postudio'}</a>
 </header>
 {/if}
 <main bind:this={content} class="flex min-h-0 flex-1 flex-col">

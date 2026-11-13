@@ -23,6 +23,10 @@ chatOperationStore,
 chatRoots,
 classifyCompletionFailure,
 clearChatDraftIfUnchanged,
+clearChatTextFilesIfUnchanged,
+chatTextFilesStore,
+getChatTextFiles,
+setChatTextFiles,
 finishChatOperation,
 finishChatComposerMode,
 getChatComposerMode,
@@ -33,6 +37,8 @@ parseChatHistory,
 parseCreatedChat,
 parseCompletedMessage,
 parseSavedMessage,
+canSaveChatTextFiles,
+savedTextFilesMatch,
 restoreChatParent,
 setChatDraft,
 setChatParent,
@@ -47,6 +53,9 @@ type ChatMessage,
 type ChatOperation
 } from '$lib/chats';
 import Icon from '$lib/components/Icon.svelte';
+import AttachmentPreview from '$lib/components/AttachmentPreview.svelte';
+import { readAttachmentFiles, MAX_ATTACHMENTS, type DraftAttachment } from '$lib/attachments';
+import type { TextFileIn } from '$lib/types';
 import HistorySkeleton from '$lib/components/HistorySkeleton.svelte';
 import Markdown from '$lib/components/Markdown.svelte';
 import ModelSelect from '$lib/components/ModelSelect.svelte';
@@ -69,6 +78,17 @@ let titleDraft = $state('');
 let titleSaving = $state(false);
 let titleError = $state('');
 let titleInput = $state<HTMLInputElement>();
+let composerMenu = $state<HTMLDivElement>();
+let actionMenu = $state<HTMLDivElement>();
+let composerTrigger = $state<HTMLButtonElement>();
+let fileInput = $state<HTMLInputElement>();
+let textFiles = $state<TextFileIn[]>([]);
+let readingFiles = $state(false);
+let fileError = $state('');
+let fileReadToken = 0;
+let actionTrigger = $state<HTMLButtonElement>();
+let composerMenuOpen = $state(false);
+let actionMenuOpen = $state(false);
 let requestId = 0;
 let messageScroller = $state<HTMLDivElement>();
 let messageContent = $state<HTMLDivElement>();
@@ -97,7 +117,12 @@ return () => observer.disconnect();
 let entranceTimer: ReturnType<typeof setTimeout> | undefined;
 let enteringMessageId = $state('');
 let unsubscribeDraft = () => {};
-const ancestry = $derived(history ? chatAncestry(history.messages, selectedLeafId) : []);
+let unsubscribeTextFiles = () => {};
+const textFileKeys = new WeakMap<TextFileIn, number>();
+let nextTextFileKey = 0;
+function textFileKey(file: TextFileIn): number { let key = textFileKeys.get(file); if (key === undefined) { key = ++nextTextFileKey; textFileKeys.set(file, key); } return key; }
+const composerMode = $derived($chatComposerModeStore[activeChatId]);
+const ancestry = $derived(history ? chatAncestry(history.messages, composerMode?.kind === 'edit' ? composerMode.messageId : selectedLeafId) : []);
 const roots = $derived(history ? chatRoots(history.messages) : []);
 const selectedParentMissing = $derived(Boolean(selectedLeafId && !history?.messages.some((message) => message.messageId === selectedLeafId)));
 const saving = $derived($chatBusyStore[activeChatId] ?? false);
@@ -160,6 +185,61 @@ function refreshCurrent() {
 void refreshHistory(activeChatId);
 }
 
+let activeMenu: 'composer' | 'actions' | null = null;
+let menuPositionCleanup: (() => void) | undefined;
+function placeMenu(menu: HTMLDivElement, trigger: HTMLButtonElement) {
+const rect = trigger.getBoundingClientRect();
+const gap = 8;
+const width = menu.getBoundingClientRect().width;
+const height = menu.getBoundingClientRect().height;
+menu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - width - 12))}px`;
+menu.style.top = `${Math.max(12, rect.top - height - gap)}px`;
+}
+function stopMenuPositionTracking() {
+menuPositionCleanup?.(); menuPositionCleanup = undefined;
+}
+function closeMenu(which: 'composer' | 'actions', restore = false) {
+const menu = which === 'composer' ? composerMenu : actionMenu;
+menu?.hidePopover();
+if (activeMenu === which) { activeMenu = null; stopMenuPositionTracking(); }
+if (restore) (which === 'composer' ? composerTrigger : actionTrigger)?.focus();
+}
+function handleMenuToggle(which: 'composer' | 'actions', event: ToggleEvent) {
+const menu = which === 'composer' ? composerMenu : actionMenu;
+const isOpen = event.newState === 'open';
+if (which === 'composer') composerMenuOpen = isOpen;
+else actionMenuOpen = isOpen;
+if (!isOpen) {
+if (activeMenu === which) { activeMenu = null; stopMenuPositionTracking(); }
+return;
+}
+stopMenuPositionTracking();
+activeMenu = which;
+const trigger = which === 'composer' ? composerTrigger : actionTrigger;
+if (!menu || !trigger) return;
+menu.style.margin = '0'; menu.style.inset = 'auto';
+placeMenu(menu, trigger);
+if (which === 'actions') menu.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+const reposition = () => { if (activeMenu === which) placeMenu(menu, trigger); };
+window.addEventListener('resize', reposition);
+window.addEventListener('scroll', reposition, true);
+menuPositionCleanup = () => { window.removeEventListener('resize', reposition); window.removeEventListener('scroll', reposition, true); };
+}
+function handleMenuKeydown(event: KeyboardEvent, which: 'composer' | 'actions') {
+if (event.key === 'Escape') { event.preventDefault(); closeMenu(which, true); return; }
+if (which !== 'actions') return;
+const menu = actionMenu; if (!menu) return;
+const items = [...menu.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')];
+const index = items.indexOf(document.activeElement as HTMLButtonElement);
+let next = index;
+if (event.key === 'ArrowDown') next = (index + 1) % items.length;
+else if (event.key === 'ArrowUp') next = (index - 1 + items.length) % items.length;
+else if (event.key === 'Home') next = 0;
+else if (event.key === 'End') next = items.length - 1;
+else return;
+event.preventDefault(); items[next]?.focus();
+}
+
 function beginTitleEdit() {
 if (!history || titleSaving) return;
 titleDraft = history.title;
@@ -208,8 +288,12 @@ if (activeChatId !== id || history?.chatId !== id) return;
 history = { ...history, title: saved.title };
 titleDraft = saved.title;
 titleEditing = false;
+ui.notify('채팅 제목을 저장했습니다.');
 } catch (cause) {
-if (activeChatId === id) titleError = cause instanceof Error ? cause.message : '제목을 저장하지 못했습니다.';
+if (activeChatId === id) {
+titleError = cause instanceof Error ? cause.message : '제목을 저장하지 못했습니다.';
+ui.notify('채팅 제목을 저장하지 못했습니다.', 'error');
+}
 } finally {
 if (activeChatId === id) titleSaving = false;
 }
@@ -249,11 +333,15 @@ if (request === olderRequestId && id === activeChatId) olderLoading = false;
 
 function watchDraft(chatId: string) {
 unsubscribeDraft();
+unsubscribeTextFiles();
+fileReadToken++; readingFiles = false;
 if (!chatId) return;
 unsubscribeDraft = chatDraftStore(chatId).subscribe((value) => (draft = value));
+unsubscribeTextFiles = chatTextFilesStore(chatId).subscribe((value) => (textFiles = value));
 }
 
 function afterRouteNavigation() {
+if (activeMenu) closeMenu(activeMenu);
 const nextId = page.params.id ?? '';
 if (nextId !== activeChatId) {
 if (entranceTimer !== undefined) window.clearTimeout(entranceTimer);
@@ -291,7 +379,11 @@ const timer = window.setInterval(() => void refreshHistory(activeChatId, false),
 return () => {
 window.clearInterval(timer);
 if (entranceTimer !== undefined) window.clearTimeout(entranceTimer);
+if (activeMenu) closeMenu(activeMenu);
+stopMenuPositionTracking();
 unsubscribeDraft();
+unsubscribeTextFiles();
+fileReadToken++; readingFiles = false;
 };
 });
 
@@ -328,12 +420,24 @@ if (message.parentId && !history?.messages.some((candidate) => candidate.message
 const id = activeChatId;
 const mode = startChatEdit(id, message, selectedLeafId || null);
 selectedLeafId = mode.parentId ?? '';
-void focusComposer(id);
+void tick().then(() => document.getElementById('chat-edit-text')?.focus());
 }
 
 function cancelComposerMode() {
 const mode = cancelChatComposerMode(activeChatId);
-if (mode) selectedLeafId = mode.previousParentId ?? '';
+if (mode) {
+selectedLeafId = mode.previousParentId ?? '';
+if (mode.kind === 'edit') void tick().then(() => document.getElementById(`chat-edit-${mode.messageId}`)?.focus());
+}
+}
+
+function cancelInlineEdit() {
+if (saving) return;
+cancelComposerMode();
+}
+
+function onInlineEditKeydown(event: KeyboardEvent) {
+if (event.key === 'Escape') { event.preventDefault(); cancelInlineEdit(); }
 }
 
 function selectBranch(message: ChatMessage) {
@@ -447,26 +551,47 @@ error: disposition === 'unknown'
 async function saveMessage(generate: boolean) {
 const id = activeChatId;
 const text = draft;
+const submittedFiles = getChatTextFiles(activeChatId);
 const requestedModelId = generate ? modelId : '';
-if (!history || history.chatId !== id || !text.trim() || saving) return;
-if (selectedParentMissing) {
+const submittedMode = getChatComposerMode(id);
+if (!history || history.chatId !== id || saving || readingFiles) return;
+const originalFiles = submittedMode?.kind === 'edit' ? (history?.messages.find((m) => m.messageId === submittedMode.messageId)?.textFiles ?? []) : submittedFiles;
+if (!text.trim() && originalFiles.length === 0) return;
+if (!canSaveChatTextFiles(capabilities, capabilityError || (capabilityLoading ? 'loading' : ''), originalFiles)) { saveError = '텍스트 첨부 기능을 확인할 수 없어 파일을 저장하지 않았습니다.'; ui.notify('텍스트 첨부 기능을 확인할 수 없어 저장하지 않았습니다.', 'error'); return; }
+if (originalFiles.length > 10 || originalFiles.reduce((n, f) => n + new TextEncoder().encode(f.text).byteLength, 0) > 1048576) { saveError = '첨부는 최대 10개, 전체 1 MiB까지 가능합니다.'; return; }
+
+if (submittedMode?.kind === 'edit' && submittedMode.parentId && !history.messages.some((message) => message.messageId === submittedMode.parentId)) {
+saveError = '선택한 부모 메시지를 불러온 뒤 저장할 수 있습니다. 이전 기록을 불러오세요.';
+return;
+}
+if (selectedParentMissing && submittedMode?.kind !== 'edit') {
 saveError = '선택한 부모 메시지를 불러온 뒤 저장할 수 있습니다. 이전 기록을 불러오세요.';
 return;
 }
 if (generate && (!completionConfigured || !requestedModelId)) return;
-const parentId = selectedLeafId || null;
+const parentId = submittedMode?.kind === 'edit' ? submittedMode.parentId : selectedLeafId || null;
 const submittedDraft = getChatDraftSnapshot(id);
-const submittedMode = getChatComposerMode(id);
 if (!beginChatOperation(id, null, requestedModelId, 'saving')) return;
 saveError = '';
 try {
 let saved: ChatMessage;
 try {
-saved = parseSavedMessage(await postJson<unknown>(`/api/chats/${encodeURIComponent(id)}/messages`, { text, parentId }));
+saved = parseSavedMessage(await postJson<unknown>(`/api/chats/${encodeURIComponent(id)}/messages`, { text, parentId, ...(originalFiles.length ? { textFiles: originalFiles } : {}) }));
 } catch (cause) {
 const detail = cause instanceof Error ? cause.message : '알 수 없는 오류';
 updateChatOperation(id, null, { status: 'save-failed', error: detail });
-if (id === activeChatId) saveError = `메시지를 저장하지 못했습니다. ${detail}`;
+if (id === activeChatId) {
+saveError = `메시지를 저장하지 못했습니다. ${detail}`;
+ui.notify('메시지를 저장하지 못했습니다.', 'error');
+}
+return;
+}
+if (!savedTextFilesMatch(saved.textFiles, originalFiles)) {
+updateChatOperation(id, null, { status: 'save-failed', error: '서버가 첨부 파일을 보존하지 않았습니다.' });
+if (id === activeChatId) {
+saveError = '서버가 첨부 파일을 보존하지 않아 초안을 유지했습니다.';
+ui.notify('서버가 첨부 파일을 보존하지 않아 저장하지 않았습니다.', 'error');
+}
 return;
 }
 const submittedContextStillCurrent = submittedMode
@@ -474,10 +599,12 @@ const submittedContextStillCurrent = submittedMode
 : !getChatComposerMode(id);
 if (submittedContextStillCurrent) {
 clearChatDraftIfUnchanged(id, submittedDraft);
+if (submittedMode?.kind !== 'edit') clearChatTextFilesIfUnchanged(id, submittedFiles);
 advanceChatParentIfUnchanged(id, parentId, saved.messageId);
 }
 bindChatOperationMessage(id, requestedModelId, saved.messageId, generate ? 'generating' : 'saved-only');
 appendMessage(id, saved);
+if (id === activeChatId && !generate) ui.notify(submittedMode?.kind === 'edit' ? '메시지를 새 분기로 저장했습니다.' : '메시지를 저장했습니다.');
 if (submittedContextStillCurrent) void scrollToLatest(id, true);
 if (generate) await requestCompletion(id, saved.messageId, requestedModelId);
 else if (id === activeChatId) void refreshHistory(id);
@@ -491,6 +618,35 @@ event.preventDefault();
 await saveMessage(true);
 }
 
+async function readSelectedFiles(event: Event) {
+const files = [...((event.currentTarget as HTMLInputElement).files ?? [])];
+(event.currentTarget as HTMLInputElement).value = '';
+if (!files.length) return;
+const id = activeChatId, token = ++fileReadToken; readingFiles = true; fileError = '';
+try {
+if (files.some((f) => /\.(png|jpe?g|gif|webp)$/i.test(f.name) || f.type.startsWith('image/'))) throw new Error('일반 채팅은 TXT/MD 파일만 지원합니다. 이미지는 첨부할 수 없습니다.');
+const current = getChatTextFiles(id);
+const currentDrafts: DraftAttachment[] = current.map((attachment) => ({ key: textFileKey(attachment), attachment: { kind: 'text', ...attachment }, size: new TextEncoder().encode(attachment.text).byteLength }));
+const result = await readAttachmentFiles(files, currentDrafts, nextTextFileKey);
+if (token !== fileReadToken || id !== activeChatId) return;
+let total = currentDrafts.reduce((n, f) => n + f.size, 0);
+const accepted = [...current];
+for (const item of result.attachments.slice(currentDrafts.length)) {
+if (item.attachment.kind !== 'text') continue;
+const size = new TextEncoder().encode(item.attachment.text).byteLength;
+if (accepted.length >= 10 || total + size > 1048576) { fileError = '첨부는 최대 10개, 전체 1 MiB까지 가능합니다.'; break; }
+const value = { name: item.attachment.name, text: item.attachment.text }; textFileKeys.set(value, ++nextTextFileKey); accepted.push(value); total += size;
+}
+if (result.error) { fileError = result.error; ui.notify(result.error, 'error'); }
+setChatTextFiles(id, accepted);
+} catch (cause) { if (token === fileReadToken && id === activeChatId) { fileError = cause instanceof Error ? cause.message : '파일을 읽지 못했습니다.'; ui.notify(fileError, 'error'); } }
+finally { if (token === fileReadToken && id === activeChatId) readingFiles = false; }
+}
+
+function removeTextFile(key: number | string) {
+setChatTextFiles(activeChatId, textFiles.filter((file) => textFileKey(file) !== key));
+}
+
 function saveOnlyMessage() {
 void saveMessage(false);
 }
@@ -502,6 +658,7 @@ event.preventDefault();
 }
 
 async function generateForMessage(userMessageId: string) {
+if (getChatComposerMode(activeChatId)?.kind === 'edit') return;
 const id = activeChatId;
 const requestedModelId = modelId;
 if (!completionConfigured || !requestedModelId || saving) return;
@@ -515,6 +672,7 @@ finishChatOperation(id);
 }
 
 async function retryCompletion(operation: ChatOperation) {
+if (getChatComposerMode(activeChatId)?.kind === 'edit') return;
 if (!operation.userMessageId || !operation.modelId || saving) return;
 if (!beginChatOperation(operation.chatId, operation.userMessageId, operation.modelId, 'generating')) return;
 try {
@@ -563,15 +721,15 @@ ui.drawerOpen = true;
 {#snippet branchPicker(messages: ChatMessage[], selectedId: string | undefined, label: string)}
 <div class="branch-picker my-1 flex min-h-11 max-w-full items-center justify-between gap-3 border-l-2 border-[#d0d0d4] pl-2 text-neutral-600 dark:text-neutral-300" aria-label={label + ' 탐색'}>
 <div class="flex min-w-0 items-center gap-1">
-<button type="button" aria-label={'이전 ' + label} disabled={messages.length < 2} class="flex size-11 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-30 dark:hover:bg-neutral-800" onclick={() => moveSibling(messages, selectedId, -1)}><Icon name="chevron" class="size-3 rotate-180" /></button>
+<button type="button" aria-label={'이전 ' + label} disabled={messages.length < 2 || composerMode?.kind === 'edit'} class="flex size-11 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-30 dark:hover:bg-neutral-800" onclick={() => moveSibling(messages, selectedId, -1)}><Icon name="chevron" class="size-3 rotate-180" /></button>
 <span class="min-w-[72px] text-center text-[13px] font-semibold tabular-nums">{Math.max(0, messages.findIndex((message) => message.messageId === selectedId) + 1)} / {messages.length}</span>
-<button type="button" aria-label={'다음 ' + label} disabled={messages.length < 2} class="flex size-11 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-30 dark:hover:bg-neutral-800" onclick={() => moveSibling(messages, selectedId, 1)}><Icon name="chevron" class="size-3" /></button>
+<button type="button" aria-label={'다음 ' + label} disabled={messages.length < 2 || composerMode?.kind === 'edit'} class="flex size-11 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-30 dark:hover:bg-neutral-800" onclick={() => moveSibling(messages, selectedId, 1)}><Icon name="chevron" class="size-3" /></button>
 </div>
 <details class="message-actions relative shrink-0">
 <summary aria-label={label + ' 목록 열기'} class="flex min-h-10 cursor-pointer list-none items-center gap-2 rounded-lg px-3 text-xs hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800"><Icon name="chevron" class="size-3 rotate-90" />목록</summary>
 <div class="absolute right-0 top-10 z-20 max-h-56 w-72 max-w-[min(80vw,22rem)] overflow-y-auto rounded-[14px] border border-neutral-200 bg-neutral-50 p-1.5 shadow-lg dark:border-neutral-700 dark:bg-neutral-900">
 {#each messages as message, index (message.messageId)}
-<button type="button" aria-pressed={selectedId === message.messageId} aria-current={selectedId === message.messageId ? 'true' : undefined} class="flex min-h-11 w-full items-center gap-3 rounded-[10px] px-2 text-left text-[13px] hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 aria-pressed:bg-neutral-100 dark:hover:bg-neutral-800 dark:aria-pressed:bg-neutral-800" onclick={(event) => { selectBranch(message); const menu = event.currentTarget.closest('details'); if (menu) { menu.open = false; menu.querySelector('summary')?.focus(); } }}><span class="flex size-[26px] shrink-0 items-center justify-center rounded-lg bg-neutral-200 text-xs font-semibold dark:bg-neutral-700">{index + 1}</span><span class="truncate">{chatMessagePreview(message)}</span></button>
+<button type="button" disabled={composerMode?.kind === 'edit'} aria-pressed={selectedId === message.messageId} aria-current={selectedId === message.messageId ? 'true' : undefined} class="flex min-h-11 w-full items-center gap-3 rounded-[10px] px-2 text-left text-[13px] hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 aria-pressed:bg-neutral-100 dark:hover:bg-neutral-800 dark:aria-pressed:bg-neutral-800" onclick={(event) => { selectBranch(message); const menu = event.currentTarget.closest('details'); if (menu) { menu.open = false; menu.querySelector('summary')?.focus(); } }}><span class="flex size-[26px] shrink-0 items-center justify-center rounded-lg bg-neutral-200 text-xs font-semibold dark:bg-neutral-700">{index + 1}</span><span class="truncate">{chatMessagePreview(message)}</span></button>
 {/each}
 </div>
 </details>
@@ -579,14 +737,11 @@ ui.drawerOpen = true;
 {/snippet}
 
 <div class="flex min-h-0 min-w-0 flex-1 flex-col">
-<header class="flex h-14 shrink-0 items-center justify-between gap-3 border-b border-neutral-200 bg-white px-4 pt-[env(safe-area-inset-top)] dark:border-neutral-800 dark:bg-neutral-950 sm:px-6">
+<header class="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-neutral-200 bg-white px-4 pt-[env(safe-area-inset-top)] dark:border-neutral-800 dark:bg-neutral-950 sm:px-6">
 <div class="flex min-w-0 items-center gap-2">
 <button type="button" class="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 lg:hidden" aria-label="메뉴 열기" onclick={toggleDrawer}><Icon name="menu" class="size-4" /></button>
 {#if ui.sidebarHidden}<button type="button" class="hidden size-9 shrink-0 items-center justify-center rounded-lg hover:bg-neutral-100 lg:flex" aria-label="사이드바 펼치기" onclick={() => ui.toggleSidebar()}><Icon name="sidebar" class="size-4" /></button>{/if}
-<span aria-hidden="true" class="hidden size-6 shrink-0 items-center justify-center rounded-full bg-neutral-900 text-xs text-white sm:flex">✦</span>
-<div class="min-w-0 max-w-64"><ModelSelect id="chat-response-model" bind:value={modelId} label="응답 모델" compact initialFromCatalog disabled={saving} /></div>
-</div>
-<div class="flex min-w-0 items-center gap-2">
+<div class="flex min-w-0 flex-1 items-center gap-2">
 {#if titleEditing && history}
 <form class="flex min-w-0 items-center gap-1" onsubmit={(event) => { event.preventDefault(); void saveChatTitle(); }}>
 <input bind:this={titleInput} bind:value={titleDraft} aria-label="채팅 제목" aria-describedby={titleError ? 'chat-title-error' : undefined} maxlength="300" class="min-w-0 w-36 rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-sky-600 focus:ring-2 focus:ring-sky-200 sm:w-56 dark:border-neutral-700 dark:bg-neutral-900" disabled={titleSaving} onkeydown={handleTitleKeydown} />
@@ -597,6 +752,9 @@ ui.drawerOpen = true;
 <h1 class="min-w-0 max-w-[48vw] truncate text-sm font-medium text-neutral-800 dark:text-neutral-100">{history ? chatDisplayTitle(history, history.messages, {}, $chatTitleOverrides) : '새 채팅'}</h1>
 {#if history}<button type="button" class="flex size-9 shrink-0 items-center justify-center rounded-lg text-neutral-600 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:text-neutral-300 dark:hover:bg-neutral-800" aria-label="채팅 제목 수정" title="채팅 제목 수정" onclick={beginTitleEdit}><Icon name="edit" class="size-4" /></button>{/if}
 {/if}
+</div>
+</div>
+<div class="flex shrink-0 items-center gap-2">
 <details class="relative shrink-0">
 <summary class="flex size-9 cursor-pointer list-none items-center justify-center rounded-full text-neutral-600 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800" aria-label="대화 옵션"><Icon name="sliders" /></summary>
 <div class="absolute right-0 top-10 z-20 w-72 rounded-xl border border-neutral-200 bg-white p-3 text-xs text-neutral-700 shadow-lg dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200">
@@ -667,7 +825,18 @@ ui.drawerOpen = true;
 {#if message.role === 'assistant'}
 <header class="mb-2 text-[13px] text-neutral-600 dark:text-neutral-300"><span class="font-medium">{message.model || 'AI 응답'}</span></header>
 {/if}
+{#if composerMode?.kind === 'edit' && composerMode.messageId === message.messageId}
+<form class="flex flex-col gap-3 rounded-[14px] border border-[#2b59c3] bg-[#f8faff] p-4 dark:border-[#7395e8] dark:bg-[#151b2a]" onsubmit={(event) => { event.preventDefault(); void saveMessage(false); }}>
+<label for="chat-edit-text" class="text-xs font-medium text-[#2b59c3] dark:text-[#9db5ff]">내 메시지 수정</label>
+<textarea id="chat-edit-text" aria-label="메시지 수정" value={draft} oninput={updateDraft} onkeydown={onInlineEditKeydown} disabled={saving || selectedParentMissing} rows="3" class="w-full resize-y border-0 bg-transparent p-0 text-[15.5px] leading-[1.6] outline-none focus-visible:ring-0 disabled:opacity-60"></textarea>
+{#if message.textFiles.length}<AttachmentPreview items={message.textFiles.map((attachment, fileIndex) => ({ key: `${message.messageId}-${fileIndex}`, attachment: { kind: 'text', ...attachment } }))} />{/if}<p class="text-xs text-neutral-600 dark:text-neutral-300">수정한 내용은 원본을 바꾸지 않고 새 분기로 저장됩니다.</p>
+{#if saveError}<p role="alert" class="text-sm text-red-700 dark:text-red-300">{saveError}</p>{/if}
+<div class="flex justify-end gap-2"><button type="button" class="h-9 min-h-9 rounded-lg px-3 text-sm hover:bg-neutral-100 disabled:opacity-50 dark:hover:bg-neutral-800" disabled={saving} onclick={cancelInlineEdit}>취소</button><button type="submit" class="h-9 min-h-9 rounded-lg bg-[#2b59c3] px-4 text-sm font-medium text-white disabled:opacity-40 dark:bg-[#7395e8] dark:text-[#101522]" disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !(history.messages.find((m) => m.messageId === message.messageId)?.textFiles.length))}>{saving ? '저장 중…' : '새 분기로 저장'}</button></div>
+</form>
+{:else}
 <div class={message.role === 'user' ? "ml-auto w-fit max-w-[80%] rounded-[20px] bg-[#f0f0f2] px-[18px] py-[11px] text-[15.5px] leading-[1.65] text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100" : "break-words text-[15.5px] leading-[1.75]"}><Markdown text={message.text} lineHeight="inherit" /></div>
+{/if}
+{#if message.textFiles.length}<AttachmentPreview items={message.textFiles.map((attachment, fileIndex) => ({ key: `${message.messageId}-${fileIndex}`, attachment: { kind: 'text', ...attachment } }))} />{/if}
 {#if message.role === 'user'}
 {#if operation?.status === 'observing'}
 <p role="status" class="mt-2 inline-flex items-center gap-2 text-xs text-neutral-700 dark:text-neutral-300"><span class="pending-dots" aria-hidden="true"><span></span><span></span><span></span></span>이미 시작된 요청 결과를 기록에서 확인 중입니다. 요청을 다시 보내지 않습니다.</p>
@@ -684,7 +853,7 @@ ui.drawerOpen = true;
 {:else if operation?.status === 'failed'}
 <div role="alert" class="mt-2 flex flex-wrap items-center gap-2 text-xs text-red-700 dark:text-red-300">
 <span>AI 응답 생성 실패 · {operation.error}</span>
-<button type="button" class="min-h-8 underline underline-offset-4" disabled={saving} onclick={() => retryCompletion(operation)}>같은 저장 메시지와 {operation.modelId} 모델로 다시 시도</button>
+{#if composerMode?.kind !== 'edit'}<button type="button" class="min-h-8 underline underline-offset-4" disabled={saving} onclick={() => retryCompletion(operation)}>같은 저장 메시지와 {operation.modelId} 모델로 다시 시도</button>{/if}
 </div>
 {:else if operation?.status === 'completed'}
 <p role="status" class="sr-only">AI 응답 완료</p>
@@ -694,14 +863,16 @@ ui.drawerOpen = true;
 <p class="mt-2 text-xs text-neutral-600 dark:text-neutral-300">이 메시지에 AI 응답이 없습니다. 서버에서 응답 생성을 사용할 수 없습니다.</p>
 {/if}
 {/if}
+{#if composerMode?.kind !== 'edit'}
 <div class="message-action-chips flex flex-wrap items-center gap-x-1 gap-y-1 text-[12.5px] text-neutral-600 dark:text-neutral-400" class:justify-end={message.role === 'user'}>
 {#if message.role === 'user'}
-<button type="button" aria-label="수정" disabled={saving || Boolean(message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId))} title={message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId) ? '이전 부모 메시지를 불러온 뒤 수정할 수 있습니다.' : undefined} class="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={() => editMessage(message)}><Icon name="edit" class="size-3.5" /><span>수정</span></button>
+<button type="button" aria-label="수정" id={`chat-edit-${message.messageId}`} disabled={saving || Boolean(message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId))} title={message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId) ? '이전 부모 메시지를 불러온 뒤 수정할 수 있습니다.' : undefined} class="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={() => editMessage(message)}><Icon name="edit" class="size-3.5" /><span>수정</span></button>
 {#if message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId)}<span class="self-center text-xs text-amber-800 dark:text-amber-200">수정하려면 이전 부모 메시지를 불러오세요.</span>{/if}
 {/if}
 <button type="button" aria-label="여기서 포크하기" disabled={saving} class="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={() => forkFromMessage(message)}><Icon name="fork" class="size-3.5" /><span>여기서 포크하기</span></button>
 </div>
-{#if message.role === 'user' && !hasAssistant && completionConfigured && modelId && (!operation || operation.status === 'saved-only')}
+{/if}
+{#if composerMode?.kind !== 'edit' && message.role === 'user' && !hasAssistant && completionConfigured && modelId && (!operation || operation.status === 'saved-only')}
 <details class="message-actions absolute right-0 top-full z-10 w-fit text-neutral-500">
 <summary aria-label="추가 생성 작업" class="flex size-8 cursor-pointer list-none items-center justify-center rounded-md text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800">⋯</summary>
 <div class="absolute right-0 top-8 z-20 w-52 rounded-xl border border-neutral-200 bg-white p-1 shadow-sm dark:border-neutral-700 dark:bg-neutral-900">
@@ -732,7 +903,7 @@ ui.drawerOpen = true;
 </div>
 {/if}
 
-{#if history}
+{#if history && composerMode?.kind !== 'edit'}
 <footer class="mx-auto w-full max-w-[808px] shrink-0 bg-white px-4 pb-3 pt-2 sm:px-6 dark:bg-neutral-950">
 {#if selectedLeafId}
 {@const selectedParent = history.messages.find((message) => message.messageId === selectedLeafId)}
@@ -779,33 +950,33 @@ ui.drawerOpen = true;
  placeholder={selectedParentMissing ? '선택한 부모 메시지를 불러온 뒤 작성할 수 있습니다.' : saving ? '저장 또는 응답 생성 중입니다…' : '메시지를 작성하세요. Enter 전송 · Shift+Enter 줄 바꿈'}
  class="max-h-48 w-full resize-none rounded-xl bg-transparent p-0 text-[15.5px] leading-[1.6] outline-none placeholder:text-neutral-600 dark:placeholder:text-neutral-300 disabled:opacity-60"
 ></textarea>
-<div class="flex items-center justify-between gap-2 px-1">
+{#if textFiles.length}<AttachmentPreview items={textFiles.map((attachment) => ({ key: textFileKey(attachment), attachment: { kind: 'text', ...attachment }, size: new TextEncoder().encode(attachment.text).byteLength }))} removable={!saving && !readingFiles} onremove={removeTextFile} />{/if}{#if readingFiles}<p role="status" class="px-1 text-xs">파일을 읽는 중입니다.</p>{/if}{#if fileError}<p role="alert" class="px-1 text-xs text-red-700">{fileError}</p>{/if}<div class="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
 <div class="flex min-w-0 flex-1 items-center gap-2">
-<details class="relative">
-<summary aria-label="추가 메시지 작업" class="flex size-9 cursor-pointer list-none items-center justify-center rounded-full border border-neutral-200 text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800">+</summary>
-<div class="absolute bottom-11 left-0 z-20 w-64 max-w-[80vw] rounded-[14px] border border-neutral-200 bg-neutral-50 p-1.5 shadow-lg dark:border-neutral-700 dark:bg-neutral-900">
-<button type="button" disabled={saving || selectedParentMissing || !draft.trim()} onclick={saveOnlyMessage} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800">메시지만 저장</button>
-{#if selectedLeafId}<button type="button" class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800" onclick={clearParent}>새 시작 분기</button>{/if}
-</div></details>
-<p class="text-xs text-neutral-500" class:sr-only={!saving && !capabilityLoading && !capabilityError && completionConfigured}>
-{#if saving}요청 처리 중입니다. 중복 전송은 막혀 있습니다.
-{:else if capabilityLoading}기능 상태 확인 중입니다. AI 요청은 상태 확인 뒤에 활성화됩니다.
-{:else if capabilityError}AI 상태를 확인할 수 없습니다. 저장만 하거나 상태를 다시 확인하세요.
-{:else if capabilities?.completion.configured}보내기는 메시지를 한 번 저장한 뒤 선택한 모델에 AI 응답을 요청합니다.
-{:else}AI 응답을 사용할 수 없습니다. 저장만 하거나 서버 기능 상태를 다시 확인하세요.
-{/if}
-</p>
+<button type="button" aria-label="첨부 및 도구" aria-haspopup="dialog" aria-expanded={composerMenuOpen} bind:this={composerTrigger} popovertarget="chat-composer-menu" onkeydown={(event) => handleMenuKeydown(event, 'composer')} class="flex size-9 shrink-0 items-center justify-center rounded-full border border-neutral-200 text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800">+</button>
+<div id="chat-composer-menu" bind:this={composerMenu} popover="auto" role="dialog" tabindex="-1" aria-label="첨부 및 도구" onkeydown={(event) => handleMenuKeydown(event, 'composer')} ontoggle={(event) => handleMenuToggle('composer', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-72 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-3 text-sm shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" disabled={!capabilities?.textAttachments?.supported || saving || readingFiles} class="min-h-11 w-full text-left disabled:opacity-50" onclick={() => { closeMenu('composer'); fileInput?.click(); }}>파일 첨부</button><button type="button" disabled class="min-h-11 w-full text-left opacity-50">도구</button><p class="text-xs text-neutral-600 dark:text-neutral-300">{#if capabilities?.textAttachments?.supported}일반 채팅은 TXT/MD 파일만 지원합니다. 최대 10개, 전체 1 MiB까지 첨부할 수 있습니다. 이미지는 아직 지원하지 않습니다.{:else}현재 서버는 일반 채팅 첨부를 지원하지 않습니다. 서버 업데이트가 필요합니다.{/if}</p><input bind:this={fileInput} class="sr-only" type="file" accept=".txt,.md,text/plain,text/markdown" multiple disabled={!capabilities?.textAttachments?.supported || saving || readingFiles} onchange={readSelectedFiles} /></div>
+<div class="min-w-0 shrink-0"><ModelSelect id="chat-response-model" bind:value={modelId} label="응답 모델" compact initialFromCatalog disabled={saving} /></div>
+<button type="button" aria-label="메시지 작업" aria-haspopup="menu" aria-expanded={actionMenuOpen} bind:this={actionTrigger} popovertarget="chat-action-menu" class="flex size-9 shrink-0 items-center justify-center rounded-full hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800">⋯</button>
+<div id="chat-action-menu" bind:this={actionMenu} popover="auto" role="menu" tabindex="-1" aria-label="메시지 작업" onkeydown={(event) => handleMenuKeydown(event, 'actions')} ontoggle={(event) => handleMenuToggle('actions', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-64 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" role="menuitem" disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length)} onclick={() => { closeMenu('actions', true); saveOnlyMessage(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800">메시지만 저장</button>{#if selectedLeafId}<button type="button" role="menuitem" onclick={() => { closeMenu('actions', true); clearParent(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800">새 시작 분기</button>{/if}</div>
+
 </div>
 <div class="flex items-center gap-2">
 <button
  type="submit"
- disabled={saving || selectedParentMissing || !draft.trim() || !completionConfigured || !modelId}
+ disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length) || !completionConfigured || !modelId}
  class="flex size-9 items-center justify-center rounded-full bg-black text-sm font-medium text-white hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:bg-white dark:text-black"
 >
 {#if saving}<span class="sr-only">생성 중</span>{:else if capabilityLoading}<span class="sr-only">상태 확인 중</span>{:else if capabilityError}<span class="sr-only">AI 상태 확인 필요</span>{:else if !completionConfigured}<span class="sr-only">AI 응답 사용 불가</span>{:else if !modelId}<span class="sr-only">모델 선택 필요</span>{:else}<span class="sr-only">전송</span>{/if}<Icon name="chevron" class="size-4 -rotate-90" />
 </button>
 </div>
 </div>
+<p class="min-w-0 break-words text-xs text-neutral-500" class:sr-only={!saving && !capabilityLoading && !capabilityError && completionConfigured}>
+{#if saving}<span role="status">요청 처리 중입니다. 중복 전송은 막혀 있습니다. 중지 기능은 서버에서 지원하지 않습니다.</span>
+{:else if capabilityLoading}기능 상태 확인 중입니다. AI 요청은 상태 확인 뒤에 활성화됩니다.
+{:else if capabilityError}AI 상태를 확인할 수 없습니다. 저장만 하거나 상태를 다시 확인하세요.
+{:else if capabilities?.completion.configured}보내기는 메시지를 한 번 저장한 뒤 선택한 모델에 AI 응답을 요청합니다.
+{:else}AI 응답을 사용할 수 없습니다. 저장만 하거나 서버 기능 상태를 다시 확인하세요.
+{/if}
+</p>
 </form>
 <p class="mt-2 text-center text-[12px] text-neutral-600 dark:text-neutral-300">AI는 실수할 수 있어요. 중요한 내용은 다시 확인하세요.</p>
 </footer>

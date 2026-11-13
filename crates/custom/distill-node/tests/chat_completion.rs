@@ -125,6 +125,7 @@ fn fixture() -> (tempfile::TempDir, Store, String) {
             role: "user".into(),
             text: "first question".into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
     store
@@ -135,6 +136,7 @@ fn fixture() -> (tempfile::TempDir, Store, String) {
             role: "assistant".into(),
             text: "prior answer".into(),
             model: Some("old-model".into()),
+            text_files: Vec::new(),
         })
         .unwrap();
     store
@@ -145,6 +147,7 @@ fn fixture() -> (tempfile::TempDir, Store, String) {
             role: "user".into(),
             text: "second question".into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
     store
@@ -155,6 +158,7 @@ fn fixture() -> (tempfile::TempDir, Store, String) {
             role: "user".into(),
             text: "other branch".into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
     (dir, store, "target".into())
@@ -252,6 +256,7 @@ async fn progress_get_tracks_only_its_chat_and_resolves_saved_answer_without_gen
             role: "user".into(),
             text: "other question".into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
 
@@ -341,6 +346,7 @@ async fn imported_user_message_cannot_authorize_local_completion() {
             role: "user".into(),
             text: "remote question".into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
     let identity = source.identity();

@@ -1,5 +1,5 @@
 <script lang="ts">
-import { onDestroy, tick } from 'svelte';
+import { onDestroy, tick, untrack } from 'svelte';
 import { getJson } from '$lib/api';
 import Icon from '$lib/components/Icon.svelte';
 import { defaultModelGroups, groupModels, isAutoModel, modelProvider, moveMenuIndex, moveModelIndex } from '$lib/models';
@@ -44,6 +44,7 @@ let popup = $state<HTMLDivElement>();
 let root = $state<HTMLDivElement>();
 let repositionCleanup: (() => void) | undefined;
 let input = $state<HTMLInputElement>();
+let selectionFocusPending = $state(false);
 let catalogModels = $derived(catalog?.availableModels ?? []);
 let menuGroups = $derived(defaultModelGroups(catalogModels));
 let autoModel = $derived(catalogModels.find(isAutoModel));
@@ -66,6 +67,8 @@ const listId = $derived(`${id}-listbox`);
 
 $effect(() => {
 const destination = host;
+selectionFocusPending = false;
+untrack(closeMenu);
 let active = true;
 catalog = null;
 loading = true;
@@ -108,12 +111,13 @@ const rect = root?.getBoundingClientRect();
 if (!rect) return;
 const viewportWidth = window.innerWidth;
 const availableWidth = Math.max(0, viewportWidth - 24);
-popupWidth = Math.min(Math.max(rect.width, twoColumns ? 432 : 288), availableWidth);
+popupWidth = Math.min(290, availableWidth);
 popupLeft = Math.max(12, Math.min(rect.left, viewportWidth - popupWidth - 12));
 const rootHeight = rootEntries.length * 40 + 8;
 const searchHeight = searchModels.length * 40 + searchGroups.length * 28 + 12;
 const submenuHeight = submenuModels.length * 40 + 36;
-const wantedHeight = Math.min(360, Math.max(64, query.trim() ? searchHeight : submenuProvider ? Math.max(rootHeight, submenuHeight) : rootHeight));
+const compactSearchHeight = compact ? 44 : 0;
+const wantedHeight = Math.min(360, Math.max(64, query.trim() ? searchHeight : submenuProvider ? Math.max(rootHeight, submenuHeight) : rootHeight) + compactSearchHeight);
 const above = Math.max(0, rect.top - 12);
 const below = Math.max(0, window.innerHeight - rect.bottom - 12);
 opensUp = below < wantedHeight + 8 && above > below;
@@ -141,6 +145,10 @@ if (activeRootIndex < 0) activeRootIndex = 0;
 activeModelIndex = -1;
 positionPopup(false);
 popup?.showPopover();
+if (compact) {
+await tick();
+input?.focus();
+}
 trackPopupPosition();
 }
 
@@ -174,9 +182,20 @@ if (commitOnSelect) value = modelId;
 closeMenu();
 query = '';
 submenuProvider = null;
+if (compact) selectionFocusPending = true;
 onselect?.(modelId);
-input?.focus();
+if (!compact) input?.focus();
 }
+
+$effect(() => {
+if (!selectionFocusPending || selectDisabled) return;
+selectionFocusPending = false;
+void tick().then(() => {
+if (document.activeElement === document.body || root?.contains(document.activeElement)) {
+(root?.querySelector('button[aria-haspopup]') as HTMLButtonElement | null)?.focus();
+}
+});
+});
 
 async function onInput(event: Event) {
 const target = event.currentTarget as HTMLInputElement;
@@ -190,6 +209,18 @@ await tick();
 positionPopup(false);
 }
 
+function onTriggerKeydown(event: KeyboardEvent) {
+if (event.isComposing || event.keyCode === 229) return;
+if (['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(event.key)) {
+event.preventDefault();
+if (open) closeMenu();
+else void openMenu();
+} else if (event.key === 'Escape' && open) {
+event.preventDefault();
+closeMenu();
+}
+}
+
 async function onKeydown(event: KeyboardEvent) {
 if (event.isComposing || event.keyCode === 229) return;
 const key = event.key;
@@ -200,6 +231,7 @@ query = '';
 submenuProvider = null;
 activeRootIndex = -1;
 activeModelIndex = -1;
+if (compact) (root?.querySelector('button[aria-haspopup]') as HTMLButtonElement | null)?.focus();
 return;
 }
 if (key === 'ArrowLeft' && open && submenuProvider && !query.trim()) {
@@ -281,8 +313,21 @@ if (!root?.contains(event.relatedTarget as Node | null)) closeMenu();
 }
 </script>
 
-<div bind:this={root} class="relative flex min-w-0 flex-col gap-1.5" onfocusout={onFocusOut}>
+<div bind:this={root} class="relative flex min-w-0 flex-col gap-1.5" style:width={compact ? 'max-content' : undefined} style:max-width={compact ? '100%' : undefined} onfocusout={onFocusOut}>
 <label for={id} class={compact ? 'sr-only' : 'text-sm font-medium'}>{label}</label>
+{#if compact}
+<button
+{id}
+type="button"
+aria-label={`${label} · ${selectedModel?.name ?? (value || '모델 선택')}`}
+aria-haspopup="dialog"
+aria-expanded={open}
+disabled={selectDisabled}
+onclick={() => { if (open) closeMenu(); else void openMenu(); }}
+onkeydown={onTriggerKeydown}
+class="flex h-[34px] max-w-[180px] min-w-0 items-center gap-2 rounded-lg px-2 text-sm outline-none hover:bg-neutral-100 focus-visible:ring-2 focus-visible:ring-sky-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-neutral-800"
+><span class="min-w-0 truncate">{selectedModel?.name ?? (value || '모델 선택')}</span><Icon name="chevron" class={`size-4 shrink-0 text-neutral-700 dark:text-neutral-300 ${open ? 'rotate-90' : ''}`} /></button>
+{:else}
 <input
 {id}
 bind:this={input}
@@ -298,19 +343,36 @@ disabled={selectDisabled}
 onclick={() => { if (!open) void openMenu(); }}
 oninput={onInput}
 onkeydown={onKeydown}
-class={[
-'min-h-11 min-w-0 w-full rounded-xl px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-700 disabled:cursor-not-allowed disabled:opacity-60',
-compact ? 'truncate border border-transparent bg-transparent pr-8 hover:bg-neutral-100 dark:hover:bg-neutral-800' : 'border border-neutral-300 bg-white pr-8 focus:border-sky-700 dark:border-neutral-700 dark:bg-neutral-900 dark:focus:border-sky-500'
-]}
+class="min-h-11 min-w-0 w-full rounded-xl border border-neutral-300 bg-white px-3 pr-8 text-sm outline-none focus:border-sky-700 focus-visible:ring-2 focus-visible:ring-sky-700 disabled:cursor-not-allowed disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900 dark:focus:border-sky-500"
 />
-<Icon name="chevron" class={`pointer-events-none absolute right-3 size-4 text-neutral-700 dark:text-neutral-300 ${compact ? 'top-3' : 'top-8'} ${open ? 'rotate-90' : ''}`} />
+<Icon name="chevron" class={`pointer-events-none absolute right-3 top-8 size-4 text-neutral-700 dark:text-neutral-300 ${open ? 'rotate-90' : ''}`} />
+{/if}
 {#if open}
-<div bind:this={popup} popover="manual" class="fixed z-[100] m-0 overflow-hidden rounded-xl border border-neutral-300 bg-white p-0 shadow-xl backdrop:bg-transparent dark:border-neutral-700 dark:bg-neutral-900" style:height="{popupHeight}px" style:width="{popupWidth}px" style:left="{popupLeft}px" style:top="{popupTop}px">
+<div bind:this={popup} popover="manual" role={compact ? 'dialog' : undefined}
+aria-label={compact ? `${label} 선택` : undefined}
+class="fixed z-[100] m-0 overflow-hidden flex flex-col rounded-xl border border-neutral-300 bg-white p-0 shadow-xl backdrop:bg-transparent dark:border-neutral-700 dark:bg-neutral-900" style:height="{popupHeight}px" style:width="{popupWidth}px" style:left="{popupLeft}px" style:top="{popupTop}px">
+{#if compact}
+<input
+bind:this={input}
+role="combobox"
+autocomplete="off"
+aria-label="모델 검색"
+aria-expanded="true"
+aria-controls={listId}
+aria-autocomplete="list"
+aria-activedescendant={activeDescendant}
+placeholder="모델 검색"
+value={query}
+oninput={onInput}
+onkeydown={onKeydown}
+class="m-2 mb-0 h-9 shrink-0 rounded-lg border border-neutral-300 bg-white px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-sky-700 dark:border-neutral-700 dark:bg-neutral-900"
+/>
+{/if}
 <div
 id={listId}
 role="listbox"
 aria-label={`${label} 목록`}
-class={['grid h-full min-h-0 overflow-hidden', query.trim() ? 'grid-cols-1' : submenuProvider ? 'grid-cols-[minmax(7rem,0.9fr)_minmax(0,1.1fr)]' : 'grid-cols-1']}
+class={['grid min-h-0 flex-1 overflow-hidden', query.trim() ? 'grid-cols-1' : submenuProvider ? 'grid-cols-[minmax(7rem,0.9fr)_minmax(0,1.1fr)]' : 'grid-cols-1']}
 >
 {#if query.trim()}
 <div role="presentation" class="min-h-0 overflow-y-auto p-1">

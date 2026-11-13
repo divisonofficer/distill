@@ -16,3 +16,12 @@ test('scope closure excludes unrelated parent and reaches nested children by exp
  assert.deepEqual(new Set(scopedChildren(rows, ['root', 'child'], 'https://one.test')), new Set(['child', 'grandchild', 'cycle']));
  assert.deepEqual(directChildren([row('root', { parentSessionId: 'root', sessionKind: 'subagent' })], 'root', 'https://one.test'), []);
 });
+test('running footer counts only live command tools and scoped working children', async () => {
+ const { readFile } = await import('node:fs/promises');
+ const conversation = await readFile(new URL('../src/lib/components/SessionConversation.svelte', import.meta.url), 'utf8');
+ const workbench = await readFile(new URL('../src/lib/components/WorkbenchPane.svelte', import.meta.url), 'utf8');
+ assert.match(conversation, /item\.status === 'in_progress'.*item\.toolKind.*execute/);
+ assert.match(conversation, /명령 \$\{runningCommandCount\}개 실행 중/);
+ assert.match(conversation, /runningAgentCount > 0.*에이전트 \$\{runningAgentCount\}개 실행 중/);
+ assert.match(workbench, /runningAgentCount=\{childrenFor\(tab\.sessionId\)\.filter\(row => row\.activity === 'working'\)\.length\}/);
+});

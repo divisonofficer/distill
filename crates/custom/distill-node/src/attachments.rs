@@ -111,6 +111,28 @@ pub fn content_attachment(content: &Value) -> Option<Attachment> {
     }
 }
 
+/// Validate and normalize ordinary-chat text files before signing them.
+pub(crate) fn chat_text_files(files: &[TextFileIn]) -> Result<Vec<TextFileIn>, String> {
+    prompt_blocks(None, &[], files)?;
+    if files.iter().map(|file| file.text.len()).sum::<usize>() > MAX_TEXT_BYTES {
+        return Err("chat text files exceed 1 MiB total".into());
+    }
+    files
+        .iter()
+        .map(|file| {
+            let name = safe_basename(&file.name)?;
+            let extension = name.rsplit('.').next().unwrap_or_default();
+            if !extension.eq_ignore_ascii_case("txt") && !extension.eq_ignore_ascii_case("md") {
+                return Err("chat text files must use TXT or MD filenames".into());
+            }
+            Ok(TextFileIn {
+                name,
+                text: file.text.clone(),
+            })
+        })
+        .collect()
+}
+
 fn input_attachments(
     images: &[ImageIn],
     text_files: &[TextFileIn],

@@ -38,7 +38,7 @@ assert.deepEqual(chats.chatRoots(messages).map((message) => message.messageId), 
 
 test('chat response parsing rejects malformed branch links and inference status', () => {
 const message = { messageId: 'm', parentId: null, role: 'user', text: 'saved', model: null, author: 'me', seq: 1 };
-assert.deepEqual(chats.parseSavedMessage({ message, inference: { status: 'unavailable', reason: 'not_implemented' } }), message);
+assert.deepEqual(chats.parseSavedMessage({ message, inference: { status: 'unavailable', reason: 'not_implemented' } }), { ...message, textFiles: [] });
 assert.throws(() => chats.parseChatHistory({ chatId: 'c', title: '', messages: [{ ...message, parentId: 4 }] }), /parentId/);
 assert.throws(() => chats.parseSavedMessage({ message, inference: { status: 'complete', reason: 'ok' } }), /추론 상태/);
 });
@@ -116,7 +116,7 @@ sync: { available: true, peerCount: 2, lastAttemptUnixSeconds: 10, lastSuccessUn
 assert.throws(() => chats.parseChatCapabilities({ completion: { configured: 1 }, sync: { available: false, peerCount: 0 } }), /기능 상태/);
 assert.throws(() => chats.parseChatCapabilities({ completion: { configured: false }, sync: { available: false, peerCount: -1 } }), /피어 수/);
 const assistant = { messageId: 'assistant', parentId: 'user', role: 'assistant', text: '**answer**', model: 'provider/model', author: 'ai', seq: 2 };
-assert.deepEqual(chats.parseCompletedMessage({ message: assistant, inference: { status: 'completed' } }), assistant);
+assert.deepEqual(chats.parseCompletedMessage({ message: assistant, inference: { status: 'completed' } }), { ...assistant, textFiles: [] });
 assert.throws(() => chats.parseCompletedMessage({ message: assistant, inference: { status: 'unavailable' } }), /응답 생성 상태/);
 assert.throws(() => chats.parseCompletedMessage({ message: { ...assistant, role: 'user' }, inference: { status: 'completed' } }), /역할/);
 });
@@ -138,7 +138,7 @@ assert.equal(chats.beginChatOperation(chatId, null, modelId, 'saving'), false);
 chats.bindChatOperationMessage(chatId, modelId, userMessageId, 'generating');
 chats.setChatParent(chatId, userMessageId);
 const assistant = { messageId: 'saved-assistant', parentId: userMessageId, role: 'assistant', text: 'answer', model: modelId, author: 'ai', seq: 2 };
-assert.deepEqual(chats.parseCompletedMessage({ message: assistant, inference: { status: 'completed' } }), assistant);
+assert.deepEqual(chats.parseCompletedMessage({ message: assistant, inference: { status: 'completed' } }), { ...assistant, textFiles: [] });
 chats.updateChatOperation(chatId, userMessageId, { status: 'failed', error: 'temporary failure' });
 chats.finishChatOperation(chatId);
 const failed = chats.getChatOperation(chatId, userMessageId);

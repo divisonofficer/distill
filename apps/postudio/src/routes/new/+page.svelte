@@ -226,13 +226,13 @@ busy = false;
 <textarea id="prompt" bind:this={promptElement} bind:value={prompt} oninput={() => { touched = true; }} onpaste={pasteAttachments} rows="2" placeholder="무엇을 시킬까요? 예: 테스트 실패 원인 찾아서 고쳐줘" class="block max-h-40 min-h-12 w-full resize-y bg-transparent p-0 text-[15px] leading-6 outline-none placeholder:text-neutral-400"></textarea>
 {#if attachments.length > 0}<AttachmentPreview items={previewItems} removable onremove={(key) => (attachments = attachments.filter((item) => item.key !== key))} />{/if}
 {#if attachmentError}<p role="alert" class="text-sm text-red-700 dark:text-red-300">{attachmentError}</p>{/if}
-<div class="flex flex-wrap items-center gap-2">
-<div class="min-w-0 max-w-72 flex-[1_1_12rem]"><ModelSelect id="new-model" bind:value={modelId} initialFromCatalog compact host={ownerHost || undefined} onselect={() => { touched = true; }} /></div>
-<label class="flex size-9 shrink-0 cursor-pointer items-center justify-center rounded-xl hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 또는 텍스트 파일 첨부"><Icon name="image" /><span class="sr-only">이미지 또는 TXT/MD 파일 첨부</span><input type="file" accept="image/*,.txt,.md,text/plain,text/markdown" multiple class="sr-only" onchange={attachFiles} /></label>
-<select id="mode" aria-label="권한 모드" bind:value={mode} onchange={() => { touched = true; }} class="min-h-9 min-w-0 max-w-32 flex-[0.8_1_7rem] truncate rounded-xl border border-neutral-300 bg-transparent px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-neutral-500 dark:border-neutral-700">{#each MODES as m (m)}<option value={m}>{MODE_LABEL[m]}</option>{/each}</select>
-<div class="flex min-w-0 flex-1 flex-col text-xs text-neutral-500"><span class="truncate" title={ownerHost}>{ownerHost || '호스트 확인 중'}</span><span>{board.connected ? '서버 연결됨' : '서버 연결 중'}</span></div>
-<button type="submit" disabled={busy || attachmentReads > 0} class="flex h-10 w-10 shrink-0 items-center justify-center gap-2 rounded-xl bg-neutral-900 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" aria-label="작업 시작"><Icon name="send" class="size-4" /><span class="sr-only">시작</span></button>
+<div class="flex min-w-0 flex-nowrap items-center gap-0.5">
+<label class="flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 또는 텍스트 파일 첨부"><Icon name="image" /><span class="sr-only">이미지 또는 TXT/MD 파일 첨부</span><input type="file" accept="image/*,.txt,.md,text/plain,text/markdown" multiple class="sr-only" onchange={attachFiles} /></label>
+<div class="min-w-0 max-w-[180px] flex-1 shrink"><ModelSelect id="new-model" bind:value={modelId} initialFromCatalog compact host={ownerHost || undefined} onselect={() => { touched = true; }} /></div>
+<select id="mode" aria-label="권한 모드" bind:value={mode} onchange={() => { touched = true; }} class="h-[34px] min-h-[34px] min-w-0 max-w-32 flex-[0.8_1_7rem] truncate rounded-lg border border-neutral-300 bg-transparent px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-neutral-500 dark:border-neutral-700">{#each MODES as m (m)}<option value={m}>{MODE_LABEL[m]}</option>{/each}</select>
+<button type="submit" disabled={busy || attachmentReads > 0} class="flex size-[38px] shrink-0 items-center justify-center rounded-full bg-neutral-900 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" aria-label="작업 시작"><Icon name="send" class="size-4" /><span class="sr-only">시작</span></button>
 </div>
+<p class="text-xs text-neutral-500"><span class="truncate" title={ownerHost}>{ownerHost || '호스트 확인 중'}</span> · {board.connected ? '서버 연결됨' : '서버 연결 중'}</p>
 {#if error}<p role="alert" class="text-sm text-red-700 dark:text-red-300">{error}</p>{/if}
 </div>
 </div>

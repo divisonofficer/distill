@@ -104,10 +104,28 @@ assert.equal(models.moveModelIndex(entries, 'a', 'ArrowDown'), 1);
 assert.equal(models.moveModelIndex(entries, 'b', 'ArrowDown'), 0);
 });
 
+test('compact picker reserves search height, toggles without selecting, and closes on host changes', async () => {
+const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svelte'), 'utf8');
+assert.match(source, /const compactSearchHeight = compact \? 44 : 0/);
+assert.match(source, /placeholder="모델 검색"[\s\S]*?h-9 shrink-0 rounded-lg/);
+assert.match(source, /role=\{compact \? 'dialog' : undefined\}[\s\S]*?aria-label=\{compact \? `\$\{label\} 선택` : undefined\}/);
+assert.match(source, /function onTriggerKeydown\(event: KeyboardEvent\)[\s\S]*?\['Enter', ' ', 'ArrowDown', 'ArrowUp'\][\s\S]*?if \(open\) closeMenu\(\);/);
+assert.match(source, /onclick=\{\(\) => \{ if \(open\) closeMenu\(\); else void openMenu\(\); \}\}/);
+assert.match(source, /untrack\(closeMenu\)/);
+assert.match(source, /value \|\| '모델 선택'/);
+});
+
 test('picker keeps IME guard and exposes active descendants only for rendered menu options', async () => {
 const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svelte'), 'utf8');
 assert.match(source, /async function onKeydown\(event: KeyboardEvent\) \{\s*if \(event\.isComposing \|\| event\.keyCode === 229\) return;/);
 assert.match(source, /aria-activedescendant=\{activeDescendant\}/);
+assert.match(source, /h-\[34px\] max-w-\[180px\]/);
+assert.match(source, /aria-label=\{`\$\{label\} · \$\{selectedModel\?\.name \?\? \(value \|\| '모델 선택'\)\}`\}/);
+assert.match(source, /placeholder="모델 검색"/);
+assert.match(source, /popupWidth = Math\.min\(290, availableWidth\)/);
+assert.match(source, /if \(compact\) \{\s*await tick\(\);\s*input\?\.focus\(\);/);
+assert.match(source, /role="combobox"[\s\S]*?placeholder="모델 검색"/);
+assert.match(source, /commitOnSelect\) value = modelId/);
 assert.match(source, /function trackPopupPosition\(\)[\s\S]*?addEventListener\('resize', reposition\)[\s\S]*?addEventListener\('scroll', reposition, true\)/);
 assert.match(source, /function stopTrackingPopup\(\)[\s\S]*?removeEventListener\('resize', reposition\)[\s\S]*?removeEventListener\('scroll', reposition, true\)/);
 assert.match(source, /onDestroy\(stopTrackingPopup\)/);

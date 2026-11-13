@@ -4,7 +4,7 @@ import type { ToolItem } from '$lib/session.svelte';
 import type { ToolContent } from '$lib/types';
 import type { Tone } from '$lib/format';
 
-let { item, id, onselect }: { item: ToolItem; id?: string; onselect?: (item: ToolItem) => void } = $props();
+let { item, id, onselect, grouped = false }: { item: ToolItem; id?: string; onselect?: (item: ToolItem) => void; grouped?: boolean } = $props();
 
 type ToolIcon = 'document' | 'terminal' | 'edit' | 'server';
 type OperationKind = 'read' | 'command' | 'edit' | 'other';
@@ -23,19 +23,26 @@ const input = item.input && typeof item.input === 'object' && !Array.isArray(ite
 const kind = (item.toolKind ?? '').toLowerCase();
 const name = (item.name ?? '').toLowerCase();
 const command = typeof item.input === 'string' ? item.input : firstString(input, ['command', 'cmd', 'script']);
-const path = firstString(input, ['path', 'file_path', 'filePath', 'filepath', 'filename', 'target']);
-if (kind === 'read' || /(^|[^a-z])read(?:_|$)|readfile|file_reader/.test(name)) {
-return { kind: 'read' as const, label: '파일 읽기', icon: 'document' as const, detail: path ?? item.title ?? item.name };
+const path = firstString(input, ['target_file', 'path', 'file_path', 'filePath', 'filepath', 'filename', 'target']);
+const description = firstString(input, ['description', 'prompt']);
+if (/(^|[_:/-])todo_write$/.test(name)) {
+const todos = Array.isArray(input.todos) ? input.todos : Array.isArray(input.tasks) ? input.tasks : undefined;
+return { kind: 'other' as const, label: '작업 목록 갱신', icon: 'edit' as const, detail: todos ? `할 일 ${todos.length}개` : undefined };
 }
-if (kind === 'execute' || /(^|[_:/-])(bash|shell|execute|exec|terminal)([_:/-]|$)|(^|_)run_command([_:/-]|$)/.test(name)) {
-return { kind: 'command' as const, label: '명령 실행', icon: 'terminal' as const, detail: command ?? item.title ?? item.name };
+if (/(^|[_:/-])spawn_subagent$/.test(name)) return { kind: 'other' as const, label: '하위 에이전트', icon: 'server' as const, detail: description ?? firstString(input, ['subagent_type', 'agent_type', 'type']) };
+if (!/(^|[_:/-])search_replace$/.test(name) && /(^|[_:/-])(grep|search)$/.test(name)) return { kind: 'other' as const, label: '검색', icon: 'document' as const, detail: [firstString(input, ['pattern', 'query']), firstString(input, ['path']), firstString(input, ['glob'])].filter(Boolean).join(' · ') || undefined };
+if (kind === 'read' || /(^|[^a-z])read(?:_|$)|readfile|file_reader/.test(name)) {
+return { kind: 'read' as const, label: '파일 읽기', icon: 'document' as const, detail: path ?? (item.title !== item.name ? item.title : undefined) };
+}
+if (kind === 'execute' || /(^|[_:/-])(bash|shell|execute|exec|terminal)([_:/-]|$)|(^|_)run_(?:terminal_)?command([_:/-]|$)/.test(name)) {
+return { kind: 'command' as const, label: '명령 실행', icon: 'terminal' as const, detail: command ?? (item.title !== item.name ? item.title : undefined) };
 }
 if (kind === 'edit' || kind === 'write' || /(^|[_:/-])(edit|write|patch|replace)([_:/-]|$)|search_replace|apply_patch/.test(name)) {
-return { kind: 'edit' as const, label: '파일 수정', icon: 'edit' as const, detail: path ?? item.title ?? item.name };
+return { kind: 'edit' as const, label: '파일 수정', icon: 'edit' as const, detail: path ?? (item.title !== item.name ? item.title : undefined) };
 }
-if (kind === 'delete') return { kind: 'other' as const, label: '파일 삭제', icon: 'edit' as const, detail: path ?? item.title ?? item.name };
-if (kind === 'move') return { kind: 'other' as const, label: '파일 이동', icon: 'edit' as const, detail: path ?? item.title ?? item.name };
-return { kind: 'other' as const, label: item.title ?? item.name ?? '도구 실행', icon: 'server' as const, detail: undefined };
+if (kind === 'delete') return { kind: 'other' as const, label: '파일 삭제', icon: 'edit' as const, detail: path ?? (item.title !== item.name ? item.title : undefined) };
+if (kind === 'move') return { kind: 'other' as const, label: '파일 이동', icon: 'edit' as const, detail: path ?? (item.title !== item.name ? item.title : undefined) };
+return { kind: 'other' as const, label: item.title ?? item.name ?? '도구 실행', icon: 'server' as const, detail: item.title === item.name ? undefined : item.title ?? undefined };
 });
 
 const texts = $derived((item.content ?? []).filter((content) => content.type === 'text'));
@@ -102,8 +109,8 @@ return { added, removed };
 }
 </script>
 
-<details {id} tabindex="-1" open={item.status === 'failed' || item.status === 'in_progress' || commandFailed} class="group overflow-hidden rounded-xl border border-neutral-200 bg-white text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300">
-<summary onclick={() => onselect?.(item)} class="flex min-h-10 cursor-pointer list-none items-center gap-2 px-3 select-none hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800/80">
+<details {id} tabindex="-1" open={item.status === 'failed' || item.status === 'in_progress' || commandFailed} class={grouped ? 'group bg-white text-sm text-neutral-700 dark:bg-neutral-900 dark:text-neutral-300' : 'group overflow-hidden rounded-xl border border-neutral-200 bg-white text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300'}>
+<summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 px-3 select-none hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800/80">
 {#if item.status === 'failed' || commandFailed}<span aria-label="실패" class="size-2 shrink-0 rounded-full bg-red-500"></span>{:else if item.status === 'in_progress'}<span aria-label="실행 중" class="size-2 shrink-0 animate-pulse rounded-full bg-sky-500"></span>{:else if item.status === 'completed'}<span aria-label="완료" class="shrink-0 text-emerald-600 dark:text-emerald-400">✓</span>{:else if item.status === 'pending'}<span aria-label="대기" class="size-2 shrink-0 rounded-full bg-neutral-400"></span>{/if}
 <Icon name={operation.icon as ToolIcon} class="size-4 shrink-0 text-neutral-500" />
 <span class="max-w-[40%] shrink-0 truncate font-medium" title={operation.label}>{operation.label}</span>
@@ -126,6 +133,7 @@ return { added, removed };
 </div>
 {/if}
 {/each}
+{#if onselect}<button type="button" class="self-start rounded-md px-2 py-1 text-xs text-sky-700 hover:bg-neutral-800 dark:text-sky-300" onclick={(event) => { event.stopPropagation(); onselect(item); }}>상세 탭 열기</button>{/if}
 {#each images as src, index (index)}
 <img {src} alt="도구 결과 이미지 {index + 1}" class="h-auto w-auto max-w-full self-start rounded-lg" />
 {/each}

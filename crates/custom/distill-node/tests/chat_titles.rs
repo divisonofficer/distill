@@ -23,6 +23,7 @@ fn store_with_chat(path: &Path, chat_id: &str, title: &str, text: &str) -> Store
             role: "user".into(),
             text: text.into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
     store
@@ -141,6 +142,7 @@ async fn derives_historical_titles_and_preserves_custom_titles() {
             role: "user".into(),
             text: "Do not replace this".into(),
             model: None,
+            text_files: Vec::new(),
         })
         .unwrap();
     let store = Store::open(&path).unwrap();
