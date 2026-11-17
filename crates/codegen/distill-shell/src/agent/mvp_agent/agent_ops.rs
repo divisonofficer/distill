@@ -2918,6 +2918,21 @@ impl MvpAgent {
             Err("session not found".to_string())
         }
     }
+    pub(crate) async fn kill_background_task_scoped(&self, session_id: &str, task_id: &str) -> distill_tools::types::KillOutcome {
+        let sid = acp::SessionId::new(session_id);
+        match self.get_session_handle(&sid) {
+            Some(handle) => handle.kill_background_task_scoped(session_id, task_id).await,
+            None => distill_tools::types::KillOutcome::NotFound,
+        }
+    }
+
+    pub(crate) async fn scoped_kill_supported(&self, session_id: &str) -> bool {
+        let sid = acp::SessionId::new(session_id);
+        match self.get_session_handle(&sid) {
+            Some(handle) => handle.scoped_kill_supported().await,
+            None => false,
+        }
+    }
     pub(crate) async fn delete_scheduled_task(
         &self,
         session_id: &str,
@@ -2948,6 +2963,16 @@ impl MvpAgent {
     ) -> Vec<
         distill_tools::implementations::distill::task::types::SubagentInspection,
     > {
+        self.list_subagents(parent_session_id, false).await
+    }
+
+    pub(crate) async fn list_subagents(
+        &self,
+        parent_session_id: &str,
+        include_completed: bool,
+    ) -> Vec<
+        distill_tools::implementations::distill::task::types::SubagentInspection,
+    > {
         let backend = distill_tools::implementations::distill::task::backend::ChannelBackend::new(
             self.subagent_event_tx.event_sender().0,
         );
@@ -2964,7 +2989,9 @@ impl MvpAgent {
                 )
                 .await;
         }
-        backend.list_running(parent_session_id).await
+        backend
+            .list_with_recent_completed(parent_session_id, include_completed)
+            .await
     }
     pub(crate) async fn inspect_subagent(
         &self,

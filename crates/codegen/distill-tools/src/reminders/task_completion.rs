@@ -24,11 +24,11 @@ use crate::types::output::ToolOutput;
 use crate::types::resources::{SharedResources, State, Terminal};
 use crate::types::tool::{Reminder, ToolKind};
 use crate::util::truncate::{PREVIEW_SIZE, PartialOutput, truncate_str, truncate_with_preview};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use distill_tool_types::KillTaskOutput;
 use distill_tool_types::SubagentCompletedOutput;
 use distill_tool_types::{TaskOutputOutput, TaskOutputResult};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 /// Default tool name used in auto-wake completion messages.
 pub const DEFAULT_TASK_OUTPUT_TOOL: &str = "get_task_output";
 /// UI/Stop kill with no live waiter: tell the model not to relaunch the task.
@@ -285,8 +285,7 @@ pub fn format_monitor_events(
             ))
         }
         _ => {
-            type Event =
-                crate::implementations::distill::monitor::types::MonitorEventNotification;
+            type Event = crate::implementations::distill::monitor::types::MonitorEventNotification;
             let mut groups: Vec<(&str, Vec<&Event>)> = Vec::new();
             for event in events {
                 match groups.iter_mut().find(|(id, _)| *id == event.task_id) {
@@ -312,9 +311,10 @@ pub fn format_monitor_events(
                     .map(|(desc, _)| desc)
                     .filter(|d| !d.is_empty())
                     .unwrap_or("event");
-                let description = crate::implementations::distill::monitor::event::sanitize_monitor_description(
-                    description,
-                );
+                let description =
+                    crate::implementations::distill::monitor::event::sanitize_monitor_description(
+                        description,
+                    );
                 let _ = write!(
                     buf,
                     "\n\n<monitor description=\"{description}\" task_id=\"{task_id}\">"
@@ -1422,10 +1422,10 @@ mod tests {
         BackgroundHandle, KillOutcome, TerminalBackend, TerminalRunRequest, TerminalRunResult,
     };
     use crate::types::resources::Resources;
-    use std::sync::Arc;
-    use std::time::Duration;
     use distill_tool_types::KillTaskResult;
     use distill_tool_types::{MultiTaskOutputResult, TaskOutputResult};
+    use std::sync::Arc;
+    use std::time::Duration;
     struct MockTerminal {
         tasks: Vec<TaskSnapshot>,
     }
@@ -1792,6 +1792,7 @@ mod tests {
     fn test_request(id: &str) -> SubagentRequest {
         SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: id.into(),
             prompt: String::new(),
             description: "test task".into(),

@@ -59,6 +59,8 @@ import type { TextFileIn } from '$lib/types';
 import HistorySkeleton from '$lib/components/HistorySkeleton.svelte';
 import Markdown from '$lib/components/Markdown.svelte';
 import ModelSelect from '$lib/components/ModelSelect.svelte';
+import SpeechDictation from '$lib/components/SpeechDictation.svelte';
+import { appendDictationText, stopActiveSpeechDictation } from '$lib/speech-dictation.js';
 import { ui } from '$lib/ui.svelte';
 
 let activeChatId = $state<string>(page.params.id ?? '');
@@ -344,6 +346,7 @@ function afterRouteNavigation() {
 if (activeMenu) closeMenu(activeMenu);
 const nextId = page.params.id ?? '';
 if (nextId !== activeChatId) {
+stopActiveSpeechDictation();
 if (entranceTimer !== undefined) window.clearTimeout(entranceTimer);
 entranceTimer = undefined;
 enteringMessageId = '';
@@ -377,6 +380,7 @@ watchDraft(activeChatId);
 void refreshCapabilities();
 const timer = window.setInterval(() => void refreshHistory(activeChatId, false), 15000);
 return () => {
+stopActiveSpeechDictation();
 window.clearInterval(timer);
 if (entranceTimer !== undefined) window.clearTimeout(entranceTimer);
 if (activeMenu) closeMenu(activeMenu);
@@ -389,6 +393,12 @@ fileReadToken++; readingFiles = false;
 
 function updateDraft(event: Event) {
 draft = (event.currentTarget as HTMLTextAreaElement).value;
+setChatDraft(activeChatId, draft);
+saveError = '';
+}
+
+function appendDictation(sentence: string) {
+draft = appendDictationText(draft, sentence);
 setChatDraft(activeChatId, draft);
 saveError = '';
 }
@@ -549,6 +559,7 @@ error: disposition === 'unknown'
 }
 
 async function saveMessage(generate: boolean) {
+stopActiveSpeechDictation();
 const id = activeChatId;
 const text = draft;
 const submittedFiles = getChatTextFiles(activeChatId);
@@ -950,6 +961,7 @@ ui.drawerOpen = true;
  placeholder={selectedParentMissing ? '선택한 부모 메시지를 불러온 뒤 작성할 수 있습니다.' : saving ? '저장 또는 응답 생성 중입니다…' : '메시지를 작성하세요. Enter 전송 · Shift+Enter 줄 바꿈'}
  class="max-h-48 w-full resize-none rounded-xl bg-transparent p-0 text-[15.5px] leading-[1.6] outline-none placeholder:text-neutral-600 dark:placeholder:text-neutral-300 disabled:opacity-60"
 ></textarea>
+
 {#if textFiles.length}<AttachmentPreview items={textFiles.map((attachment) => ({ key: textFileKey(attachment), attachment: { kind: 'text', ...attachment }, size: new TextEncoder().encode(attachment.text).byteLength }))} removable={!saving && !readingFiles} onremove={removeTextFile} />{/if}{#if readingFiles}<p role="status" class="px-1 text-xs">파일을 읽는 중입니다.</p>{/if}{#if fileError}<p role="alert" class="px-1 text-xs text-red-700">{fileError}</p>{/if}<div class="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
 <div class="flex min-w-0 flex-1 items-center gap-2">
 <button type="button" aria-label="첨부 및 도구" aria-haspopup="dialog" aria-expanded={composerMenuOpen} bind:this={composerTrigger} popovertarget="chat-composer-menu" onkeydown={(event) => handleMenuKeydown(event, 'composer')} class="flex size-9 shrink-0 items-center justify-center rounded-full border border-neutral-200 text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800">+</button>
@@ -960,6 +972,7 @@ ui.drawerOpen = true;
 
 </div>
 <div class="flex items-center gap-2">
+<SpeechDictation id={`chat-speech-${encodeURIComponent(activeChatId)}`} disabled={saving || selectedParentMissing} onappend={appendDictation} />
 <button
  type="submit"
  disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length) || !completionConfigured || !modelId}

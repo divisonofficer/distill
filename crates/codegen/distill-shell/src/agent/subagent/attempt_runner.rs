@@ -146,6 +146,7 @@ pub(super) async fn run_one_turn_attempt(
         traceparent: distill_otel::current_traceparent(),
         json_schema: input.request.runtime_overrides.output_schema.clone(),
         send_now: false,
+        strict_queue: false,
         admission: None,
         tool_overrides_update: None,
         respond_to: prompt_tx,
@@ -442,43 +443,52 @@ pub(super) async fn capture_and_fold_one_turn_usage(
     result: &mut SubagentResult,
     input: OneTurnUsageInput<'_>,
 ) -> bool {
-    let (by_model, attributions, pending_attempts, incomplete, output_incomplete, output_tokens, total_tokens) =
-        match super::handle_request::child_actor_query(
-            "session_usage",
-            input.child_handle.chat_state_handle.try_get_session_usage(),
-            Err(()),
-        )
-        .await
-        {
-            Ok(usage) => {
-                let output_tokens = usage.totals.output_tokens;
-                let total_tokens = canonical_total_tokens(&usage.totals);
-                let incomplete =
-                    usage_is_incomplete(usage.incomplete, input.cancellation_may_hide_usage);
-                let output_incomplete =
-                    usage_is_incomplete(usage.is_incomplete(), input.cancellation_may_hide_usage);
-                // A mixed child ledger cannot be represented by identity rows
-                // without a residual aggregate calculation. Keep its proven
-                // aggregate total; once every counted call has an attribution,
-                // send rows only so the parent cannot add both projections.
-                let fully_attributed = usage.attributions.len() as u64 == usage.totals.model_calls;
-                let attributions = fully_attributed.then_some(usage.attributions).unwrap_or_default();
-                let by_model = fully_attributed
-                    .then_some(Vec::new())
-                    .or_else(|| Some(usage.by_model.into_iter().collect::<Vec<_>>()));
-                let pending_attempts = usage.pending_attempts.into_iter().collect::<Vec<_>>();
-                (
-                    by_model,
-                    attributions,
-                    pending_attempts,
-                    incomplete,
-                    output_incomplete,
-                    (!output_incomplete).then_some(output_tokens),
-                    Some(total_tokens),
-                )
-            }
-            Err(()) => (None, Vec::new(), Vec::new(), true, true, None, None),
-        };
+    let (
+        by_model,
+        attributions,
+        pending_attempts,
+        incomplete,
+        output_incomplete,
+        output_tokens,
+        total_tokens,
+    ) = match super::handle_request::child_actor_query(
+        "session_usage",
+        input.child_handle.chat_state_handle.try_get_session_usage(),
+        Err(()),
+    )
+    .await
+    {
+        Ok(usage) => {
+            let output_tokens = usage.totals.output_tokens;
+            let total_tokens = canonical_total_tokens(&usage.totals);
+            let incomplete =
+                usage_is_incomplete(usage.incomplete, input.cancellation_may_hide_usage);
+            let output_incomplete =
+                usage_is_incomplete(usage.is_incomplete(), input.cancellation_may_hide_usage);
+            // A mixed child ledger cannot be represented by identity rows
+            // without a residual aggregate calculation. Keep its proven
+            // aggregate total; once every counted call has an attribution,
+            // send rows only so the parent cannot add both projections.
+            let fully_attributed = usage.attributions.len() as u64 == usage.totals.model_calls;
+            let attributions = fully_attributed
+                .then_some(usage.attributions)
+                .unwrap_or_default();
+            let by_model = fully_attributed
+                .then_some(Vec::new())
+                .or_else(|| Some(usage.by_model.into_iter().collect::<Vec<_>>()));
+            let pending_attempts = usage.pending_attempts.into_iter().collect::<Vec<_>>();
+            (
+                by_model,
+                attributions,
+                pending_attempts,
+                incomplete,
+                output_incomplete,
+                (!output_incomplete).then_some(output_tokens),
+                Some(total_tokens),
+            )
+        }
+        Err(()) => (None, Vec::new(), Vec::new(), true, true, None, None),
+    };
     result.total_tokens_used = total_tokens.unwrap_or(0);
     if let Some((task_spent, task_incomplete)) = input.task_budget_usage {
         result.output_tokens_used = output_tokens.unwrap_or(task_spent);

@@ -395,6 +395,8 @@ pub enum SessionCommand {
         /// Cancel-and-send: cancel the running turn and run this prompt next.
         /// Also derived server-side during an interruptible wait (see [`SessionActor::queue_input`]).
         send_now: bool,
+        /// Keep ordinary prompts queued instead of applying the configured follow-up auto-steer policy.
+        strict_queue: bool,
         /// Actor-authoritative admission and deferred fallback for terminal task wakes.
         admission: Option<TaskWakeAdmission>,
         tool_overrides_update: Option<distill_sampling_types::ToolOverridesUpdate>,
@@ -700,6 +702,14 @@ pub enum SessionCommand {
         task_id: String,
         source: distill_tools::types::KillSource,
         respond_to: oneshot::Sender<Result<distill_tools::types::KillOutcome, String>>,
+    },
+    KillBackgroundTaskScoped {
+        session_id: String,
+        task_id: String,
+        respond_to: oneshot::Sender<distill_tools::types::KillOutcome>,
+    },
+    ScopedKillSupported {
+        respond_to: oneshot::Sender<bool>,
     },
     DeleteScheduledTask {
         task_id: String,

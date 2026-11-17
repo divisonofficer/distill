@@ -15,6 +15,17 @@ if (/^(?:google\/|gemini[-_])/.test(id)) return 'Google';
 return '기타';
 }
 
+export function authenticatedModels(models: Model[], accounts: unknown): Model[] {
+const providers = new Set(Array.isArray(accounts) ? accounts.filter((account) => account && typeof account === 'object' && account.connected === true && typeof account.provider === 'string').map((account) => account.provider) : []);
+return models.filter((model) => {
+if (isAutoModel(model)) return true;
+const id = model.modelId.toLowerCase();
+if (id.startsWith('openrouter/')) return providers.has('openrouter');
+const provider = modelProvider(id);
+return provider === 'Claude' ? providers.has('claude') : provider === 'ChatGPT' ? providers.has('chatgpt') : provider === 'xAI' ? providers.has('grok') : false;
+});
+}
+
 export function isAutoModel(model: Model): boolean {
 return model.modelId.split('/').at(-1)?.toLowerCase() === 'auto' || model.name.trim().toLowerCase() === 'auto';
 }

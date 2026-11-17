@@ -8,6 +8,31 @@
     "text": "go"
   },
   {
+    "t": "queue.changed",
+    "entries": [
+      {
+        "id": "c5acf99c-027a-4c4d-9875-eed665b10654",
+        "version": 0,
+        "kind": "prompt",
+        "text": "go",
+        "position": 0
+      }
+    ],
+    "snapshot": false
+  },
+  {
+    "t": "queue.changed",
+    "entries": [],
+    "snapshot": false,
+    "running_prompt_id": "c5acf99c-027a-4c4d-9875-eed665b10654",
+    "running_text": "go",
+    "running_kind": "prompt"
+  },
+  {
+    "t": "session.state",
+    "status": "running"
+  },
+  {
     "t": "session.title",
     "title": "go"
   },
@@ -88,8 +113,14 @@
     ]
   },
   {
+    "t": "queue.changed",
+    "entries": [],
+    "snapshot": false
+  },
+  {
     "t": "turn.end",
-    "stop_reason": "cancelled"
+    "stop_reason": "cancelled",
+    "prompt_id": "c5acf99c-027a-4c4d-9875-eed665b10654"
   },
   {
     "t": "session.state",

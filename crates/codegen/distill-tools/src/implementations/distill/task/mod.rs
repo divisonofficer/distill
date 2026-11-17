@@ -33,8 +33,8 @@ use crate::types::output::ToolOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::resources::{SessionFolder, SharedResources};
 use crate::types::tool::{ToolKind, ToolNamespace};
-use regex::Regex;
 use distill_tool_types::{SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput};
+use regex::Regex;
 
 pub const TASK_TOOL_NAME: &str = "task";
 
@@ -623,6 +623,7 @@ impl distill_tool_runtime::Tool for TaskTool {
         let request = SubagentRequest {
             jev_worker_ok: false,
             id: id.clone(),
+            tool_call_id: Some(ctx.call_id.to_string()),
             prompt: input.prompt.clone(),
             description: input.description.clone(),
             subagent_type: input.subagent_type.clone(),
@@ -810,14 +811,12 @@ impl distill_tool_runtime::Tool for TaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::implementations::distill::task::backend::{
-        ChannelBackend, SubagentBackendResource,
-    };
+    use crate::implementations::distill::task::backend::{ChannelBackend, SubagentBackendResource};
     use crate::types::resources::Resources;
-    use crate::types::tool_metadata::test_ctx;
+    use crate::types::tool_metadata::{test_ctx, test_ctx_with_call_id};
+    use distill_tool_types::SubagentCapabilityMode;
     use std::sync::Arc;
     use tokio::sync::mpsc;
-    use distill_tool_types::SubagentCapabilityMode;
 
     /// Backend whose `ValidateType` events are auto-acked with `Ok`.
     fn make_backend() -> (
@@ -874,6 +873,32 @@ mod tests {
             SubagentEvent::Spawn(r) => r,
             _ => panic!("Expected SubagentEvent::Spawn"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_call_id_is_carried_into_spawn_request() {
+        let (backend, mut rx) = make_backend();
+        let observer = tokio::spawn(async move {
+            let Some(SubagentEvent::Spawn(request)) = rx.recv().await else {
+                panic!("expected subagent spawn")
+            };
+            assert_eq!(request.request.tool_call_id.as_deref(), Some("tool-call-123"));
+            let id = request.request.id.clone();
+            let _ = request.result_tx.send(SubagentResult {
+                success: true,
+                subagent_id: id.clone(),
+                child_session_id: id,
+                ..Default::default()
+            });
+        });
+        let result = distill_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx_with_call_id(resources_for_task(backend).into_shared(), "tool-call-123"),
+            task_input("general-purpose", false),
+        )
+        .await;
+        assert!(result.is_ok(), "spawn failed: {result:?}");
+        observer.await.expect("spawn observer");
     }
 
     #[tokio::test]
@@ -975,7 +1000,9 @@ mod tests {
     #[tokio::test]
     async fn ultracode_task_inherits_shared_mode_and_capability_and_off_restores_depth() {
         let (backend, mut rx) = make_backend();
-        let enabled = Arc::new(distill_tool_types::AtomicExecutionMode::new(distill_tool_types::ExecutionMode::Ultracode));
+        let enabled = Arc::new(distill_tool_types::AtomicExecutionMode::new(
+            distill_tool_types::ExecutionMode::Ultracode,
+        ));
         let mut resources = Resources::new();
         resources.insert(backend);
         resources.insert(SubagentDepthCounter(2));
@@ -1523,7 +1550,8 @@ mod tests {
         input.model = Some("invented-model".to_string());
 
         let result =
-            distill_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input).await;
+            distill_tool_runtime::Tool::run(&TaskTool, test_ctx(resources.into_shared()), input)
+                .await;
 
         let msg = result
             .expect_err("invalid model must reject before spawn")

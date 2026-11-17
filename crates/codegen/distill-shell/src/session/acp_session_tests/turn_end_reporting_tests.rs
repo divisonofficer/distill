@@ -1130,6 +1130,7 @@ fn subagent_completion_settles_promoted_task_wake_before_accounting() {
                         traceparent: None,
                         json_schema: None,
                         send_now: false,
+                        strict_queue: false,
                         admission: None,
                         tool_overrides_update: None,
                         respond_to: late_reply,

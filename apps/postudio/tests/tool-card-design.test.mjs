@@ -42,7 +42,10 @@ test('tool rows keep command output and auxiliary call data separate', () => {
   assert.match(toolRow, /<summary[^>]*>호출 정보/);
   assert.match(toolRow, /상세 탭 열기/);
   assert.doesNotMatch(toolRow, /<summary[^>]*onclick=/);
-  assert.match(toolRow, /item\.status === 'failed' \|\| item\.status === 'in_progress'/);
+  assert.match(toolRow, /let expanded = \$state\(false\)/);
+  assert.match(toolRow, /bind:open=\{expanded\}/);
+  assert.match(toolRow, /max-h-48 overflow-auto/);
+  assert.doesNotMatch(toolRow, /open=\{item\.status/);
   assert.match(toolRow, /commandExitCode !== 0/);
   assert.doesNotMatch(toolRow, /Badge/);
 });
@@ -62,7 +65,7 @@ test('tool rows render operation labels and real arguments for qualified tool na
   assert.match(todos, /할 일 2개/);
   assert.doesNotMatch(todos, /파일 수정/);
   const agent = body({ kind: 'tool', key: 4, id: 'a', name: 'spawn_subagent', input: { description: 'Review parser changes', subagent_type: 'explore' } });
-  assert.match(agent, /하위 에이전트/);
+  assert.match(agent, /서브에이전트/);
   assert.match(agent, /Review parser changes/);
   assert.doesNotMatch(agent, /완료|결과|실행 ID/);
   const command = body({ kind: 'tool', key: 5, id: 'c', name: 'execute', toolKind: 'execute', input: { command: 'npm test -- --run' } });
@@ -73,6 +76,17 @@ test('tool rows render operation labels and real arguments for qualified tool na
   assert.doesNotMatch(searchReplace, /검색/);
   const generic = body({ kind: 'tool', key: 7, id: 'x', name: 'custom_tool', title: 'custom_tool' });
   assert.doesNotMatch(generic, /<code[^>]*>custom_tool<\/code>/);
+});
+
+test('failed tool renders actual concise error in collapsed summary', () => {
+  const item = { kind: 'tool', key: 1, id: 'failed-call', name: 'execute', toolKind: 'execute', status: 'failed', input: { command: 'run task' }, content: [{ type: 'text', text: 'ENOENT: missing config\n' + 'large log line\n'.repeat(500) }] };
+  const html = render(ToolRow, { props: { item, onselect: () => {} } }).body;
+  const summary = html.slice(html.indexOf('<summary'), html.indexOf('</summary>'));
+  assert.doesNotMatch(html.slice(0, html.indexOf('>')), / open(?:=|\s|>)/);
+  assert.match(summary, /ENOENT: missing config/);
+  assert.doesNotMatch(summary, /large log line/);
+  assert.match(html, /상세 탭 열기/);
+  assert.match(toolRow, /bind:open=\{expanded\}/);
 });
 
 test('tool summary has no tab action and body button opens existing tool tab', () => {

@@ -193,6 +193,7 @@ fn same_prompt_text_in_distinct_turns_emits_once_per_turn() {
             reducer.on_agent(&completed),
             vec![
                 Sep::TurnEnd {
+                    prompt_id: None,
                     stop_reason: "end_turn".into(),
                     error: None
                 },

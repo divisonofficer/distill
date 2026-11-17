@@ -106,13 +106,13 @@ assert.equal(models.moveModelIndex(entries, 'b', 'ArrowDown'), 0);
 
 test('compact picker reserves search height, toggles without selecting, and closes on host changes', async () => {
 const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svelte'), 'utf8');
-assert.match(source, /const compactSearchHeight = compact \? 44 : 0/);
+assert.match(source, /const compactSearchHeight = compact \? 48 : 0/);
 assert.match(source, /placeholder="모델 검색"[\s\S]*?h-9 shrink-0 rounded-lg/);
 assert.match(source, /role=\{compact \? 'dialog' : undefined\}[\s\S]*?aria-label=\{compact \? `\$\{label\} 선택` : undefined\}/);
 assert.match(source, /function onTriggerKeydown\(event: KeyboardEvent\)[\s\S]*?\['Enter', ' ', 'ArrowDown', 'ArrowUp'\][\s\S]*?if \(open\) closeMenu\(\);/);
 assert.match(source, /onclick=\{\(\) => \{ if \(open\) closeMenu\(\); else void openMenu\(\); \}\}/);
 assert.match(source, /untrack\(closeMenu\)/);
-assert.match(source, /value \|\| '모델 선택'/);
+assert.match(source, /사용할 수 없는 모델/);
 });
 
 test('picker keeps IME guard and exposes active descendants only for rendered menu options', async () => {
@@ -120,9 +120,9 @@ const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svel
 assert.match(source, /async function onKeydown\(event: KeyboardEvent\) \{\s*if \(event\.isComposing \|\| event\.keyCode === 229\) return;/);
 assert.match(source, /aria-activedescendant=\{activeDescendant\}/);
 assert.match(source, /h-\[34px\] max-w-\[180px\]/);
-assert.match(source, /aria-label=\{`\$\{label\} · \$\{selectedModel\?\.name \?\? \(value \|\| '모델 선택'\)\}`\}/);
+assert.match(source, /aria-label=\{`\$\{label\} · \$\{selectedModel\?\.name/);
 assert.match(source, /placeholder="모델 검색"/);
-assert.match(source, /popupWidth = Math\.min\(290, availableWidth\)/);
+assert.match(source, /popupWidth = Math\.min\(320, availableWidth\)/);
 assert.match(source, /if \(compact\) \{\s*await tick\(\);\s*input\?\.focus\(\);/);
 assert.match(source, /role="combobox"[\s\S]*?placeholder="모델 검색"/);
 assert.match(source, /commitOnSelect\) value = modelId/);
@@ -132,4 +132,21 @@ assert.match(source, /onDestroy\(stopTrackingPopup\)/);
 assert.match(source, /function closeMenu\(\)[\s\S]*?stopTrackingPopup\(\)[\s\S]*?hidePopover\(\)/);
 assert.match(source, /activeModelIndex < searchModels\.length \? `\$\{id\}-option-\$\{activeModelIndex\}` : undefined/);
 assert.match(source, /if \(query\.trim\(\)\) \{\s*const model = searchModels\[activeModelIndex\];\s*if \(model\) choose\(model\.modelId\);/);
+});
+
+test('provider selection replaces same compact panel with accessible model stage', async () => {
+const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svelte'), 'utf8');
+assert.match(source, /\{:else if submenuProvider\}[\s\S]*?aria-label="제공자 목록으로 돌아가기"[\s\S]*?aria-label=\{`\$\{submenuProvider\} 모델`\}/);
+assert.doesNotMatch(source, /grid-cols-\[minmax/);
+assert.match(source, /selectedProvider === entry\.provider && selectedModel[\s\S]*?\{selectedModel\.name\}/);
+assert.match(source, /addEventListener\('pointerdown', dismissOutside, true\)/);
+assert.match(source, /opensUp = compact[\s\S]*?above >= Math\.min\(wantedHeight, 180\)/);
+assert.match(source, /@media \(prefers-reduced-motion: reduce\)/);
+assert.match(source, /onselect\?\.\(modelId\)/);
+});
+
+test('authenticated providers alone expose models', () => {
+const catalog = [{ modelId: 'auto', name: 'Auto' }, { modelId: 'xai/grok-4', name: 'Grok' }, { modelId: 'claude/sonnet', name: 'Sonnet' }];
+assert.deepEqual(models.authenticatedModels(catalog, [{ provider: 'grok', connected: false }, { provider: 'claude', connected: true }]).map((model) => model.modelId), ['auto', 'claude/sonnet']);
+assert.deepEqual(models.authenticatedModels(catalog, null).map((model) => model.modelId), ['auto']);
 });

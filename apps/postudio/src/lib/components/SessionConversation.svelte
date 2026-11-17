@@ -5,8 +5,12 @@ import { connect, getJson, type Socket } from '$lib/api';
 import AttachmentPreview from '$lib/components/AttachmentPreview.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import InteractionCard from '$lib/components/InteractionCard.svelte';
+import CompactionChoice from '$lib/components/CompactionChoice.svelte';
+import CompactionStatus from '$lib/components/CompactionStatus.svelte';
 import Markdown from '$lib/components/Markdown.svelte';
 import ComposerRouting from '$lib/components/ComposerRouting.svelte';
+import SpeechDictation from '$lib/components/SpeechDictation.svelte';
+import { appendDictationText, stopActiveSpeechDictation } from '$lib/speech-dictation.js';
 import ToolRow from '$lib/components/ToolRow.svelte';
 import HistorySkeleton from '$lib/components/HistorySkeleton.svelte';
 import { modeFromRow } from '$lib/types';
@@ -15,6 +19,8 @@ import { sessionTitle } from '$lib/format';
 import { ui } from '$lib/ui.svelte';
 import { workspaceDisplayName } from '$lib/workspaces';
 import { SessionReplay, SessionView, groupCompletedTools, restoredHistoryScrollTop, type ToolItem } from '$lib/session.svelte';
+import { childNeedsInput, matchChildExecution, type Executions } from '$lib/executions.svelte';
+import type { BoardRow } from '$lib/types';
 import {
 	clipboardFiles,
 	createTextDraft,
@@ -27,9 +33,9 @@ mergeDrafts,
 } from '$lib/attachments';
 import { permissionActions, permissionOptionLabel, permissionPromptState } from '$lib/permissions';
 import { TaskHistoryScroll, type HistoryReplayMode, type HistoryScrollTarget, type ScrollMetrics } from '$lib/task-history-scroll';
-import type { ClientMsg, InteractionRequest, Mode, Sep } from '$lib/types';
+import type { ClientMsg, InteractionRequest, Mode, QueueEntry, Sep } from '$lib/types';
 
-let { sessionId, host, blocked = false, initialDraft, onDraftChange, onTitle, onTools, onOpenTool, onPending, onControlChange, runningAgentCount = 0 }: { sessionId: string; host: string; blocked?: boolean; initialDraft?: { text: string; attachments: DraftAttachment[] }; onDraftChange?: (draft: { text: string; attachments: DraftAttachment[] }) => void; onTitle?: (title: string) => void; onTools?: (tools: ToolItem[]) => void; onOpenTool?: (tool: ToolItem) => void; onPending?: (pending: boolean) => void; onControlChange?: (control: { connected: boolean; running: boolean; cancel: () => boolean } | null) => void; runningAgentCount?: number } = $props();
+let { sessionId, host, blocked = false, active = true, initialDraft, onDraftChange, onTitle, onTools, onOpenTool, onOpenCommandOutput, onOpenMonitor, onPending, onControlChange, runningAgentCount = 0, executions, childSessions = [] }: { sessionId: string; host: string; blocked?: boolean; active?: boolean; initialDraft?: { text: string; attachments: DraftAttachment[] }; onDraftChange?: (draft: { text: string; attachments: DraftAttachment[] }) => void; onTitle?: (title: string) => void; onTools?: (tools: ToolItem[]) => void; onOpenTool?: (tool: ToolItem) => void; onOpenCommandOutput?: (tool: ToolItem) => void; onOpenMonitor?: () => void; onPending?: (pending: boolean) => void; onControlChange?: (control: { connected: boolean; running: boolean; cancel: () => boolean } | null) => void; runningAgentCount?: number; executions?: Executions; childSessions?: BoardRow[] } = $props();
 const id = $derived(sessionId);
 const composerId = $derived(`composer-${sessionId}`);
 const modelId = $derived(`session-model-${sessionId}`);
@@ -45,6 +51,7 @@ onDestroy(() => {
 });
 const view = new SessionView();
 let interactions = $state<InteractionRequest[]>([]);
+let interactionRetryKey = $state(0);
 let pinnedRow = $state<import('$lib/types').BoardRow | undefined>();
 let metadataError = $state('');
 let metadataTimer: ReturnType<typeof setInterval> | undefined;
@@ -56,7 +63,14 @@ const title = $derived(view.title || (row ? sessionTitle(row) : id));
 const hostAddress = $derived(new URL(sessionHost).host);
 const activePending = $derived(permissionPromptState(view.permissions.length, interactions.length));
 const tools = $derived.by(() => { void view.revision; return view.items.filter((item): item is ToolItem => item.kind === 'tool'); });
-const runningCommandCount = $derived(tools.filter((item) => item.status === 'in_progress' && ((item.toolKind ?? '').toLowerCase() === 'execute' || /(^|[_:/-])(bash|shell|execute|exec|terminal)([_:/-]|$)|(^|_)run_(?:terminal_)?command([_:/-]|$)/i.test(item.name ?? ''))).length);
+function subagentForTool(tool: ToolItem) {
+ if (!executions) return null;
+ const agent = matchChildExecution(tool, executions.agents, sessionId);
+ if (!agent) return null;
+ return { agent, fresh: executions.agentFresh[agent.subagentId] === true, needsInput: childNeedsInput(agent, childSessions, sessionId) };
+}
+const runningCommandCount = $derived(executions ? (executions.tasksFresh ? executions.tasks.filter((task) => !task.completed).length : 0) : tools.filter((item) => item.status === 'in_progress' && ((item.toolKind ?? '').toLowerCase() === 'execute' || /(^|[_:/-])(bash|shell|execute|exec|terminal)([_:/-]|$)|(^|_)run_(?:terminal_)?command([_:/-]|$)/i.test(item.name ?? ''))).length);
+const busy = $derived(view.running || runningAgentCount > 0 || runningCommandCount > 0);
 $effect(() => { const value = title; if (onTitle) untrack(() => onTitle(value)); });
 $effect(() => { const value = tools; if (onTools) untrack(() => onTools(value)); });
 $effect(() => { const value = activePending; if (onPending) untrack(() => onPending(value)); });
@@ -152,6 +166,12 @@ historyAnchor = undefined;
 historyReplay = undefined;
 historyReplayGeneration++;
 view.reset();
+runningSince = null;
+pendingPromptId = null;
+deliveryUnknownPromptId = null;
+pendingSubmission = null;
+removingQueueIds = [];
+queueSnapshotRequested = false;
 view.setConnected(false);
 }
 if (hostError) {
@@ -163,6 +183,7 @@ let replayToken = 0;
 let replayMetrics: ScrollMetrics = { scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
 const s = connect<Sep>(`/ws/session/${id}`, {
 onOpen: () => {
+queueSnapshotRequested = false;
 replayMetrics = historyMetrics();
 replayMode = historyScroll.begin(sessionKey);
 replayToken = ++historyReplayGeneration;
@@ -175,7 +196,16 @@ historyHasMore = false;
 historyLoading = false;
 historyError = '';
 historyAnchor = undefined;
-view.reset();
+view.reset(true);
+if (pendingPromptId) {
+sending = true;
+sendTimer = setTimeout(() => {
+if (!pendingPromptId) return;
+sendError = '전송 확인을 기다리고 있어요. 전달 여부를 확인하고 있어요.';
+queueSnapshotRequested = false;
+requestQueueSnapshot();
+}, 10000);
+}
 interactions = [];
 if (modelTimer !== undefined) clearTimeout(modelTimer);
 modelPending = null;
@@ -196,16 +226,31 @@ view.setConnected(false);
 },
 onMessage: (m) => {
 if (m.t === 'error' && !historyReady) historyError = `대화 기록을 불러오지 못했습니다. ${m.message}`;
-if (sending && m.t === 'session.state' && m.status === 'running') {
+if (m.t === 'queue.changed') {
+if (m.snapshot) queueSnapshotRequested = false;
+removingQueueIds = [];
+const acceptedId = pendingPromptId ?? deliveryUnknownPromptId;
+if (acceptedId && (m.running_prompt_id === acceptedId || m.entries.some((entry) => entry.id === acceptedId))) {
+acknowledgePrompt(acceptedId);
+} else if (m.snapshot && pendingPromptId) {
+deliveryUnknownPromptId = pendingPromptId;
+pendingPromptId = null;
 sending = false;
 clearTimeout(sendTimer);
-text = '';
-attachments = [];
-grow();
-} else if (sending && m.t === 'error') {
-sending = false;
-clearTimeout(sendTimer);
+sendError = '전달 여부를 확인할 수 없어요. 초안을 유지했어요. 다시 보내면 중복될 수 있습니다.';
 }
+} else if (m.t === 'prompt.accepted') {
+acknowledgePrompt(m.prompt_id);
+} else if (m.t === 'prompt.rejected' && (m.prompt_id === pendingPromptId || m.prompt_id === deliveryUnknownPromptId)) {
+sending = false;
+pendingPromptId = null;
+deliveryUnknownPromptId = null;
+pendingSubmission = null;
+clearTimeout(sendTimer);
+sendError = `메시지를 전달하지 못했습니다. ${m.message}`;
+}
+const wasRunning = view.running;
+const previousPromptId = view.activePromptId;
 const replay = historyReplay;
 let replayComplete = false;
 if (m.t === 'history.page') {
@@ -237,6 +282,12 @@ void finishHistoryReplay(replayToken, target);
 } else if (isTranscriptUpdate(m)) {
 followHistoryUpdate();
 }
+if (m.t === 'replay.end') {
+// A stale remove is harmless and prompts the shell's existing authoritative queue rebroadcast.
+requestQueueSnapshot();
+}
+if (view.running && (!wasRunning || (m.t === 'queue.changed' && view.activePromptId !== previousPromptId))) runningSince = Date.now();
+if (!view.running) runningSince = null;
 if (m.t === 'session.model') {
 const pending = modelPending;
 if (pending?.id === id && m.model_id === pending.requested) ui.notify(`${title}: 모델이 변경되었습니다.`);
@@ -264,6 +315,7 @@ return sock?.send(msg) ?? false;
 }
 
 function applyInteraction(ev: Sep) {
+if (ev.t === 'error') interactionRetryKey++;
 if (ev.t === 'question.request' || ev.t === 'plan.request') {
 if (!interactions.some((request) => request.id === ev.id)) interactions.push(ev);
 } else if (ev.t === 'permission.resolved') {
@@ -279,6 +331,8 @@ if (!send(msg)) return false;
 return true;
 }
 
+let shortcut = $state('Ctrl+Enter');
+$effect(() => { shortcut = /Mac|iPhone|iPad|iPod/.test(navigator.platform) ? '⌘Enter' : 'Ctrl+Enter'; });
 let text = $state(untrack(() => initialDraft?.text ?? ''));
 let attachments = $state<DraftAttachment[]>(untrack(() => initialDraft?.attachments ?? []));
 $effect(() => { const draft = { text, attachments: [...attachments] }; if (onDraftChange) untrack(() => onDraftChange(draft)); });
@@ -287,15 +341,66 @@ let attachmentReads = $state(0);
 let attachmentError = $state('');
 let sendError = $state('');
 let sending = $state(false);
+let pendingPromptId = $state<string | null>(null);
+let deliveryUnknownPromptId = $state<string | null>(null);
+let pendingSubmission = $state<{ text: string; attachmentKeys: number[] } | null>(null);
+let removingQueueIds = $state<string[]>([]);
+let queueSnapshotRequested = false;
 let sendTimer: ReturnType<typeof setTimeout> | undefined;
+let runningSince = $state<number | null>(null);
+let elapsedNow = $state(Date.now());
 let scroller = $state<HTMLElement>();
 let historyContent = $state<HTMLElement>();
 let composer = $state<HTMLTextAreaElement>();
 let previewItems = $derived(attachments.map(({ key, attachment, size }) => ({ key, attachment, size })));
 
+const hasDraft = $derived(text.trim() !== '' || attachments.length > 0);
 const canSend = $derived(
-view.connected && historyReady && !view.running && !sending && attachmentReads === 0 && (text.trim() !== '' || attachments.length > 0)
+view.connected && historyReady && !sending && pendingPromptId === null && attachmentReads === 0 && hasDraft
 );
+const elapsedLabel = $derived(formatElapsed(runningSince === null ? 0 : elapsedNow - runningSince));
+
+function formatElapsed(milliseconds: number): string {
+const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+if (seconds < 60) return `${seconds}초`;
+if (seconds < 3600) return `${Math.floor(seconds / 60)}분 ${seconds % 60}초`;
+return `${Math.floor(seconds / 3600)}시간 ${Math.floor(seconds % 3600 / 60)}분`;
+}
+
+function acknowledgePrompt(promptId: string) {
+if (pendingPromptId !== promptId && deliveryUnknownPromptId !== promptId) return;
+const submitted = pendingSubmission;
+sending = false;
+pendingPromptId = null;
+deliveryUnknownPromptId = null;
+pendingSubmission = null;
+clearTimeout(sendTimer);
+sendError = '';
+if (submitted && text.trim() === submitted.text && attachments.map((item) => item.key).join(',') === submitted.attachmentKeys.join(',')) {
+text = '';
+attachments = [];
+grow();
+}
+}
+
+function requestQueueSnapshot() {
+if (!view.connected || queueSnapshotRequested) return;
+queueSnapshotRequested = true;
+if (!send({ t: 'queue.remove', id: `postudio-queue-snapshot-${crypto.randomUUID()}`, expected_version: 0 })) queueSnapshotRequested = false;
+}
+
+function removeQueued(entry: QueueEntry) {
+if (!view.connected || entry.owner !== 'postudio-node' || removingQueueIds.includes(entry.id)) return;
+if (send({ t: 'queue.remove', id: entry.id, expected_version: entry.version })) {
+removingQueueIds = [...removingQueueIds, entry.id];
+}
+}
+
+$effect(() => {
+if (!view.running) return;
+const timer = setInterval(() => elapsedNow = Date.now(), 1000);
+return () => clearInterval(timer);
+});
 
 $effect(() => {
 const content = historyContent;
@@ -381,6 +486,11 @@ text = composer.value;
 grow();
 }
 
+function appendDictation(sentence: string) {
+text = appendDictationText(text, sentence);
+void tick().then(grow);
+}
+
 async function addFiles(files: File[]) {
 const start = attachmentSeq;
 attachmentSeq += files.length;
@@ -431,34 +541,59 @@ await addFiles(files);
 
 function submit(e: SubmitEvent) {
 e.preventDefault();
+submitPrompt(false);
+}
+
+function submitPrompt(sendNow: boolean) {
+stopActiveSpeechDictation();
 if (!canSend) return;
+const submittedText = text.trim();
+const attachmentKeys = attachments.map((item) => item.key);
 const images = attachments.flatMap(({ attachment }) =>
 attachment.kind === 'image' ? [{ mime: attachment.mime, data: attachment.data }] : []
 );
 const text_files = attachments.flatMap(({ attachment }) =>
 attachment.kind === 'text' ? [{ name: attachment.name, text: attachment.text }] : []
 );
+const promptId = crypto.randomUUID();
 const message: ClientMsg = {
 t: 'prompt',
-text: text.trim(),
+text: submittedText,
 images,
+prompt_id: promptId,
+...(sendNow ? { send_now: true } : {}),
 ...(text_files.length ? { text_files } : {})
 };
+if (deliveryUnknownPromptId && !window.confirm('이전 메시지가 전달됐을 수 있어요. 다시 보내면 중복될 수 있습니다. 새 요청으로 보낼까요?')) return;
 if (!send(message)) {
 sendError = '메시지를 보내지 못했습니다. 연결을 확인한 뒤 다시 시도해주세요.';
 return;
 }
+deliveryUnknownPromptId = null;
+queueSnapshotRequested = false;
 sendError = '';
 attachmentError = '';
+pendingPromptId = promptId;
+pendingSubmission = { text: submittedText, attachmentKeys };
 sending = true;
-sendTimer = setTimeout(() => { sending = false; sendError = '전송 확인이 지연됩니다. 대화 기록을 확인한 뒤 다시 시도하세요.'; }, 10000);
+clearTimeout(sendTimer);
+sendTimer = setTimeout(() => {
+if (pendingPromptId !== promptId) return;
+sendError = '전송 확인을 기다리고 있어요. 전달 여부를 확인하고 있어요.';
+queueSnapshotRequested = false;
+requestQueueSnapshot();
+}, 10000);
 }
 
 function onComposerKey(e: KeyboardEvent) {
-if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+if (e.metaKey || e.ctrlKey) {
+e.preventDefault();
+submitPrompt(true);
+return;
+}
 e.preventDefault();
 (e.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
-}
 }
 
 function chooseModel(modelId: string) {
@@ -594,7 +729,7 @@ composer?.focus();
 {/if}
 {#each timeline as entry (entry.kind === 'item' ? `item-${entry.item.key}` : `tools-${entry.items[0].key}`)}
 {#if entry.kind === 'tools'}
-<div class="flex flex-col gap-0 rounded-xl border border-neutral-200 dark:border-neutral-800">{#each entry.items as tool (tool.key)}<ToolRow item={tool} id={toolDomId(tool.id)} onselect={(tool) => onOpenTool?.(tool)} grouped />{/each}</div>
+<div class="flex flex-col gap-0 rounded-xl border border-neutral-200 dark:border-neutral-800">{#each entry.items as tool (tool.key)}{@const child = subagentForTool(tool)}<ToolRow item={tool} id={toolDomId(tool.id)} childExecution={child?.agent ?? null} childExecutionFresh={child?.fresh ?? false} childNeedsInput={child?.needsInput ?? false} onselect={(tool) => onOpenTool?.(tool)} onoutput={(tool) => onOpenCommandOutput?.(tool)} grouped />{/each}</div>
 {:else}
 {@const item = entry.item}
 {#if item.kind === 'attachment'}
@@ -602,7 +737,7 @@ composer?.focus();
 <AttachmentPreview items={[{ key: item.key, attachment: item.attachment }]} />
 </div>
 {:else if item.kind === 'tool'}
-<ToolRow {item} id={toolDomId(item.id)} onselect={(tool) => onOpenTool?.(tool)} />
+{@const child = subagentForTool(item)}<ToolRow {item} id={toolDomId(item.id)} childExecution={child?.agent ?? null} childExecutionFresh={child?.fresh ?? false} childNeedsInput={child?.needsInput ?? false} onselect={(tool) => onOpenTool?.(tool)} onoutput={(tool) => onOpenCommandOutput?.(tool)} />
 {:else if item.role === 'user'}
 <div class="ml-auto max-w-[85%] rounded-3xl bg-neutral-200/70 px-4 py-2.5 text-[15px] leading-7 break-words whitespace-pre-wrap dark:bg-neutral-800">
 {item.text}
@@ -625,7 +760,7 @@ composer?.focus();
 {/if}
 {/each}
 <div id={pendingId} class="flex flex-col gap-3">
-{#each interactions as request (request.id)}
+{#each interactions.filter((request) => request.t !== 'question.request' || !request.tool_call_id.startsWith('cold-return-')) as request (request.id)}
 <InteractionCard {request} connected={view.connected} reply={(msg) => replyInteraction(request, msg)} />
 {/each}
 {#each view.permissions as p (p.toolCallId)}
@@ -663,13 +798,18 @@ composer?.focus();
 </div>
 
 <div class="relative mx-auto flex w-full max-w-3xl shrink-0 flex-col gap-2 bg-white px-4 pt-2 pb-3 dark:bg-neutral-950">
-{#if view.running}<div role="status" class="flex min-h-9 items-center gap-2 rounded-lg bg-neutral-100 px-3 text-sm dark:bg-neutral-800"><span>{[runningCommandCount > 0 ? `명령 ${runningCommandCount}개 실행 중` : '', runningAgentCount > 0 ? `에이전트 ${runningAgentCount}개 실행 중` : ''].filter(Boolean).join(' · ') || '작업 실행 중'}</span><button type="button" class="ml-auto min-h-8 rounded-lg px-3 hover:bg-neutral-200 dark:hover:bg-neutral-700" aria-label="중단" onclick={cancelCurrent}>중단</button></div>{/if}
+<CompactionStatus state={view.compaction} />
+{#each interactions.filter((request): request is Extract<InteractionRequest, { t: 'question.request' }> => request.t === 'question.request' && request.tool_call_id.startsWith('cold-return-')) as request (request.id)}
+<CompactionChoice {request} connected={view.connected} retryKey={interactionRetryKey} reply={(msg) => replyInteraction(request, msg)} />
+{/each}
 {#if modelError?.id === id}<p role="alert" class="text-sm text-red-600">{modelError.message}</p>{/if}
 {#if modeError?.id === id}<p role="alert" class="text-sm text-red-600">{modeError.message}</p>{/if}
 <form
-class="flex flex-col gap-1.5 rounded-[22px] border border-[#dcdce0] bg-white pt-2.5 pb-1.5 pl-4 pr-2 shadow-[0_2px_10px_rgba(20,20,30,.06)] focus-within:ring-2 focus-within:ring-sky-500/20 dark:border-neutral-700 dark:bg-neutral-900"
+class:composer-running={busy}
+class="composer flex flex-col gap-1.5 rounded-[22px] border border-[#dcdce0] bg-white pt-2.5 pb-1.5 pl-4 pr-2 shadow-[0_2px_10px_rgba(20,20,30,.06)] focus-within:ring-2 focus-within:ring-sky-500/20 dark:border-neutral-700 dark:bg-neutral-900"
 onsubmit={submit}
 >
+{#if view.queue.length}<div class="flex flex-wrap gap-1.5" aria-label="대기 중 메시지">{#each view.queue as entry (entry.id)}<div class="flex min-w-0 max-w-full items-center gap-1 rounded-full border border-neutral-200 bg-neutral-50 pl-2.5 pr-1 text-xs dark:border-neutral-700 dark:bg-neutral-800"><span class="max-w-[min(55vw,22rem)] truncate">대기 중: {entry.text || '첨부 파일'}</span>{#if entry.owner === 'postudio-node'}<button type="button" disabled={removingQueueIds.includes(entry.id)} aria-label={`대기 메시지 취소: ${entry.text || '첨부 파일'}`} class="flex size-6 shrink-0 items-center justify-center rounded-full hover:bg-neutral-200 disabled:opacity-40 dark:hover:bg-neutral-700" onclick={() => removeQueued(entry)}>×</button>{/if}</div>{/each}<span class="text-xs text-neutral-500">다음 단계 전에 전달해요 · {shortcut}로 지금 끼어들기</span></div>{/if}
 {#if attachments.length > 0}
 <AttachmentPreview
 items={previewItems}
@@ -680,16 +820,16 @@ onremove={(key) => (attachments = attachments.filter((item) => item.key !== key)
 <label for={composerId} class="sr-only">메시지</label>
 <textarea
 id={composerId}
-disabled={sending}
 bind:this={composer}
 bind:value={text}
 oninput={grow}
 onpaste={pasteAttachments}
 onkeydown={onComposerKey}
 rows="2"
-placeholder={!view.connected ? '서버 연결을 기다리는 중…' : view.running ? '작업 실행 중 · 메시지는 실행이 끝난 뒤 보낼 수 있습니다.' : '메시지를 입력하세요'}
+placeholder={!view.connected ? '서버 연결을 기다리는 중…' : view.running ? `실행 중이에요. 메시지를 보내면 다음 단계 전에 전달해요 · ${shortcut} 지금 끼어들기` : '메시지를 입력하세요'}
 class="max-h-60 min-h-12 w-full resize-none bg-transparent p-0 text-[15px] leading-6 outline-none placeholder:text-neutral-600 dark:placeholder:text-neutral-300"
 ></textarea>
+
 {#if attachmentError}
 <p role="alert" class="px-2 text-sm text-red-700 dark:text-red-300">{attachmentError}</p>
 {/if}
@@ -700,14 +840,16 @@ class="max-h-60 min-h-12 w-full resize-none bg-transparent p-0 text-[15px] leadi
 <label class="flex h-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg px-1 hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 또는 텍스트 파일 첨부"><Icon name="image" class="size-4" /><span class="sr-only">이미지 또는 TXT/MD 파일 첨부</span><input type="file" accept="image/*,.txt,.md,text/plain,text/markdown" multiple class="sr-only" onchange={attachFiles} /></label>
 <div class="min-w-0 max-w-[180px] basis-[180px] shrink"><ComposerRouting id={`composer-routing-${encodeURIComponent(sessionId)}`} host={sessionHost} value={view.modelId || row?.modelId || 'Auto'} onselect={chooseModel} disabled={!view.connected || view.running || modelPending?.id === id} /></div>
 <div class="min-w-0 flex-1"></div>
+{#if busy}<span role="status" aria-label={`실행 현황 열기 · ${view.running ? `실행 중 · ${elapsedLabel}` : runningAgentCount > 0 ? `서브에이전트 ${runningAgentCount}개 실행 중` : `명령 ${runningCommandCount}개 실행 중`}${view.running && runningAgentCount > 0 ? ` · 에이전트 ${runningAgentCount}` : ''}${runningCommandCount > 0 && (view.running || runningAgentCount > 0) ? ` · 명령 ${runningCommandCount}` : ''}`}><button type="button" class="run-state" aria-label={`실행 현황 열기 · ${view.running ? `실행 중 · ${elapsedLabel}` : runningAgentCount > 0 ? `서브에이전트 ${runningAgentCount}개 실행 중` : `명령 ${runningCommandCount}개 실행 중`}${view.running && runningAgentCount > 0 ? ` · 에이전트 ${runningAgentCount}` : ''}${runningCommandCount > 0 && (view.running || runningAgentCount > 0) ? ` · 명령 ${runningCommandCount}` : ''}`} onclick={() => onOpenMonitor?.()}><span class="run-spinner" aria-hidden="true"></span><span>{view.running ? `실행 중 · ${elapsedLabel}` : runningAgentCount > 0 ? `서브에이전트 ${runningAgentCount}개 실행 중` : `명령 ${runningCommandCount}개 실행 중`}</span>{#if view.running && runningAgentCount > 0}<span class="run-detail"> · 에이전트 {runningAgentCount}</span>{/if}{#if runningCommandCount > 0 && (view.running || runningAgentCount > 0)}<span class="run-detail"> · 명령 {runningCommandCount}</span>{/if}</button></span>{/if}
 {#if contextUsage}
 <button type="button" popovertarget={contextId} aria-haspopup="dialog" aria-label={`컨텍스트 사용량 ${contextUsage.percent}%`} title={`컨텍스트 ${contextUsage.used.toLocaleString()} / ${contextUsage.size.toLocaleString()} 토큰`} class="inline-flex h-[34px] shrink-0 items-center gap-1 rounded-lg px-1 text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800"><svg aria-hidden="true" class="size-4 -rotate-90" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7" fill="none" stroke="#e3e3e7" stroke-width="3" /><circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" pathLength="100" stroke-dasharray={`${Math.min(100, contextUsage.percent)} 100`} /></svg><span>{contextUsage.percent}%</span></button>
 <div id={contextId} popover="auto" data-composer-popover onbeforetoggle={positionComposerPopover} role="dialog" aria-label="컨텍스트 사용량" class="fixed inset-auto m-0 overflow-auto rounded-[14px] border border-neutral-200 bg-white p-3.5 text-[13px] shadow-xl dark:border-neutral-700 dark:bg-neutral-900"><h3 class="font-semibold">컨텍스트 사용량 · {contextUsage.percent}%</h3><p class="mt-2 font-mono text-xs">{contextUsage.used.toLocaleString()} / {contextUsage.size.toLocaleString()} 토큰</p><p class="mt-2 text-xs leading-5 text-neutral-500">현재 세션에서 보고한 사용량입니다.</p></div>
 {:else}<span role="img" aria-label="컨텍스트 사용량 알 수 없음" title="컨텍스트 사용량 정보 없음" class="flex h-[34px] w-[30px] shrink-0 items-center justify-center text-xs text-neutral-500">—</span>{/if}
-<details class="relative shrink-0"><summary aria-label={`승인 정책: ${modeLabel}`} title={`승인 정책 · ${modeLabel}`} class="flex h-[34px] w-[34px] cursor-pointer list-none items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800"><Icon name="shield" class="size-3.5" /><span class="sr-only">승인 정책 · {modeLabel}</span></summary><div class="absolute bottom-full right-0 z-20 mb-2 w-56 max-w-[calc(100vw-48px)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-xl dark:border-neutral-700 dark:bg-neutral-900">
+<details class="relative shrink-0"><summary aria-label={`승인 정책: ${modeLabel}`} title={`승인 정책 · ${modeLabel}`} class="flex h-[34px] w-[34px] cursor-pointer list-none items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800"><Icon name={mode === 'auto' ? 'shield-check' : mode === 'always-approve' ? 'shield-off' : 'shield'} class={mode === 'auto' ? 'size-3.5 text-blue-700 dark:text-blue-400' : mode === 'always-approve' ? 'size-3.5 text-amber-700 dark:text-amber-400' : 'size-3.5'} /><span class="sr-only">승인 정책 · {modeLabel}</span></summary><div class="absolute bottom-full right-0 z-20 mb-2 w-56 max-w-[calc(100vw-48px)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-xl dark:border-neutral-700 dark:bg-neutral-900">
 {#each MODES as candidate (candidate)}<button type="button" disabled={!view.connected || mode === undefined || modePending?.id === id || candidate === mode} class="flex min-h-10 w-full items-start gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={(event) => { const parent = event.currentTarget.closest('details'); if (parent) parent.open = false; setMode(candidate); }}><span class="mt-0.5 w-4 shrink-0">{#if candidate === mode}<Icon name="check" class="size-3.5" />{/if}</span><span>{MODE_LABEL[candidate]}<small class="mt-0.5 block text-xs leading-4 text-neutral-500">{candidate === 'ask' ? '도구 사용 전 확인' : candidate === 'auto' ? '자동 승인 정책 사용' : '확인 없이 항상 승인'}</small></span></button>{/each}
 </div></details>
-{#if !view.running}<button type="submit" disabled={!canSend} aria-label="보내기" class="flex size-[38px] shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white hover:bg-neutral-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 disabled:opacity-30 dark:bg-white dark:text-neutral-950"><Icon name="send" class="size-4" /></button>{/if}
+<SpeechDictation id={`session-speech-${encodeURIComponent(sessionId)}`} {active} disabled={!view.connected || pendingPromptId !== null} onappend={appendDictation} />
+<button type={view.running && !hasDraft ? "button" : "submit"} disabled={view.running && !hasDraft ? !view.connected : !canSend} aria-label={view.running && !hasDraft ? "중지" : "보내기"} title={view.running && !hasDraft ? "실행 중지" : undefined} onclick={() => { if (view.running && !hasDraft) cancelCurrent(); }} class="flex size-[38px] shrink-0 items-center justify-center rounded-full bg-neutral-900 text-white hover:bg-neutral-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-900 disabled:opacity-30 dark:bg-white dark:text-neutral-950">{#if view.running && !hasDraft}<span aria-hidden="true" class="size-3 rounded-[2px] bg-white dark:bg-neutral-950"></span>{:else}<Icon name="send" class="size-4" />{/if}</button>
 </div>
 </form>
 <p class="text-center text-[11px] leading-4 text-neutral-500">작업은 연결된 호스트의 파일을 직접 수정할 수 있습니다.</p>
@@ -716,3 +858,14 @@ class="max-h-60 min-h-12 w-full resize-none bg-transparent p-0 text-[15px] leadi
 </section>
 
 </div>
+
+<style>
+.composer { container-type: inline-size; --blue-line: #d7e2fa; --blue-text: #1f48a3; }
+.composer-running, .composer-running:focus-within { border-color: #b9cbf3; animation: run-pulse 2s ease-in-out infinite; }
+.run-state { display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; border-radius: 14px; background: #e8eefc; flex-shrink: 0; height: 28px; color: var(--blue-text); font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.run-spinner { width: 12px; height: 12px; border: 1.5px solid var(--blue-line); border-top-color: var(--blue-text); border-radius: 50%; animation: run-spin 1s linear infinite; }
+@keyframes run-spin { to { transform: rotate(360deg); } }
+@keyframes run-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(43,89,195,0); } 50% { box-shadow: 0 0 0 4px rgba(43,89,195,.10); } }
+@container (max-width: 560px) { .run-detail { display: none; } }
+@media (prefers-reduced-motion: reduce) { .composer-running, .run-spinner { animation: none; } }
+</style>

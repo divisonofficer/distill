@@ -76,6 +76,7 @@ async fn mint_test_sender(owner: SubagentOwner) -> Option<AgentMessageSender> {
             .spawn(
                 SubagentRequest {
                     jev_worker_ok: false,
+                    tool_call_id: None,
                     id,
                     prompt: "work".to_owned(),
                     description: "child".to_owned(),

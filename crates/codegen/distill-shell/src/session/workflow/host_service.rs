@@ -539,6 +539,7 @@ impl HostService {
             |child_id: String, prompt: String, resume_from: Option<String>, fork_context: bool| {
                 SubagentRequest {
                     jev_worker_ok: false,
+                    tool_call_id: None,
                     id: child_id,
                     prompt,
                     description: description.clone(),

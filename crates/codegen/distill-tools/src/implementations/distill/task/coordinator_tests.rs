@@ -5,10 +5,11 @@ use crate::implementations::distill::task::backend::{ChannelBackend, SubagentBac
 use crate::implementations::distill::task::types::{
     ActiveAgentMessageDelivery, ActiveAgentMessageOperation, ActiveAgentMessageOutcome,
     ActiveAgentMessageRequest, ActiveAgentMessageSource, ActiveMessageTarget, AgentMessageSender,
-    SubagentCancelRequest, SubagentClearUsageNotAppliedRequest, SubagentCompletionsRequest,
-    SubagentListActiveRequest, SubagentLoopUnitActiveRequest, SubagentMarkUsageNotAppliedRequest,
-    SubagentOutstandingReply, SubagentOutstandingRequest, SubagentOwner, SubagentRegistryCounts,
-    SubagentRequest, SubagentSnapshotStatus, SubagentWaitPromptDrainedRequest, ExecutionPolicy,
+    ExecutionPolicy, SubagentCancelRequest, SubagentClearUsageNotAppliedRequest,
+    SubagentCompletionsRequest, SubagentListActiveRequest, SubagentLoopUnitActiveRequest,
+    SubagentMarkUsageNotAppliedRequest, SubagentOutstandingReply, SubagentOutstandingRequest,
+    SubagentOwner, SubagentRegistryCounts, SubagentRequest, SubagentSnapshotStatus,
+    SubagentWaitPromptDrainedRequest,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -381,6 +382,7 @@ pub(in crate::implementations::distill::task::coordinator) fn request(
 ) -> SubagentRequest {
     SubagentRequest {
         jev_worker_ok: false,
+        tool_call_id: None,
         id: id.to_owned(),
         prompt: "work".to_owned(),
         description: "test child".to_owned(),
@@ -2629,15 +2631,93 @@ async fn nested_spawner_can_query_and_cancel_queued_grandchild() {
 }
 
 #[tokio::test]
+async fn recent_completed_list_is_opt_in_bounded_and_session_scoped() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    for index in 0..7 {
+        let id = format!("completed-{index}");
+        let mut child = request(&id, false);
+        child.tool_call_id = Some(format!("call-{index}"));
+        let spawn = tokio::spawn({
+            let backend = harness.backend.clone();
+            async move { backend.spawn(child, None).await }
+        });
+        assert_eq!(harness.started.recv().await.as_deref(), Some(id.as_str()));
+        let _ = harness.finish_one.send(id.clone());
+        assert!(spawn.await.unwrap().unwrap().success);
+        harness
+            .completions
+            .recv()
+            .await
+            .expect("completion recorded");
+    }
+
+    let mut foreign = request("foreign-completed", false);
+    foreign.parent_session_id = "other-session".into();
+    let spawn = tokio::spawn({
+        let backend = harness.backend.clone();
+        async move { backend.spawn(foreign, None).await }
+    });
+    assert_eq!(
+        harness.started.recv().await.as_deref(),
+        Some("foreign-completed")
+    );
+    let _ = harness.finish_one.send("foreign-completed".into());
+    assert!(spawn.await.unwrap().unwrap().success);
+    harness
+        .completions
+        .recv()
+        .await
+        .expect("foreign completion recorded");
+
+    assert!(harness.backend.list_running("parent").await.is_empty());
+    let rows = harness
+        .backend
+        .list_with_recent_completed("parent", true)
+        .await;
+    assert_eq!(rows.len(), 5);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.snapshot.subagent_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "completed-6",
+            "completed-5",
+            "completed-4",
+            "completed-3",
+            "completed-2"
+        ]
+    );
+    assert!(rows.iter().all(|row| {
+        row.tool_call_id.is_some()
+            && matches!(
+                &row.snapshot.status,
+                SubagentSnapshotStatus::Completed { .. }
+            )
+    }));
+    let other_rows = harness
+        .backend
+        .list_with_recent_completed("other-session", true)
+        .await;
+    assert_eq!(other_rows.len(), 1);
+    assert_eq!(other_rows[0].snapshot.subagent_id, "foreign-completed");
+    harness.actor.abort();
+}
+
+#[tokio::test]
 async fn nested_spawner_lists_grandchild_in_list_running_and_list_active() {
     let mut harness = harness(false, std::time::Duration::from_secs(60));
     let child_backend = spawn_child(&mut harness, false).await;
-    let _grandchild = spawn_nested(&mut harness, &child_backend, request("grandchild", true)).await;
+    let mut grandchild_request = request("grandchild", true);
+    grandchild_request.tool_call_id = Some("tool-call-grandchild".into());
+    let _grandchild = spawn_nested(&mut harness, &child_backend, grandchild_request).await;
     assert_eq!(harness.started.recv().await.as_deref(), Some("grandchild"));
 
-    let from_child: Vec<_> = child_backend
-        .list_running("child")
-        .await
+    let child_rows = child_backend.list_running("child").await;
+    assert_eq!(
+        child_rows[0].tool_call_id.as_deref(),
+        Some("tool-call-grandchild")
+    );
+    let from_child: Vec<_> = child_rows
         .into_iter()
         .map(|inspection| inspection.snapshot.subagent_id)
         .collect();
@@ -2650,6 +2730,14 @@ async fn nested_spawner_lists_grandchild_in_list_running_and_list_active() {
         .collect();
     from_root.sort();
     assert_eq!(from_root, ["child", "grandchild"]);
+    let mut ui_ids: Vec<_> = parent_backend(&harness)
+        .list_with_recent_completed("parent", true)
+        .await
+        .into_iter()
+        .map(|row| row.snapshot.subagent_id)
+        .collect();
+    ui_ids.sort();
+    assert_eq!(ui_ids, ["child", "grandchild"]);
 
     let (respond_to, response) = oneshot::channel();
     harness
@@ -4177,7 +4265,9 @@ async fn workflow_spawns_bypass_the_session_concurrent_limit() {
 fn ultracode_request(id: &str) -> SubagentRequest {
     let mut request = request(id, true);
     request.runtime_overrides.execution_policy = Some(ExecutionPolicy {
-        mode: std::sync::Arc::new(distill_tool_types::AtomicExecutionMode::new(distill_tool_types::ExecutionMode::Ultracode)),
+        mode: std::sync::Arc::new(distill_tool_types::AtomicExecutionMode::new(
+            distill_tool_types::ExecutionMode::Ultracode,
+        )),
         max_depth: 2,
         off_max_depth: 1,
         capability_ceiling: None,
@@ -4188,22 +4278,44 @@ fn ultracode_request(id: &str) -> SubagentRequest {
 
 #[tokio::test]
 async fn ultra_shallow_modes_run_siblings_concurrently_but_reject_nested_spawns() {
-    for selected_mode in [distill_tool_types::ExecutionMode::Ultrafast, distill_tool_types::ExecutionMode::Ultrasave] {
+    for selected_mode in [
+        distill_tool_types::ExecutionMode::Ultrafast,
+        distill_tool_types::ExecutionMode::Ultrasave,
+    ] {
         let mut harness = harness_with_config(false, limited(2, LimitBehavior::Queue));
         let mut tasks = Vec::new();
         let mode = std::sync::Arc::new(distill_tool_types::AtomicExecutionMode::default());
         for id in ["first", "second"] {
             let mut request = ultracode_request(id);
-            request.runtime_overrides.execution_policy.as_mut().unwrap().mode = mode.clone();
-            request.runtime_overrides.execution_policy.as_mut().unwrap().off_max_depth = 3;
+            request
+                .runtime_overrides
+                .execution_policy
+                .as_mut()
+                .unwrap()
+                .mode = mode.clone();
+            request
+                .runtime_overrides
+                .execution_policy
+                .as_mut()
+                .unwrap()
+                .off_max_depth = 3;
             let backend = harness.backend.clone();
-            tasks.push(tokio::spawn(async move { backend.spawn(request, None).await }));
+            tasks.push(tokio::spawn(
+                async move { backend.spawn(request, None).await },
+            ));
             harness.requests.recv().await.expect("sibling observed");
-            harness.started.recv().await.expect("sibling active before either finishes");
+            harness
+                .started
+                .recv()
+                .await
+                .expect("sibling active before either finishes");
             // The first child started in Normal; a mode change also reaches it.
             mode.store(selected_mode);
         }
-        let result = session_backend(&harness, "first").spawn(ultracode_request("nested"), None).await.unwrap();
+        let result = session_backend(&harness, "first")
+            .spawn(ultracode_request("nested"), None)
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("depth limit"));
         assert_eq!(harness.backend.registry_counts().await.queued, 0);
@@ -4254,7 +4366,11 @@ async fn ultracode_nested_spawn_at_capacity_returns_local_fallback_without_queue
 async fn ultracode_nested_depth_and_root_prompt_are_preserved_and_cancelled_as_one_tree() {
     let mut harness = harness(false, std::time::Duration::from_secs(60));
     let mut pinned_outer = ultracode_request("outer");
-    let policy = pinned_outer.runtime_overrides.execution_policy.as_mut().unwrap();
+    let policy = pinned_outer
+        .runtime_overrides
+        .execution_policy
+        .as_mut()
+        .unwrap();
     policy.off_max_depth = 3;
     let enabled = policy.mode.clone();
     pinned_outer.cwd = Some("/isolated-parent".into());
@@ -4320,7 +4436,11 @@ async fn ultracode_nested_depth_and_root_prompt_are_preserved_and_cancelled_as_o
         .expect("off-mode depth-three child admitted");
     assert_eq!(observed.runtime_overrides.spawn_depth, Some(3));
     assert!(
-        observed.runtime_overrides.execution_policy.as_ref().is_some_and(|policy| !policy.is_enabled()),
+        observed
+            .runtime_overrides
+            .execution_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.is_enabled()),
         "Normal retains the shared switch without activating adaptive mode"
     );
     harness
@@ -4409,7 +4529,11 @@ async fn ultracode_isolated_spawner_is_a_leaf_before_admission_even_when_off_or_
     harness.started.recv().await.unwrap();
     let child_backend = session_backend(&harness, "isolated-owner");
     for (index, mode) in [true, false, true].into_iter().enumerate() {
-        enabled.store(if mode { distill_tool_types::ExecutionMode::Ultracode } else { distill_tool_types::ExecutionMode::Normal });
+        enabled.store(if mode {
+            distill_tool_types::ExecutionMode::Ultracode
+        } else {
+            distill_tool_types::ExecutionMode::Normal
+        });
         let mut nested = ultracode_request(&format!("denied-{index}"));
         nested.run_in_background = index == 2;
         nested.resume_from = Some("another-durable-source".into());

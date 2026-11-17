@@ -13,6 +13,7 @@ use super::super::types::{SubagentInspection, SubagentSnapshot};
 use super::{ChildControl, ChildRunner, SubagentCoordinator, SubagentProgress};
 
 const DEFAULT_QUERY_BLOCK_TIMEOUT_MS: u64 = 30_000;
+const MAX_RECENT_COMPLETED_SUBAGENTS: usize = 5;
 
 impl<R: ChildRunner> SubagentCoordinator<R> {
     fn push_blocking_waiter(
@@ -152,6 +153,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     pub(super) fn handle_list_running(
         &mut self,
         parent_session_id: String,
+        include_completed: bool,
         respond_to: oneshot::Sender<Vec<SubagentInspection>>,
     ) {
         let ids: Vec<_> = self
@@ -164,18 +166,40 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             })
             .map(|child| child.request.id.clone())
             .collect();
+        let mut recent_completed: Vec<_> = if include_completed {
+            self.completed
+                .values()
+                .filter(|child| {
+                    self.graph
+                        .is_reachable_from(&child.request.id, &parent_session_id)
+                        && !child.request.owner.is_workflow()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        recent_completed.sort_by_key(|child| std::cmp::Reverse(child.completion_age));
+        let recent_completed: Vec<_> = recent_completed
+            .into_iter()
+            .take(MAX_RECENT_COMPLETED_SUBAGENTS)
+            .map(|child| self.completed_inspection_for_query(child))
+            .collect();
+
         if ids.is_empty() {
-            let _ = respond_to.send(Vec::new());
+            let _ = respond_to.send(recent_completed);
             return;
         }
 
+        let active_count = ids.len();
+        let mut slots = vec![None; active_count];
+        slots.extend(recent_completed.into_iter().map(Some));
         let request_id = self.next_list_request_id;
         self.next_list_request_id = self.next_list_request_id.wrapping_add(1);
         self.list_requests.insert(
             request_id,
             ListRequest {
-                slots: vec![None; ids.len()],
-                remaining: ids.len(),
+                slots,
+                remaining: active_count,
                 respond_to,
             },
         );

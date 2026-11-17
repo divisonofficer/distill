@@ -31,6 +31,7 @@ pub(crate) struct QueueInputRequest {
     pub(crate) verbatim: bool,
     pub(crate) json_schema: Option<serde_json::Value>,
     pub(crate) send_now: bool,
+    pub(crate) strict_queue: bool,
     pub(crate) task_wake_fallback: Option<TaskWakeFallback>,
     pub(crate) tool_overrides_update: Option<distill_sampling_types::ToolOverridesUpdate>,
     pub(crate) respond_to: oneshot::Sender<PromptTurnResult>,
@@ -76,6 +77,7 @@ impl QueueInputRequest {
             verbatim: false,
             json_schema: None,
             send_now: false,
+            strict_queue: false,
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
@@ -124,6 +126,7 @@ impl SessionActor {
             verbatim,
             json_schema,
             send_now,
+            strict_queue,
             task_wake_fallback,
             tool_overrides_update,
             respond_to,
@@ -322,7 +325,8 @@ impl SessionActor {
             queued.input_origin.policy().shutdown == ShutdownPolicy::Drain
                 && Some(queued.prompt_id.as_str()) != running_front_id.as_deref()
         });
-        let auto_send_now = follow_up_steer && turn_running && blocked_in_wait && !held_user_queue;
+        let auto_send_now =
+            follow_up_steer && !strict_queue && turn_running && blocked_in_wait && !held_user_queue;
         let send_now = item.is_queue_editable() && (send_now || auto_send_now);
         let front_awaiting_commit_now = Self::front_awaiting_commit(&state);
         let cancel_running_turn =

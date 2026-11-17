@@ -15,6 +15,13 @@ export interface SocketHandlers<M> {
  onHost?(origin: string): void;
 }
 
+export class ApiError extends Error {
+ constructor(public status: number, public path: string, public detail: string, public body = detail) {
+  super(`${path}: ${status}${detail.trim() ? ` ${detail.trim().slice(0, 500)}` : ''}`);
+  this.name = 'Error';
+ }
+}
+
 export async function getJson<T>(path: string, host?: string): Promise<T> {
  if (mock) return (await mock.mockFetch('GET', path)) as T;
  const destination = path.startsWith('/api/chats') ? undefined : host;
@@ -30,7 +37,7 @@ export async function getJson<T>(path: string, host?: string): Promise<T> {
     else if (typeof data.message === 'string') detail = data.message;
    }
   } catch { /* Keep plain-text error responses useful. */ }
-  throw new Error(`${path}: ${res.status}${detail.trim() ? ` ${detail.trim().slice(0, 500)}` : ''}`);
+  throw new ApiError(res.status, path, detail, text);
  }
  return (await res.json()) as T;
 }
@@ -50,8 +57,7 @@ export async function postJson<T>(path: string, body: unknown, host?: string): P
     else if (typeof data.message === 'string') detail = data.message;
    }
   } catch { /* Keep plain-text error responses useful. */ }
-  detail = detail.trim().slice(0, 500);
-  throw new Error(`${path}: ${res.status}${detail ? ` ${detail}` : ''}`);
+  throw new ApiError(res.status, path, detail, text);
  }
  const text = await res.text();
  return (text ? JSON.parse(text) : undefined) as T;

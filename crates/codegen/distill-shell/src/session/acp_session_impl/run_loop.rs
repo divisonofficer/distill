@@ -802,7 +802,7 @@ pub(super) async fn run_session(
                         SessionCommand::SetToolOverrides { overrides } => {
                             session.set_tool_overrides(overrides);
                         }
-                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, admission, tool_overrides_update, respond_to, prompt_admitted, persist_ack, parsed_prompt_tx } => {
+                        SessionCommand::Prompt { prompt_id, prompt_blocks, prompt_mode, artifact_upload_ctx, client_identifier, screen_mode, verbatim, traceparent, json_schema, send_now, strict_queue, admission, tool_overrides_update, respond_to, prompt_admitted, persist_ack, parsed_prompt_tx } => {
                             let origin = super::PromptOrigin::from_prompt_id(&prompt_id);
                             if subagent_completion_sealed
                                 && InputOrigin::new(origin.clone()).is_preemptible_runtime_wake()
@@ -892,6 +892,7 @@ pub(super) async fn run_session(
                                     verbatim,
                                     json_schema,
                                     send_now,
+                                    strict_queue,
                                     task_wake_fallback,
                                     tool_overrides_update,
                                     respond_to,
@@ -1024,6 +1025,15 @@ pub(super) async fn run_session(
                                 .kill_background_task(&task_id, source)
                                 .await
                                 .map_err(|e| e.to_string());
+                            let _ = respond_to.send(result);
+                        }
+                        SessionCommand::KillBackgroundTaskScoped { session_id, task_id, respond_to } => {
+                            let result = session.agent.borrow().tool_bridge()
+                                .kill_background_task_scoped(&session_id, &task_id).await;
+                            let _ = respond_to.send(result);
+                        }
+                        SessionCommand::ScopedKillSupported { respond_to } => {
+                            let result = session.agent.borrow().tool_bridge().scoped_kill_supported();
                             let _ = respond_to.send(result);
                         }
                         SessionCommand::DeleteScheduledTask { task_id, respond_to } => {

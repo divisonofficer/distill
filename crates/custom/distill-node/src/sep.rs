@@ -144,9 +144,47 @@ pub enum Sep {
     PermissionResolved { tool_call_id: String },
     #[serde(rename = "usage")]
     Usage { used: u64, size: u64 },
+    #[serde(rename = "queue.changed")]
+    QueueChanged {
+        entries: Vec<QueueEntry>,
+        #[serde(default)]
+        snapshot: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_prompt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_combined_texts: Option<Vec<String>>,
+    },
+    #[serde(rename = "prompt.accepted")]
+    PromptAccepted { prompt_id: String },
+    #[serde(rename = "prompt.rejected")]
+    PromptRejected { prompt_id: String, message: String },
+    #[serde(rename = "compaction.started")]
+    CompactionStarted {
+        tokens_used: u64,
+        context_window: u64,
+        reason: String,
+    },
+    #[serde(rename = "compaction.completed")]
+    CompactionCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_before: Option<u64>,
+        tokens_after: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<i64>,
+    },
+    #[serde(rename = "compaction.failed")]
+    CompactionFailed { error: String },
+    #[serde(rename = "compaction.cancelled")]
+    CompactionCancelled { reason: String },
     #[serde(rename = "turn.end")]
     TurnEnd {
         stop_reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -211,6 +249,26 @@ pub struct TextFileIn {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueEntry {
+    pub id: String,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_editor: Option<String>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub position: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combined_texts: Option<Vec<String>>,
+}
+
 /// Client to node, on the session WebSocket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -225,6 +283,15 @@ pub enum ClientMsg {
         images: Vec<ImageIn>,
         #[serde(default)]
         text_files: Vec<TextFileIn>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
+        #[serde(default)]
+        send_now: bool,
+    },
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        id: String,
+        expected_version: u64,
     },
     Cancel,
     Permission {
@@ -303,7 +370,9 @@ mod tests {
             ClientMsg::Prompt {
                 text: "hi".into(),
                 images: vec![],
-                text_files: vec![]
+                text_files: vec![],
+                prompt_id: None,
+                send_now: false
             }
         );
         let msg: ClientMsg = serde_json::from_str(r#"{"t":"model","model_id":"model-x"}"#).unwrap();
@@ -319,6 +388,30 @@ mod tests {
             })
             .unwrap(),
             r#"{"t":"session.model","model_id":"model-x"}"#
+        );
+        let msg: ClientMsg = serde_json::from_str(
+            r#"{"t":"prompt","text":"next","images":[],"prompt_id":"p1","send_now":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::Prompt {
+                text: "next".into(),
+                images: vec![],
+                text_files: vec![],
+                prompt_id: Some("p1".into()),
+                send_now: true,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"t":"queue.remove","id":"p1","expected_version":2}"#
+            )
+            .unwrap(),
+            ClientMsg::QueueRemove {
+                id: "p1".into(),
+                expected_version: 2
+            }
         );
     }
 

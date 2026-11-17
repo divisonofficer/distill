@@ -18,6 +18,10 @@ use crate::keeper::Keeper;
 use crate::reduce::Reducer;
 use crate::sep::{ClientMsg, PermissionMode, Sep, Status};
 
+const POSTUDIO_CLIENT_IDENTIFIER: &str = "postudio-node";
+const QUEUE_SNAPSHOT_PREFIX: &str = "postudio-queue-snapshot-";
+const MAX_PROMPT_ID_BYTES: usize = 128;
+
 #[derive(Clone)]
 struct Ctx {
     cfg: AgentConfig,
@@ -215,17 +219,51 @@ impl Conn {
                 text,
                 images,
                 text_files,
+                prompt_id,
+                send_now,
             } => {
+                if prompt_id
+                    .as_deref()
+                    .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_PROMPT_ID_BYTES)
+                {
+                    return prompt_rejected(
+                        prompt_id,
+                        "prompt_id must be a non-empty string of at most 128 bytes",
+                    );
+                }
                 let blocks =
                     match crate::attachments::prompt_blocks(Some(&text), &images, &text_files) {
                         Ok(blocks) => blocks,
-                        Err(message) => return vec![error(message)],
+                        Err(message) => return prompt_rejected(prompt_id, message),
                     };
                 self.request(
                     "session/prompt",
-                    json!({"sessionId": sid, "prompt": blocks}),
+                    prompt_params(&sid, &blocks, prompt_id.as_deref(), send_now),
                 )
                 .1
+            }
+            ClientMsg::QueueRemove {
+                id,
+                expected_version,
+            } => {
+                if id.trim().is_empty() || id.len() > MAX_PROMPT_ID_BYTES {
+                    return vec![error(
+                        "queue id must be a non-empty string of at most 128 bytes",
+                    )];
+                }
+                let snapshot_probe = id.starts_with(QUEUE_SNAPSHOT_PREFIX);
+                let events = self.notify(
+                    "_x.ai/queue/remove",
+                    queue_remove_params(&sid, &id, expected_version),
+                );
+                if snapshot_probe
+                    && !events
+                        .iter()
+                        .any(|event| matches!(event, Sep::Error { .. }))
+                {
+                    self.reducer.expect_queue_snapshot();
+                }
+                events
             }
             ClientMsg::Cancel => self.notify("session/cancel", json!({"sessionId": sid})),
             ClientMsg::Permission { id, option_id } => {
@@ -568,6 +606,46 @@ impl Conn {
     }
 }
 
+fn prompt_rejected(prompt_id: Option<String>, message: impl Into<String>) -> Vec<Sep> {
+    let message = message.into();
+    match prompt_id {
+        Some(prompt_id) => vec![Sep::PromptRejected { prompt_id, message }],
+        None => vec![error(message)],
+    }
+}
+
+fn prompt_params(
+    session_id: &str,
+    blocks: &[Value],
+    prompt_id: Option<&str>,
+    send_now: bool,
+) -> Value {
+    let mut params = json!({"sessionId": session_id, "prompt": blocks});
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "clientIdentifier".to_owned(),
+        Value::String(POSTUDIO_CLIENT_IDENTIFIER.to_owned()),
+    );
+    meta.insert("queuePolicy".to_owned(), Value::String("strict".to_owned()));
+    if let Some(prompt_id) = prompt_id {
+        meta.insert("promptId".to_owned(), Value::String(prompt_id.to_owned()));
+    }
+    if send_now {
+        meta.insert("sendNow".to_owned(), Value::Bool(true));
+    }
+    params["_meta"] = Value::Object(meta);
+    params
+}
+
+fn queue_remove_params(session_id: &str, id: &str, expected_version: u64) -> Value {
+    json!({
+        "sessionId": session_id,
+        "id": id,
+        "expectedVersion": expected_version,
+        "owner": POSTUDIO_CLIENT_IDENTIFIER,
+    })
+}
+
 fn model_changed(msg: &Value, expected_session: &str) -> Option<String> {
     let method = msg.get("method")?.as_str()?;
     let params = msg.get("params")?;
@@ -728,6 +806,41 @@ async fn emit(socket: &mut WebSocket, events: &[Sep]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_correlated_prompts_keep_submission_identity() {
+        assert_eq!(
+            prompt_rejected(Some("p1".into()), "bad attachment"),
+            vec![Sep::PromptRejected {
+                prompt_id: "p1".into(),
+                message: "bad attachment".into(),
+            }]
+        );
+        assert!(matches!(
+            prompt_rejected(None, "bad attachment").as_slice(),
+            [Sep::Error { .. }]
+        ));
+    }
+
+    #[test]
+    fn prompt_params_use_supported_queue_and_send_now_metadata() {
+        let block = json!({"type":"text","text":"next"});
+        let queued = prompt_params("s1", std::slice::from_ref(&block), Some("p1"), false);
+        assert_eq!(queued["_meta"]["promptId"], "p1");
+        assert_eq!(
+            queued["_meta"]["clientIdentifier"],
+            POSTUDIO_CLIENT_IDENTIFIER
+        );
+        assert_eq!(queued["_meta"]["queuePolicy"], "strict");
+        assert_eq!(queued["_meta"].get("sendNow"), None);
+        assert_eq!(queued["sessionId"], "s1");
+        let send_now = prompt_params("s1", &[block], Some("p2"), true);
+        assert_eq!(send_now["_meta"]["sendNow"], true);
+        assert_eq!(
+            queue_remove_params("s1", "p1", 4),
+            json!({"sessionId":"s1","id":"p1","expectedVersion":4,"owner":"postudio-node"})
+        );
+    }
 
     #[test]
     fn only_tagged_session_updates_are_buffered_as_history() {

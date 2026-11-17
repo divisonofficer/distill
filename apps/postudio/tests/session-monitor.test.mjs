@@ -21,7 +21,7 @@ test('running footer counts only live command tools and scoped working children'
  const conversation = await readFile(new URL('../src/lib/components/SessionConversation.svelte', import.meta.url), 'utf8');
  const workbench = await readFile(new URL('../src/lib/components/WorkbenchPane.svelte', import.meta.url), 'utf8');
  assert.match(conversation, /item\.status === 'in_progress'.*item\.toolKind.*execute/);
- assert.match(conversation, /명령 \$\{runningCommandCount\}개 실행 중/);
- assert.match(conversation, /runningAgentCount > 0.*에이전트 \$\{runningAgentCount\}개 실행 중/);
+ assert.match(conversation, /명령 \{runningCommandCount\}/);
+ assert.match(conversation, /runningAgentCount > 0.*에이전트 \{runningAgentCount\}/);
  assert.match(workbench, /runningAgentCount=\{childrenFor\(tab\.sessionId\)\.filter\(row => row\.activity === 'working'\)\.length\}/);
 });

@@ -164,6 +164,7 @@ async fn channel_backend_spawn_success() {
     });
 
     let request = SubagentRequest {
+        tool_call_id: None,
         id: "test-id".to_string(),
         prompt: "do something".to_string(),
         description: "test".to_string(),
@@ -199,6 +200,7 @@ async fn channel_backend_spawn_closed_channel() {
     let backend = ChannelBackend::new(tx);
 
     let request = SubagentRequest {
+        tool_call_id: None,
         id: "test-id".to_string(),
         prompt: "do something".to_string(),
         description: "test".to_string(),
@@ -559,6 +561,7 @@ async fn workflow_spawn_future_drop_cancels_but_task_drop_does_not() {
     fn request_for(owner: super::super::types::SubagentOwner) -> SubagentRequest {
         SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: "drop-owner-test".to_string(),
             prompt: "test".to_string(),
             description: "test".to_string(),
@@ -613,6 +616,7 @@ async fn channel_backend_spawn_result_dropped() {
     });
 
     let request = SubagentRequest {
+        tool_call_id: None,
         id: "drop-test".to_string(),
         prompt: "test".to_string(),
         description: "test".to_string(),

@@ -1209,6 +1209,12 @@ impl acp::Agent for MvpAgent {
             .and_then(|m| m.get("sendNow"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let strict_queue = arguments
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("queuePolicy"))
+            .and_then(|value| value.as_str())
+            == Some("strict");
         let mut before_upload_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         if let Some(ctx) = trace_context.clone() {
             let (tx, parsed_prompt_rx) = oneshot::channel::<ParsedPromptInfo>();
@@ -1404,6 +1410,7 @@ impl acp::Agent for MvpAgent {
                     traceparent,
                     json_schema,
                     send_now: true,
+                    strict_queue,
                     admission: None,
                     tool_overrides_update,
                     respond_to: tx,
@@ -1424,6 +1431,7 @@ impl acp::Agent for MvpAgent {
                     artifact_upload_ctx,
                     client_identifier: prompt_client_identifier,
                     screen_mode: prompt_screen_mode,
+                    strict_queue,
                     verbatim,
                     traceparent,
                     json_schema,

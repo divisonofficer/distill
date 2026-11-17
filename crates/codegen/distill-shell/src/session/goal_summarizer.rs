@@ -156,6 +156,7 @@ impl ChannelSpawner {
     ) -> Result<String, SpawnError> {
         let request = SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: id.to_string(),
             prompt,
             description: GOAL_SUMMARIZER_SUBAGENT_DESCRIPTION.to_string(),
@@ -336,10 +337,11 @@ pub(crate) async fn run_goal_summarizer(
     let plan_file_str = inputs.plan_file.to_string_lossy();
     let details_str = inputs.details_file.unwrap_or("(unavailable)");
     let traces_dir_str = inputs.session_traces_dir.to_string_lossy();
-    let with_paths = distill_agent::prompt::template::strip_source_notice(GOAL_SUMMARIZER_PROMPT_TEMPLATE)
-        .replace("{PLAN_FILE}", &plan_file_str)
-        .replace("{DETAILS_FILE}", details_str)
-        .replace("{SESSION_TRACES_DIR}", &traces_dir_str);
+    let with_paths =
+        distill_agent::prompt::template::strip_source_notice(GOAL_SUMMARIZER_PROMPT_TEMPLATE)
+            .replace("{PLAN_FILE}", &plan_file_str)
+            .replace("{DETAILS_FILE}", details_str)
+            .replace("{SESSION_TRACES_DIR}", &traces_dir_str);
     let rendered = inputs.tool_names.apply(&with_paths);
     let mut prompt_text = String::with_capacity(rendered.len() + inputs.objective.len() + 32);
     prompt_text.push_str(&rendered);

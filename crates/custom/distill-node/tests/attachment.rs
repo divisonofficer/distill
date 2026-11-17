@@ -46,6 +46,8 @@ fn client_prompt_attachment_fields_default_for_old_wire_messages() {
     assert_eq!(
         msg,
         ClientMsg::Prompt {
+            prompt_id: None,
+            send_now: false,
             text: "hi".into(),
             images: vec![],
             text_files: vec![],

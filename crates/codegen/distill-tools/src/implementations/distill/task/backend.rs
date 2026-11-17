@@ -386,11 +386,21 @@ impl ChannelBackend {
     }
 
     pub async fn list_running(&self, parent_session_id: &str) -> Vec<SubagentInspection> {
+        self.list_with_recent_completed(parent_session_id, false)
+            .await
+    }
+
+    pub async fn list_with_recent_completed(
+        &self,
+        parent_session_id: &str,
+        include_completed: bool,
+    ) -> Vec<SubagentInspection> {
         let (respond_to, response_rx) = oneshot::channel();
         if self
             .tx
             .send(SubagentEvent::ListRunning(SubagentListRunningRequest {
                 parent_session_id: parent_session_id.to_owned(),
+                include_completed,
                 respond_to,
             }))
             .is_err()

@@ -102,14 +102,19 @@ mod compaction_timing_gate_tests {
     /// the middle of an edit.
     #[test]
     fn timing_state_shows_whether_a_subtask_just_ended() {
-        let long = format!("{}All tests pass; next I will start on the parser.", "x".repeat(2_000));
+        let long = format!(
+            "{}All tests pass; next I will start on the parser.",
+            "x".repeat(2_000)
+        );
         let todos = vec![
             ("wire the parser".to_owned(), "in_progress"),
             ("write docs".to_owned(), "pending"),
             ("fix tests".to_owned(), "completed"),
         ];
         let state = compaction_timing_state("build it", 60, 200_000, Some(&long), &todos);
-        let last = state["last_assistant_message"].as_str().expect("last message");
+        let last = state["last_assistant_message"]
+            .as_str()
+            .expect("last message");
         assert!(last.ends_with("start on the parser."), "{last}");
         assert!(last.chars().count() <= 600, "bounded: {}", last.len());
         assert_eq!(state["todos"]["completed"], 1);
@@ -334,10 +339,7 @@ fn labelled_number(rest: &str) -> Option<u64> {
         });
         break;
     }
-    let digits: String = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     (!digits.is_empty())
         .then(|| digits.parse::<u64>().ok())
         .flatten()
@@ -464,7 +466,10 @@ mod output_cap_tests {
 
     #[test]
     fn unparseable_message_yields_none() {
-        assert_eq!(provider_overflow_requested_and_limit("context length exceeded"), None);
+        assert_eq!(
+            provider_overflow_requested_and_limit("context length exceeded"),
+            None
+        );
         assert_eq!(provider_overflow_requested_and_limit(""), None);
     }
 
@@ -479,9 +484,18 @@ mod output_cap_tests {
 
     #[test]
     fn shrink_halves_when_unparseable_and_stops_at_floor() {
-        assert_eq!(output_cap_after_context_overflow("context length exceeded", 8_000), Some(4_000));
-        assert_eq!(output_cap_after_context_overflow("context length exceeded", 1_500), Some(1_024));
-        assert_eq!(output_cap_after_context_overflow("context length exceeded", 1_024), None);
+        assert_eq!(
+            output_cap_after_context_overflow("context length exceeded", 8_000),
+            Some(4_000)
+        );
+        assert_eq!(
+            output_cap_after_context_overflow("context length exceeded", 1_500),
+            Some(1_024)
+        );
+        assert_eq!(
+            output_cap_after_context_overflow("context length exceeded", 1_024),
+            None
+        );
     }
 
     #[test]
@@ -1134,6 +1148,16 @@ impl SessionActor {
             .as_ref()
             .map(|c| c.context_window.get())
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let percentage = distill_token_estimation::usage_percentage_u8(total_tokens, context_window);
+        self.send_xai_notification(XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: total_tokens,
+            context_window,
+            percentage,
+            reason: "Manual /compact".to_string(),
+        })
+        .await;
+        let compact_start = std::time::Instant::now();
         self.maybe_pre_compaction_flush(total_tokens, context_window, "pre_compaction")
             .await;
         if let Err(e) = self
@@ -1149,6 +1173,24 @@ impl SessionActor {
             let span = tracing::Span::current();
             span.record("success", false);
             span.record("error", e.to_string().as_str());
+            let cancelled = self.compaction.cancel.is_cancelled()
+                || matches!(
+                    crate::session::helpers::session_compact::compact_error_kind(&e),
+                    Some(crate::session::helpers::session_compact::CompactErrorKind::Cancelled)
+                );
+            if cancelled {
+                self.send_xai_notification(XaiSessionUpdate::AutoCompactCancelled {
+                    reason: crate::extensions::notification::AutoCompactCancelReason::UserCancelled,
+                })
+                .await;
+            } else {
+                let detail =
+                    Self::user_facing_compact_error(&crate::sampling::error::acp_error_message(&e));
+                self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
+                    error: detail.clone(),
+                })
+                .await;
+            }
             let kind = crate::session::helpers::session_compact::compact_error_kind(&e)
                 .unwrap_or(crate::session::helpers::session_compact::CompactErrorKind::Failed);
             let detail =
@@ -1157,7 +1199,6 @@ impl SessionActor {
                 crate::session::helpers::session_compact::compact_error_data(kind, &detail),
             ));
         }
-        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let tokens_after = self.chat_state_handle.get_total_tokens().await;
         let span = tracing::Span::current();
         span.record("post_tokens", tokens_after as i64);
@@ -1165,7 +1206,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::AutoCompactCompleted {
             tokens_before: Some(total_tokens),
             tokens_after,
-            elapsed_ms: None,
+            elapsed_ms: Some(compact_start.elapsed().as_millis() as i64),
             summary_preview: None,
         })
         .await;
@@ -2165,6 +2206,7 @@ impl SessionActor {
                         let _ =
                             event_tx.send(SubagentEvent::ListRunning(SubagentListRunningRequest {
                                 parent_session_id: self.session_id_string(),
+                                include_completed: false,
                                 respond_to: tx,
                             }));
                         rx.await
@@ -2898,12 +2940,8 @@ impl SessionActor {
         if self.compaction.is_suppressed() {
             return false;
         }
-        self.estimate_exceeds_error_context_window_for_route(
-            err,
-            route,
-            requested_output_tokens,
-        )
-        .await
+        self.estimate_exceeds_error_context_window_for_route(err, route, requested_output_tokens)
+            .await
     }
 
     /// The request's effective input plus its reserved output and a small

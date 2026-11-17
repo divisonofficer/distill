@@ -111,6 +111,17 @@ export type InteractionRequest =
 			plan_content?: string;
 	  };
 
+export interface QueueEntry {
+id: string;
+version: number;
+owner?: string;
+lastEditor?: string;
+kind: string;
+text: string;
+position: number;
+combinedTexts?: string[];
+}
+
 export type Sep =
 	| { t: 'session.state'; status: Status }
 	| { t: 'session.title'; title: string }
@@ -141,14 +152,22 @@ export type Sep =
 	| { t: 'permission.expired'; id: unknown }
 | { t: 'permission.resolved'; tool_call_id: string }
 	| { t: 'usage'; used: number; size: number }
-	| { t: 'turn.end'; stop_reason: string; error?: string }
+| { t: 'queue.changed'; entries: QueueEntry[]; snapshot?: boolean; running_prompt_id?: string; running_text?: string; running_kind?: string; running_combined_texts?: string[] }
+| { t: 'prompt.accepted'; prompt_id: string }
+| { t: 'prompt.rejected'; prompt_id: string; message: string }
+	| { t: 'compaction.started'; tokens_used: number; context_window: number; reason: string }
+	| { t: 'compaction.completed'; tokens_before?: number; tokens_after: number; elapsed_ms?: number | null }
+	| { t: 'compaction.failed'; error: string }
+	| { t: 'compaction.cancelled'; reason: string }
+	| { t: 'turn.end'; stop_reason: string; prompt_id?: string; error?: string }
 	| { t: 'history.page'; items: Sep[]; cursor: string | null; has_more: boolean; initial: boolean; error?: string }
 	| { t: 'replay.end' }
 	| { t: 'error'; message: string };
 
 export type ClientMsg =
 	| { t: 'history.load'; cursor: string }
-	| { t: 'prompt'; text: string; images: ImageIn[]; text_files?: TextFileIn[] }
+	| { t: 'prompt'; text: string; images: ImageIn[]; text_files?: TextFileIn[]; prompt_id: string; send_now?: boolean }
+	| { t: 'queue.remove'; id: string; expected_version: number }
 	| { t: 'cancel' }
 	| { t: 'permission'; id: unknown; option_id: string }
 	| {

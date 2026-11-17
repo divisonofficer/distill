@@ -412,3 +412,23 @@ assert.equal(view.items[0].title, 'Original');
 assert.equal(view.items[0].status, 'completed');
 assert.equal(view.items.filter(item => item.kind === 'tool').length, 1);
 });
+
+test('historical turn endings never clear a live approval received before history', () => {
+ const view = new SessionView();
+ const replay = new SessionReplay(view);
+ replay.begin();
+ replay.apply({ t: 'permission.request', id: 42, tool_call_id: 'pending-spawn', title: 'Spawn child', options: [{ id: 'allow', name: 'Allow', kind: 'allow_once' }] });
+ replay.apply({ t: 'history.page', initial: true, cursor: null, has_more: false, items: [
+  { t: 'message.delta', text: 'older answer' },
+  { t: 'turn.end', stop_reason: 'error', error: 'old failure' },
+  { t: 'message.delta', text: 'newer answer' },
+  { t: 'turn.end', stop_reason: 'end_turn' }
+ ] });
+ replay.apply({ t: 'replay.end' });
+ assert.equal(view.permissions.length, 1);
+ assert.equal(view.permissions[0].toolCallId, 'pending-spawn');
+ assert.equal(view.status, 'waiting_permission');
+ assert.deepEqual(view.items.filter(x => x.kind === 'text').map(x => x.text), ['older answer', 'old failure', 'newer answer']);
+ view.apply({ t: 'permission.resolved', tool_call_id: 'pending-spawn' });
+ assert.equal(view.permissions.length, 0);
+});

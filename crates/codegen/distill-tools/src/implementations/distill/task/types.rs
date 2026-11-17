@@ -21,10 +21,10 @@
 
 use std::sync::Arc;
 
+use distill_tool_types::{SubagentCapabilityMode, SubagentIsolationMode, WaitMode};
 use educe::Educe;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use distill_tool_types::{SubagentCapabilityMode, SubagentIsolationMode, WaitMode};
 
 use crate::register_resource;
 
@@ -73,6 +73,8 @@ impl SubagentOwner {
 pub struct SubagentRequest {
     /// Local agent identity (UUIDv7). Model-facing as `subagent_id` and used as the child session ID.
     pub id: String,
+    /// Tool invocation that spawned this child, when a TaskTool started it.
+    pub tool_call_id: Option<String>,
     pub prompt: String,
     pub description: String,
     pub subagent_type: String,
@@ -631,6 +633,7 @@ pub struct SubagentInspection {
     pub snapshot: SubagentSnapshot,
     pub parent_session_id: String,
     pub child_session_id: String,
+    pub tool_call_id: Option<String>,
     pub fork_parent_prompt_id: Option<String>,
     pub resumed_from: Option<String>,
 }
@@ -850,6 +853,7 @@ pub struct SubagentInspectRequest {
 #[educe(Debug)]
 pub struct SubagentListRunningRequest {
     pub parent_session_id: String,
+    pub include_completed: bool,
     #[educe(Debug(ignore))]
     pub respond_to: oneshot::Sender<Vec<SubagentInspection>>,
 }
@@ -1149,11 +1153,7 @@ impl std::fmt::Debug for SubagentForegroundWait {
     }
 }
 
-register_resource!(
-    "distill",
-    "SubagentForegroundWait",
-    SubagentForegroundWait
-);
+register_resource!("distill", "SubagentForegroundWait", SubagentForegroundWait);
 
 /// Carries the current parent prompt/turn ID for TaskTool subagent scoping. Set by distill-shell
 /// immediately before a prompt turn begins executing so subagents launched during that turn can be
@@ -1282,11 +1282,7 @@ mod tests {
         let ids: Vec<&str> = config.tools.iter().map(|tc| tc.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec![
-                "Distill:read_file",
-                "Distill:list_dir",
-                "Distill:grep",
-            ]
+            vec!["Distill:read_file", "Distill:list_dir", "Distill:grep",]
         );
     }
 

@@ -17,7 +17,7 @@
     "content": [
       {
         "type": "text",
-        "text": "1\u2192before\n"
+        "text": "1→before\n"
       }
     ]
   },
@@ -27,7 +27,8 @@
   },
   {
     "t": "turn.end",
-    "stop_reason": "end_turn"
+    "stop_reason": "end_turn",
+    "prompt_id": "2c81fe33-eb07-4b5e-9f39-ad7276800e2e"
   },
   {
     "t": "session.state",

@@ -58,9 +58,10 @@ import { getJson, postJson } from '$lib/api';
 import ModelSelect from '$lib/components/ModelSelect.svelte';
 import { ui } from '$lib/ui.svelte';
 
-type Account = { id: string; label: string; provider: string };
+type Account = { id: string; label: string; provider: string; connected: boolean };
 let { accounts }: { accounts: Account[] } = $props();
 
+let connectedAccounts = $derived(accounts.filter((account) => account.connected === true));
 let saved = $state<RoutingConfig | null>(null);
 let draft = $state<RoutingConfig | null>(null);
 let loading = $state(false);
@@ -69,7 +70,7 @@ let loadError = $state('');
 let saveError = $state('');
 let savedMessage = $state('');
 let dirty = $derived(saved !== null && draft !== null && JSON.stringify(routingPayload(saved)) !== JSON.stringify(routingPayload(draft)));
-let validDraft = $derived(draft !== null && (!draft.enabled || draft.options.length > 0) && draft.options.every((option) => option.account_id.trim() !== '' && option.main_model.trim() !== '' && (option.worker_model === undefined || option.worker_model.trim() !== '')));
+let validDraft = $derived(draft !== null && (!draft.enabled || draft.options.length > 0) && draft.options.every((option) => connectedAccounts.some((account) => account.id === option.account_id) && option.main_model.trim() !== '' && (option.worker_model === undefined || option.worker_model.trim() !== '')));
 
 onMount(() => {
 	void loadRouting();
@@ -100,11 +101,11 @@ function updateOption(id: string, update: Partial<RoutingOption>) {
 }
 
 function addOption() {
-	if (!draft || accounts.length === 0) return;
+	if (!draft || connectedAccounts.length === 0) return;
 	const id = newOptionId(draft.options);
 	draft = {
 		...draft,
-		options: [...draft.options, { id, account_id: accounts[0].id, main_model: '' }]
+		options: [...draft.options, { id, account_id: connectedAccounts[0].id, main_model: '' }]
 	};
 	saveError = '';
 	savedMessage = '';
@@ -209,10 +210,10 @@ async function saveRouting() {
 						<label class="flex min-w-0 flex-col gap-1.5 text-sm">
 							<span>계정</span>
 							<select value={option.account_id} disabled={saving} onchange={(event) => updateOption(option.id, { account_id: event.currentTarget.value })} class="min-h-11 min-w-0 rounded-xl border border-neutral-300 bg-white px-3 dark:border-neutral-700 dark:bg-neutral-900">
-								{#if !accounts.some((account) => account.id === option.account_id)}
-									<option value={option.account_id} disabled>등록되지 않은 계정 ({option.account_id || '없음'})</option>
+								{#if !connectedAccounts.some((account) => account.id === option.account_id)}
+									<option value={option.account_id} disabled>사용할 수 없는 계정</option>
 								{/if}
-								{#each accounts as account (account.id)}
+								{#each connectedAccounts as account (account.id)}
 									<option value={account.id}>{account.label} ({account.provider})</option>
 								{/each}
 							</select>
@@ -238,7 +239,7 @@ async function saveRouting() {
 				{/each}
 			</div>
 			<div class="flex flex-wrap items-center gap-2">
-				<button type="button" disabled={accounts.length === 0 || saving} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={addOption}>옵션 추가</button>
+				<button type="button" disabled={connectedAccounts.length === 0 || saving} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={addOption}>옵션 추가</button>
 				<button type="button" disabled={!dirty || !validDraft || saving} class="min-h-10 rounded-lg bg-neutral-900 px-4 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={saveRouting}>{saving ? '저장 중…' : '저장'}</button>
 				{#if dirty}<span class="text-sm text-amber-700 dark:text-amber-300">저장하지 않은 변경 사항</span>{/if}
 			</div>

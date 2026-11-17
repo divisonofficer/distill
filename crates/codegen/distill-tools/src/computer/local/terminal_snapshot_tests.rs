@@ -94,6 +94,56 @@ async fn a_finished_task_reports_completed_with_its_output() {
 }
 
 #[tokio::test]
+async fn an_evicted_task_reloads_a_bounded_output_tail_from_its_log() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let ttl = Duration::ZERO;
+    let backend = LocalTerminalBackend::new_with_completed_task_ttl(ttl);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let output_file = tmp.path().join("task.log");
+    let bytes = MAX_SNAPSHOT_BYTES + 100_000;
+    let request = TerminalRunRequest {
+        command: format!("head -c {bytes} /dev/zero | tr '\\0' 'x'; printf 'TAIL-END'"),
+        working_directory: tmp.path().to_path_buf(),
+        env: HashMap::new(),
+        timeout: Duration::from_secs(60),
+        output_byte_limit: 500,
+        output_file,
+        notification_handle: ToolNotificationHandle::from_sender(tx),
+        tool_call_id: "evicted-output-call".to_string(),
+        display_command: None,
+        auto_background_on_timeout: false,
+        foreground_block_budget: None,
+        kind: TaskKind::Bash,
+        owner_session_id: None,
+        description: None,
+    };
+
+    let bg = backend.run_background(request).await.unwrap();
+    let consumed = backend
+        .wait_for_completion(&bg.task_id, Some(Duration::from_secs(30)))
+        .await
+        .expect("task should complete");
+    assert!(consumed.completed);
+    assert!(consumed.output_total_bytes >= bytes + "TAIL-END".len());
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = backend.get_task(&bg.task_id).await.expect("task snapshot");
+            if snapshot.output.len() == MAX_SNAPSHOT_BYTES {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("snapshot should reload the bounded log tail after the task sweep");
+    assert!(snapshot.completed);
+    assert!(snapshot.output.ends_with("TAIL-END"));
+    assert!(snapshot.truncated);
+    assert!(snapshot.output_total_bytes >= bytes + "TAIL-END".len());
+}
+
+#[tokio::test]
 async fn a_missing_log_is_not_reported_as_empty_output() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let backend = LocalTerminalBackend::new();
@@ -125,7 +175,7 @@ async fn a_missing_log_is_not_reported_as_empty_output() {
     for _ in 0..100 {
         tokio::fs::remove_file(&output_file).await.ok();
         let snapshot = backend.get_task(&bg.task_id).await.expect("task snapshot");
-        if snapshot.output.is_empty() {
+        if snapshot.output.starts_with("[task output unavailable:") {
             assert!(snapshot.truncated);
             return;
         }

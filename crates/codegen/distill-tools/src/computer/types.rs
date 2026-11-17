@@ -336,6 +336,16 @@ pub trait TerminalBackend: Send + Sync {
         self.kill_task(task_id).await
     }
 
+    /// Whether scoped background kills are checked atomically by this backend.
+    fn scoped_kill_supported(&self) -> bool {
+        false
+    }
+
+    /// Kill only a background task owned by the requested session.
+    async fn kill_task_scoped(&self, _session_id: &str, _task_id: &str) -> KillOutcome {
+        KillOutcome::NotFound
+    }
+
     /// Kill all running foreground processes.
     async fn kill_foreground_commands(&self) {}
 

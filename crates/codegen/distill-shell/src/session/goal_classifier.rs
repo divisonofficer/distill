@@ -489,6 +489,7 @@ impl ChannelSpawner {
     ) -> Result<String, SpawnError> {
         let request = SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: id.to_string(),
             prompt,
             description: GOAL_CLASSIFIER_SUBAGENT_DESCRIPTION.to_string(),
@@ -711,7 +712,10 @@ impl Finding {
     /// A demonstrable defect in shipped behavior or a stub left in, as opposed
     /// to a missing test or piece of evidence (`gap`).
     fn is_defect(&self) -> bool {
-        matches!(self.kind.trim().to_ascii_lowercase().as_str(), "bug" | "todo")
+        matches!(
+            self.kind.trim().to_ascii_lowercase().as_str(),
+            "bug" | "todo"
+        )
     }
 
     fn is_empty(&self) -> bool {
@@ -1200,7 +1204,9 @@ pub(crate) fn render_harness_checks(
         let tail: String = check.excerpt.chars().skip(skip).collect();
         let command = evidence::sanitize_final_response(&check.command).replace('\n', " ");
         let tail = evidence::sanitize_final_response(tail.trim());
-        out.push_str(&format!("- `{command}` {outcome} ({freshness}); end of output:\n"));
+        out.push_str(&format!(
+            "- `{command}` {outcome} ({freshness}); end of output:\n"
+        ));
         for line in tail.lines() {
             out.push_str("    ");
             out.push_str(line);
@@ -1212,7 +1218,10 @@ pub(crate) fn render_harness_checks(
 
 /// Latest modification time among the delivered files, the reference point
 /// for whether a recorded check ran on the current code.
-async fn last_change_of(workspace_root: &Path, changed_files: &[String]) -> Option<std::time::SystemTime> {
+async fn last_change_of(
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Option<std::time::SystemTime> {
     let mut latest = None;
     for path in changed_files.iter().take(CHANGED_FILES_MTIME_MAX) {
         if let Ok(modified) = tokio::fs::metadata(workspace_root.join(path))

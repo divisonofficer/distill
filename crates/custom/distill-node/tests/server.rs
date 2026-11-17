@@ -78,6 +78,8 @@ for line in lines:
         ok(i, {})
         notif("_x.ai/session_notification", pending("t1"))
         notif("_x.ai/session_notification", {"sessionId": "s1", "update": {"sessionUpdate": "interaction_resolved", "tool_call_id": "t1"}})
+    elif meth == "_x.ai/queue/remove":
+        notif("_x.ai/queue/changed", {"sessionId": p["sessionId"], "entries": []})
     elif meth == "_x.ai/session/load_history":
         cursor = p.get("cursor")
         if cursor is None:
@@ -607,6 +609,17 @@ async fn session_replays_then_prompt_permission_turn() {
 }
 
 #[tokio::test]
+async fn queue_remove_uses_acp_extension_wire_name() {
+    let f = start().await;
+    let mut ws = connect(f.addr, "/ws/session/s1").await;
+    until(&mut ws, "replay.end").await;
+    send_json(&mut ws, json!({"t":"queue.remove","id":"queued-prompt","expected_version":3})).await;
+    until(&mut ws, "queue.changed").await;
+    assert!(log_lines(&f.log).iter().any(|m| m["method"] == "_x.ai/queue/remove"
+        && m["params"]["id"] == "queued-prompt" && m["params"]["expectedVersion"] == 3));
+}
+
+#[tokio::test]
 async fn history_pages_are_requested_from_agent_and_invalid_cursor_can_retry() {
     let f = start().await;
     let mut ws = connect(f.addr, "/ws/session/s1").await;
@@ -707,6 +720,8 @@ async fn session_question_reply_validates_and_resolves_request() {
         send_client_msg(
             &mut ws,
             &ClientMsg::Prompt {
+                prompt_id: None,
+                send_now: false,
                 text: "question flow".into(),
                 images: vec![],
                 text_files: vec![],
@@ -801,6 +816,8 @@ async fn session_plan_reply_validates_and_resolves_request() {
         send_client_msg(
             &mut ws,
             &ClientMsg::Prompt {
+                prompt_id: None,
+                send_now: false,
                 text: "plan flow".into(),
                 images: vec![],
                 text_files: vec![],

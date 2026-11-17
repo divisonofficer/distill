@@ -16,6 +16,7 @@ pub mod configuration;
 pub mod fleet;
 pub mod guard;
 pub mod interaction;
+pub mod executions;
 pub mod keeper;
 pub mod listen;
 pub mod models;
@@ -232,6 +233,7 @@ fn trusted_services_router(
         .merge(account_login::routes(agent.clone()))
         .merge(board::routes(keeper.clone()))
         .merge(models::routes(keeper.clone()))
+        .merge(executions::routes(keeper.clone()))
         .merge(session::routes(agent, keeper))
         .merge(push.routes())
         .layer(middleware::from_fn_with_state(guard, guard::guard));

@@ -1,8 +1,11 @@
 <script lang="ts">
-import { tick, untrack } from 'svelte';
+import { onDestroy, tick, untrack } from 'svelte';
 import SessionConversation from '$lib/components/SessionConversation.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import SessionMonitor from '$lib/components/SessionMonitor.svelte';
+import ExecutionMonitor from '$lib/components/ExecutionMonitor.svelte';
+import { Executions } from '$lib/executions.svelte';
+import CommandOutputModal from '$lib/components/CommandOutputModal.svelte';
 import { directChildren, scopedChildren } from '$lib/session-monitor';
 import { activityBadge } from '$lib/format';
 import { ui } from '$lib/ui.svelte';
@@ -10,13 +13,29 @@ import type { BoardRow } from '$lib/types';
 import WorkspaceDocument from '$lib/components/WorkspaceDocument.svelte';
 import type { ArtifactEntry } from '$lib/artifact-browser';
 import type { ToolItem } from '$lib/session.svelte';
-import { activateTab, closeOthers, closeTab, createLayout, joinAll, moveTab, openTab, parseLayout, splitRight, tabDropIndex, type WorkbenchLayout, type WorkbenchTab } from '$lib/workbench-layout';
+import { activateTab, closeOthers, closeTab, createLayout, isFocusedActiveTab, joinAll, moveTab, openTab, parseLayout, splitRight, tabDropIndex, type WorkbenchLayout, type WorkbenchTab } from '$lib/workbench-layout';
+
+const executionMonitors = new Map<string, ExecutionMonitor>();
+function revealExecutionMonitor(id: string) { executionMonitors.get(id)?.reveal(); }
 
 let { sessionId, host, workspaceId, conversations, sessionRows = [], blocked = false, onConversationSelect }: { sessionId: string; host: string; workspaceId: string; conversations: Array<{ sessionId: string; title: string }>; sessionRows?: BoardRow[]; blocked?: boolean; onConversationSelect?: (id: string) => void } = $props();
 const storageKey = $derived(`postudio-workbench:${JSON.stringify([host, workspaceId])}`);
 let layout = $state<WorkbenchLayout>(untrack(() => createLayout({ kind: 'conversation', id: `conversation:${sessionId}`, sessionId, title: conversations.find((item) => item.sessionId === sessionId)?.title || sessionId })));
 let drafts = new Map<string, { text: string; attachments: import('$lib/attachments').DraftAttachment[] }>();
 let toolCache = $state<Record<string, ToolItem[]>>({});
+const executionClients = new Map<string, Executions>();
+function executionFor(id: string) {
+ const key = JSON.stringify([host, id]);
+ let client = executionClients.get(key);
+ if (!client) { client = new Executions(host, id); executionClients.set(key, client); }
+ return client;
+}
+$effect(() => {
+ const current = new Set(Object.values(layout.tabs).filter((tab) => tab.kind === 'conversation').map((tab) => JSON.stringify([host, tab.sessionId])));
+ for (const [key, client] of executionClients) if (!current.has(key)) { client.stop(); executionClients.delete(key); }
+});
+onDestroy(() => { for (const client of executionClients.values()) client.stop(); executionClients.clear(); });
+let commandHistory = $state<ToolItem | null>(null);
 let pending = $state<Record<string, boolean>>({});
 let controls = $state<Record<string, { connected: boolean; running: boolean; cancel: () => boolean }>>({});
 let readyKey = $state('');
@@ -160,7 +179,7 @@ $effect(() => {
   if (key !== readyKey) {
    if (menu?.matches(':popover-open')) closeMenu(false);
    const switchedScope = readyKey !== '';
-   readyKey = key; toolCache = {}; pending = {}; controls = {};
+   readyKey = key; toolCache = {}; pending = {}; controls = {}; commandHistory = null;
    let restored: WorkbenchLayout | null = null;
    if (!blocked) try { restored = parseLayout(JSON.parse(localStorage.getItem(key) ?? 'null')); } catch {}
    if (restored) {
@@ -172,7 +191,7 @@ $effect(() => {
    previousRoute = route;
    if (!blocked) save();
   } else if (route !== previousRoute) {
-   previousRoute = route;
+   previousRoute = route; commandHistory = null;
    const tabId = conversationTabId(route);
    layout = openTab(layout, { kind: 'conversation', id: tabId, sessionId: route, title: roster.find(item => item.sessionId === route)?.title || route });
    layout = activateTab(layout, tabId); save();
@@ -183,15 +202,17 @@ $effect(() => {
 });
 </script>
 
+<CommandOutputModal history={commandHistory} now={0} onclose={() => commandHistory = null} />
+
 <svelte:window onresize={(event) => { revealActive(); closeForViewport(event); }} />
 
 <div class="workbench" class:blocked>
  <div class="groups" style={`--group-count:${layout.groups.length}`}>
  {#each layout.groups as group, index (group.id)}
   <header class="group-header" class:mobile-hidden={currentGroup.id !== group.id}>
-   <strong>작업 그룹 {index + 1}</strong>
-   <div class="tabstrip" role="tablist" tabindex="-1" aria-label={`작업 그룹 ${index + 1}`} ondragover={(event) => { if (acceptsTabDrag(event)) event.preventDefault(); }} ondragleave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) dropMarker = null; }} ondrop={transfer} data-group={group.id}>
+   {#if layout.groups.length > 1}<strong>작업 그룹 {index + 1}</strong>{/if}
    <span class="navigation-controls" role="presentation"><button class="mobile-menu" type="button" aria-label="메뉴 열기" onclick={() => (ui.drawerOpen = true)}><Icon name="menu" /></button>{#if index === 0 && ui.sidebarHidden}<button class="desktop-sidebar" type="button" aria-label="사이드바 펼치기" title="사이드바 펼치기" onclick={() => ui.toggleSidebar()}><Icon name="sidebar" /></button>{/if}</span>
+   <div class="tabstrip" role="tablist" tabindex="-1" aria-label={`작업 그룹 ${index + 1}`} ondragover={(event) => { if (acceptsTabDrag(event)) event.preventDefault(); }} ondragleave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) dropMarker = null; }} ondrop={transfer} data-group={group.id}>
    {#each group.tabs as id (id)}{@const tab = layout.tabs[id]}
     <div class="tab" class:current={group.active === id} class:drop-before={dropMarker?.groupId === group.id && dropMarker.tabId === id && !dropMarker.after} class:drop-after={dropMarker?.groupId === group.id && dropMarker.tabId === id && dropMarker.after}>
      <button type="button" role="tab" draggable="true" ondragstart={(event) => transfer(event, id)} ondragend={() => dropMarker = null} ondragover={(event) => dragOverTab(event, group.id, id)} ondrop={(event) => dropOnTab(event, group.id, id)} id={`tab-${id}`} aria-selected={group.active === id} tabindex={group.active === id ? 0 : -1} aria-label={tab.title} title={pending[cacheKey(tab.sessionId)] ? `${tab.title} · 응답 필요` : tab.title} onclick={() => selectTab(id)} onkeydown={(event) => { keyTab(event, group, id); if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); openMenu(event.currentTarget, id, group.id); } }} oncontextmenu={(event) => { event.preventDefault(); openMenu(event.currentTarget as HTMLElement, id, group.id); }} aria-haspopup="menu" aria-expanded={menuTab === id && menuOpen}><Icon name={tab.kind === 'conversation' ? 'chat' : tab.kind === 'explorer' ? 'folder' : tab.kind === 'file' ? 'document' : tab.kind === 'tool' ? 'terminal' : 'globe'} class="tab-icon"/><span class="tab-title">{tab.title}</span>{#if tab.kind === 'conversation' && pending[cacheKey(tab.sessionId)]}<span class="pending-mark" role="status" aria-label="응답 필요">●</span>{/if}</button><button class="close" type="button" aria-label={`닫기 ${tab.title}`} onclick={() => close(id)}>×</button>
@@ -199,7 +220,7 @@ $effect(() => {
     </div>
    {/each}
    </div><button class="add" type="button" aria-label="탭 열기" aria-haspopup="menu" aria-expanded={!menuTab && menuGroup === group.id && menuOpen} onclick={(event) => openMenu(event.currentTarget, '', group.id, 'add')}>＋</button>
-   <label class="group-picker">작업 그룹 <select value={layout.focusedGroup} onchange={(event) => setLayout({ ...layout, focusedGroup: event.currentTarget.value })}>{#each layout.groups as option, optionIndex (option.id)}<option value={option.id}>{optionIndex + 1}</option>{/each}</select></label>
+   {#if layout.groups.length > 1}<label class="group-picker">작업 그룹 <select value={layout.focusedGroup} onchange={(event) => setLayout({ ...layout, focusedGroup: event.currentTarget.value })}>{#each layout.groups as option, optionIndex (option.id)}<option value={option.id}>{optionIndex + 1}</option>{/each}</select></label>{/if}
   </header>
  {/each}
  {#key storageKey}
@@ -208,7 +229,7 @@ $effect(() => {
   {@const owner = layout.groups.find(group => group.tabs.includes(tab.id))}
   {@const ownerIndex = owner ? layout.groups.indexOf(owner) : 0}
   <section class="panel" class:mobile-hidden={currentGroup.id !== owner?.id} style={`grid-column:${ownerIndex + 1}`} hidden={!owner || owner.active !== tab.id} inert={!owner || owner.active !== tab.id}>
-   {#if tab.kind === 'conversation'}<div class="conversation-panel">{#if childrenFor(tab.sessionId).length}<SessionMonitor sessions={childrenFor(tab.sessionId)} onopen={(id) => { if (childrenFor(tab.sessionId).some(row => row.sessionId === id)) openConversation(id, owner?.id); }} {canCancel} oncancel={cancelChild} />{/if}<SessionConversation sessionId={tab.sessionId} host={host} runningAgentCount={childrenFor(tab.sessionId).filter(row => row.activity === 'working').length} blocked={blocked || readyKey !== storageKey} initialDraft={drafts.get(draftKey)} onDraftChange={(draft) => drafts.set(draftKey, draft)} onTitle={(title) => updateTitle(tab.sessionId, title)} onTools={(tools) => updateTools(tab.sessionId, tools)} onOpenTool={(tool) => openTool(tab.sessionId, tool)} onPending={(value) => pending = { ...pending, [draftKey]: value }} onControlChange={controlCallback(tab.sessionId, storageKey)} /></div>
+   {#if tab.kind === 'conversation'}<div class="conversation-panel"><ExecutionMonitor bind:this={() => executionMonitors.get(tab.sessionId), (value) => { if (value) executionMonitors.set(tab.sessionId, value); else executionMonitors.delete(tab.sessionId); }} {host} sessionId={tab.sessionId} client={executionFor(tab.sessionId)} childSessions={childrenFor(tab.sessionId)} active={isFocusedActiveTab(layout, owner?.id, tab.id)} blocked={blocked || readyKey !== storageKey} />{#if childrenFor(tab.sessionId).length}<details><summary>연결된 하위 대화 (참고)</summary><SessionMonitor sessions={childrenFor(tab.sessionId)} onopen={(id) => { if (childrenFor(tab.sessionId).some(row => row.sessionId === id)) openConversation(id, owner?.id); }} {canCancel} oncancel={cancelChild} /></details>{/if}<SessionConversation onOpenMonitor={() => revealExecutionMonitor(tab.sessionId)} sessionId={tab.sessionId} host={host} executions={executionFor(tab.sessionId)} childSessions={childrenFor(tab.sessionId)} active={isFocusedActiveTab(layout, owner?.id, tab.id)} runningAgentCount={childrenFor(tab.sessionId).filter(row => row.activity === 'working').length} blocked={blocked || readyKey !== storageKey} initialDraft={drafts.get(draftKey)} onDraftChange={(draft) => drafts.set(draftKey, draft)} onTitle={(title) => updateTitle(tab.sessionId, title)} onTools={(tools) => updateTools(tab.sessionId, tools)} onOpenTool={(tool) => openTool(tab.sessionId, tool)} onOpenCommandOutput={(tool) => commandHistory = tool} onPending={(value) => pending = { ...pending, [draftKey]: value }} onControlChange={controlCallback(tab.sessionId, storageKey)} /></div>
    {:else}<WorkspaceDocument {tab} {host} blocked={blocked || readyKey !== storageKey} tools={toolCache[cacheKey(tab.sessionId)] ?? []} onOpenFile={(entry, sid) => openedFile(entry, sid, owner?.id)} onOpenPreview={(port) => openPreview(port, owner?.id)} onOpenTool={(tool, view) => openTool(tab.sessionId, tool, view)} />{/if}
   </section>
  {/each}
@@ -255,7 +276,7 @@ $effect(() => {
 .group-picker{display:none}
 .empty{grid-row:2;padding:16px}
 button:focus-visible,select:focus-visible{outline:2px solid #2b59c3}
-@media(min-width:1024px){.mobile-menu{display:none}.desktop-sidebar{display:flex}}
+@media(min-width:1024px){.navigation-controls .mobile-menu{display:none}.desktop-sidebar{display:flex}}
 @media(max-width:640px){
  .groups{display:block;position:relative;width:100%}
  .group-header{position:relative;height:42px}

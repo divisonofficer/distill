@@ -8,6 +8,8 @@ import { workspacesForHost } from '$lib/workspaces';
 import AttachmentPreview from '$lib/components/AttachmentPreview.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import ModelSelect from '$lib/components/ModelSelect.svelte';
+import SpeechDictation from '$lib/components/SpeechDictation.svelte';
+import { appendDictationText, stopActiveSpeechDictation } from '$lib/speech-dictation.js';
 import {
 	clipboardFiles,
 	createTextDraft,
@@ -27,6 +29,7 @@ let currentHost = $derived(board.origin || (typeof location === 'undefined' ? ''
 onMount(() => { ownerHost = currentHost; });
 $effect(() => { if (!touched && currentHost && ownerHost !== currentHost) { ownerHost = currentHost; modelId = ''; } });
 function switchHost() {
+ stopActiveSpeechDictation();
  ownerHost = currentHost;
  cwd = ''; worktree = false; wtName = ''; modelId = ''; workspaceOpen = false;
  error = '';
@@ -51,6 +54,7 @@ let workspaces = $derived(workspacesForHost(board.rows, recent, ownerHost, curre
 let selectedTemporaryWorkspace = $derived(workspaces.temporary.find((workspace) => workspace.cwd === cwd));
 
 function selectWorkspace(path: string) {
+stopActiveSpeechDictation();
 touched = true;
 cwd = path;
 worktree = true;
@@ -71,6 +75,11 @@ return;
 }
 promptElement.setRangeText(value, promptElement.selectionStart, promptElement.selectionEnd, 'end');
 prompt = promptElement.value;
+}
+
+function appendDictation(sentence: string) {
+prompt = appendDictationText(prompt, sentence);
+touched = true;
 }
 
 async function addFiles(files: File[]) {
@@ -122,6 +131,7 @@ await addFiles(files);
 
 async function submit(e: SubmitEvent) {
 e.preventDefault();
+stopActiveSpeechDictation();
 error = '';
 if (busy || attachmentReads) return;
 const dir = cwd.trim();
@@ -224,12 +234,14 @@ busy = false;
 <div class="mx-auto flex w-full max-w-[808px] flex-col gap-2 rounded-[22px] border border-neutral-300 bg-white p-3 pl-[18px] shadow-sm dark:border-neutral-700 dark:bg-neutral-900">
 <label for="prompt" class="sr-only">작업 지시 입력</label>
 <textarea id="prompt" bind:this={promptElement} bind:value={prompt} oninput={() => { touched = true; }} onpaste={pasteAttachments} rows="2" placeholder="무엇을 시킬까요? 예: 테스트 실패 원인 찾아서 고쳐줘" class="block max-h-40 min-h-12 w-full resize-y bg-transparent p-0 text-[15px] leading-6 outline-none placeholder:text-neutral-400"></textarea>
+
 {#if attachments.length > 0}<AttachmentPreview items={previewItems} removable onremove={(key) => (attachments = attachments.filter((item) => item.key !== key))} />{/if}
 {#if attachmentError}<p role="alert" class="text-sm text-red-700 dark:text-red-300">{attachmentError}</p>{/if}
 <div class="flex min-w-0 flex-nowrap items-center gap-0.5">
 <label class="flex h-[34px] w-[34px] shrink-0 cursor-pointer items-center justify-center rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800" title="이미지 또는 텍스트 파일 첨부"><Icon name="image" /><span class="sr-only">이미지 또는 TXT/MD 파일 첨부</span><input type="file" accept="image/*,.txt,.md,text/plain,text/markdown" multiple class="sr-only" onchange={attachFiles} /></label>
 <div class="min-w-0 max-w-[180px] flex-1 shrink"><ModelSelect id="new-model" bind:value={modelId} initialFromCatalog compact host={ownerHost || undefined} onselect={() => { touched = true; }} /></div>
 <select id="mode" aria-label="권한 모드" bind:value={mode} onchange={() => { touched = true; }} class="h-[34px] min-h-[34px] min-w-0 max-w-32 flex-[0.8_1_7rem] truncate rounded-lg border border-neutral-300 bg-transparent px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-neutral-500 dark:border-neutral-700">{#each MODES as m (m)}<option value={m}>{MODE_LABEL[m]}</option>{/each}</select>
+<SpeechDictation id="new-task-speech" disabled={busy} onappend={appendDictation} />
 <button type="submit" disabled={busy || attachmentReads > 0} class="flex size-[38px] shrink-0 items-center justify-center rounded-full bg-neutral-900 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" aria-label="작업 시작"><Icon name="send" class="size-4" /><span class="sr-only">시작</span></button>
 </div>
 <p class="text-xs text-neutral-500"><span class="truncate" title={ownerHost}>{ownerHost || '호스트 확인 중'}</span> · {board.connected ? '서버 연결됨' : '서버 연결 중'}</p>

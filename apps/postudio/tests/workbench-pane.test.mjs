@@ -1,5 +1,6 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { appendDictationText, createSpeechDictationController } from '../src/lib/speech-dictation.js';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,12 +11,13 @@ const source = await readFile(new URL('../src/lib/components/WorkbenchPane.svelt
 const documentSource = await readFile(new URL('../src/lib/components/WorkspaceDocument.svelte', import.meta.url), 'utf8');
 const layoutSource = await readFile(new URL('../src/routes/+layout.svelte', import.meta.url), 'utf8');
 const sidebarSource = await readFile(new URL('../src/lib/components/Sidebar.svelte', import.meta.url), 'utf8');
-let vite, Pane, WorkspaceDocument, render;
+let vite, Pane, WorkspaceDocument, render, createLayout, openTab, splitRight, isFocusedActiveTab;
 before(async () => {
  vite = await createServer({ root, configFile: resolve(root, 'vite.config.ts'), server: { middlewareMode: true }, appType: 'custom', logLevel: 'silent' });
  ({ default: Pane } = await vite.ssrLoadModule('/src/lib/components/WorkbenchPane.svelte'));
  ({ default: WorkspaceDocument } = await vite.ssrLoadModule('/src/lib/components/WorkspaceDocument.svelte'));
  ({ render } = await vite.ssrLoadModule('svelte/server'));
+ ({ createLayout, openTab, splitRight, isFocusedActiveTab } = await vite.ssrLoadModule('/src/lib/workbench-layout.ts'));
 });
 after(async () => { await vite?.close(); });
 
@@ -27,8 +29,11 @@ test('work route has no shell header and pane owns responsive navigation control
  assert.match(source, /class="desktop-sidebar"[^>]*aria-label="사이드바 펼치기"[^>]*onclick=\{\(\) => ui\.toggleSidebar\(\)\}/);
  assert.match(source, /<span class="navigation-controls" role="presentation"><button class="mobile-menu"/);
  assert.match(source, /index === 0 && ui\.sidebarHidden/);
- assert.doesNotMatch(source, /\{#if index === 0\}<span class="navigation-controls"/);
- assert.match(source, /@media\(min-width:1024px\)\{\.mobile-menu\{display:none\}\.desktop-sidebar\{display:flex\}\}/);
+ assert.match(source, /<strong>작업 그룹 \{index \+ 1\}<\/strong>/);
+ assert.match(source, /\.navigation-controls \.mobile-menu\{display:none\}/);
+ assert.ok(source.indexOf('class="navigation-controls"') < source.indexOf('class="tabstrip"'));
+ assert.match(source, /<\/div><button class="add"/);
+ assert.match(source, /@media\(min-width:1024px\)\{\.navigation-controls \.mobile-menu\{display:none\}\.desktop-sidebar\{display:flex\}\}/);
  assert.match(sidebarSource, /워크스페이스/);
  assert.match(sidebarSource, /\/artifacts/);
 });
@@ -41,7 +46,7 @@ test('loading route keeps navigation available without shell workspace header', 
  assert.doesNotMatch(route, /워크스페이스 정보|아티팩트/);
 });
 
-test('blocked hosts render an error and never embed a preview', () => {
+test('blocked hosts render an error and never embed a preview', async () => {
  const { body } = render(Pane, { props: { ...props, blocked: true } });
  assert.doesNotMatch(body, /<iframe|<img/);
 });
@@ -85,7 +90,7 @@ test('folder navigation is separate from file selection and requests stay pinned
  assert.match(documentSource, /artifactUrl\(origin, tab\.sessionId, tab\.path\)/);
  assert.match(documentSource, /configuredUntrustedOrigin\(node, host\)/);
  assert.match(documentSource, /generation/);
- assert.match(documentSource, /ports.includes\(tab.port\)/);
+ assert.match(documentSource, /ports\.includes\(tab\.port\)/);
  assert.doesNotMatch(documentSource, /allow-same-origin/);
 });
 
@@ -94,4 +99,35 @@ test('workspace renders dynamic tab titles from supplied conversation roster', (
  assert.match(body, /실제 대화 제목/);
  assert.match(body, /role="tab"/);
  assert.equal((body.match(/role="tab"/g) ?? []).length, 1);
+ assert.doesNotMatch(body, />작업 그룹 1<\/strong>/);
+ assert.doesNotMatch(body, /class="group-picker"/);
+});
+
+test('switching mobile workbench group stops hidden conversation capture and ignores late final', () => {
+ const firstTab = { kind: 'conversation', id: 'conversation:first', sessionId: 'first', title: '첫 대화' };
+ const secondTab = { kind: 'conversation', id: 'conversation:second', sessionId: 'second', title: '두 번째 대화' };
+ let layout = splitRight(openTab(createLayout(firstTab), secondTab, 'group-1'), secondTab.id);
+ layout = { ...layout, focusedGroup: 'group-1' };
+ assert.match(source, /active=\{isFocusedActiveTab\(layout, owner\?\.id, tab\.id\)\}/);
+ const groupId = layout.groups.find((group) => group.tabs.includes(firstTab.id)).id;
+ assert.equal(isFocusedActiveTab(layout, groupId, firstTab.id), true);
+ let draft = 'typed draft';
+ const instances = [];
+ const controller = createSpeechDictationController({
+  getRecognition: () => class {
+   constructor() { instances.push(this); }
+   start() {}
+   abort() { this.aborted = true; }
+  },
+  secureContext: true,
+  onFinal: (text) => { draft = appendDictationText(draft, text); },
+  onState() {}
+ });
+ controller.start();
+ layout = { ...layout, focusedGroup: 'group-2' };
+ if (!isFocusedActiveTab(layout, groupId, firstTab.id) && controller.state.requested) controller.stop('다른 작업 그룹이 선택되어 음성 입력을 중지했습니다.');
+ instances[0].onresult({ results: [{ isFinal: true, 0: { transcript: 'late sentence.' } }] });
+ assert.equal(controller.state.requested, false);
+ assert.equal(instances[0].aborted, true);
+ assert.equal(draft, 'typed draft');
 });

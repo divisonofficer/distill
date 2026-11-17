@@ -72,6 +72,7 @@ fn running_inspection(id: &str, parent: &str) -> SubagentInspection {
         },
         parent_session_id: parent.to_string(),
         child_session_id: format!("child-{id}"),
+        tool_call_id: None,
         fork_parent_prompt_id: None,
         resumed_from: None,
     }

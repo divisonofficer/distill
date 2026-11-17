@@ -1305,7 +1305,7 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
     local
         .run_until(async {
             let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
-            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let (persistence_tx, mut persistence_rx) = mpsc::unbounded_channel();
             let actor =
                 Arc::new(create_test_actor(50_000, 200_000, 85, gateway_tx, persistence_tx).await);
             let base_url = spawn_deterministic_400_server().await;
@@ -1328,6 +1328,35 @@ async fn bare_manual_compact_failure_does_not_suppress_auto() {
                 SUPPRESS_NONE,
                 "manual /compact (even without args) must never set auto-compact suppression"
             );
+            settle_test_persistence(&actor).await;
+            let mut lifecycle = Vec::new();
+            while let Ok(msg) = persistence_rx.try_recv() {
+                if let PersistenceMsg::Update(crate::session::storage::SessionUpdate::Xai(notif)) =
+                    msg
+                {
+                    match &notif.update {
+                        crate::extensions::notification::SessionUpdate::AutoCompactStarted {
+                            reason,
+                            ..
+                        } => lifecycle.push(("started", reason.clone())),
+                        crate::extensions::notification::SessionUpdate::AutoCompactFailed {
+                            ..
+                        } => lifecycle.push(("failed", String::new())),
+                        crate::extensions::notification::SessionUpdate::AutoCompactCompleted {
+                            ..
+                        } => lifecycle.push(("completed", String::new())),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(
+                lifecycle
+                    .iter()
+                    .map(|(event, _)| *event)
+                    .collect::<Vec<_>>(),
+                vec!["started", "failed"]
+            );
+            assert_eq!(lifecycle[0].1, "Manual /compact");
             let result = actor
                 .run_compact_only(
                     AutoCompactTriggerInfo {

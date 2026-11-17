@@ -30,6 +30,10 @@ export function createLayout(initialTab: WorkbenchTab): WorkbenchLayout {
   return { tabs: { [initialTab.id]: { ...initialTab } }, groups: [{ id: 'group-1', tabs: [initialTab.id], active: initialTab.id }], focusedGroup: 'group-1' };
 }
 
+export function isFocusedActiveTab(layout: WorkbenchLayout, groupId: string | undefined, tabId: string): boolean {
+  return layout.focusedGroup === groupId && layout.groups.find((group) => group.id === groupId)?.active === tabId;
+}
+
 export function openTab(layout: WorkbenchLayout, tab: WorkbenchTab, groupId?: string): WorkbenchLayout {
   const next = clone(layout);
   if (next.tabs[tab.id]) return activateTab(next, tab.id);

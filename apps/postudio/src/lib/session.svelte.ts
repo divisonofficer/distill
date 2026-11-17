@@ -1,4 +1,4 @@
-import type { PermissionOption, Sep, Status, ToolContent, UserAttachment } from './types';
+import type { PermissionOption, QueueEntry, Sep, Status, ToolContent, UserAttachment } from './types';
 
 export function sessionDestination(search: string, configured: (origin: string) => boolean): string {
 const host = new URLSearchParams(search).get('host');
@@ -37,6 +37,13 @@ export interface AttachmentItem {
 
 export type Item = TextItem | ToolItem | AttachmentItem;
 
+export type CompactionState =
+	| { status: 'running'; tokensUsed: number; contextWindow: number; reason: string }
+	| { status: 'completed'; tokensBefore?: number; tokensAfter: number; elapsedMs?: number | null }
+	| { status: 'failed'; error: string }
+	| { status: 'cancelled'; reason: string }
+	| { status: 'unknown' };
+
 export interface Pending {
 	id: unknown;
 	toolCallId: string;
@@ -52,6 +59,9 @@ export class SessionView {
 	title = $state('');
 	modelId = $state('');
 	usage = $state<{ used: number; size: number } | null>(null);
+	queue = $state<QueueEntry[]>([]);
+	activePromptId = $state<string | null>(null);
+	compaction = $state<CompactionState | null>(null);
 	permissions = $state<Pending[]>([]);
 	revision = $state(0);
 
@@ -63,22 +73,33 @@ export class SessionView {
 		return this.status === 'running' || this.status === 'waiting_permission';
 	}
 
-	reset() {
+	reset(preserveQueue = false) {
 		this.items = [];
 		this.permissions = [];
 		this.usage = null;
 		this.title = '';
 		this.modelId = '';
+this.compaction = null;
+		if (!preserveQueue) { this.queue = []; this.activePromptId = null; }
 		this.#toolIndex.clear();
 		this.#canAppend = false;
 	}
 
 	applyHistoryPage(items: Sep[], initial: boolean) {
 		if (initial) {
+			const liveCompaction = this.compaction;
 			this.items = [];
 			this.#toolIndex.clear();
 			this.#canAppend = false;
-			for (const item of items) this.apply(item);
+			const historyCompaction = new SessionView();
+			for (const item of items) {
+				if (item.t.startsWith('compaction.')) historyCompaction.apply(item);
+				else if (item.t === 'turn.end') {
+					this.#canAppend = false;
+					if (item.error) this.#push('error', item.error);
+				} else this.apply(item);
+			}
+			this.compaction = liveCompaction ?? (historyCompaction.compaction?.status === 'running' ? null : historyCompaction.compaction);
 			return;
 		}
 		const previousCanAppend = this.#canAppend;
@@ -107,16 +128,20 @@ continue;
 
 	setConnected(on: boolean) {
 		this.connected = on;
-		if (!on) this.status = 'offline';
-else this.status = 'idle';
+		if (!on) {
+			this.status = 'offline';
+			if (this.compaction?.status === 'running') this.compaction = { status: 'unknown' };
+		} else this.status = this.activePromptId ? 'running' : 'idle';
 	}
 
 	apply(ev: Sep) {
 		this.revision++;
 		switch (ev.t) {
 			case 'session.state':
+				if (this.activePromptId && ev.status === 'idle') break;
 				this.status = ev.status;
 				if (ev.status === 'error') {
+					if (this.compaction?.status === 'running') this.compaction = { status: 'unknown' };
 					this.permissions = [];
 					this.#canAppend = false;
 				}
@@ -129,6 +154,32 @@ else this.status = 'idle';
 				break;
 			case 'usage':
 				this.usage = { used: ev.used, size: ev.size };
+				break;
+			case 'prompt.accepted':
+				break;
+			case 'queue.changed':
+				this.queue = ev.entries;
+				if (ev.snapshot) {
+					this.activePromptId = ev.running_prompt_id ?? null;
+					this.status = this.activePromptId ? 'running' : 'idle';
+				} else if (ev.running_prompt_id) {
+					this.activePromptId = ev.running_prompt_id;
+					this.status = 'running';
+				} else if (!this.activePromptId && ev.entries.length === 0) {
+					this.status = 'idle';
+				}
+				break;
+			case 'compaction.started':
+				this.compaction = { status: 'running', tokensUsed: ev.tokens_used, contextWindow: ev.context_window, reason: ev.reason };
+				break;
+			case 'compaction.completed':
+				this.compaction = { status: 'completed', tokensBefore: ev.tokens_before, tokensAfter: ev.tokens_after, elapsedMs: ev.elapsed_ms };
+				break;
+			case 'compaction.failed':
+				this.compaction = { status: 'failed', error: ev.error };
+				break;
+			case 'compaction.cancelled':
+				this.compaction = { status: 'cancelled', reason: ev.reason };
 				break;
 			case 'user.message':
 				this.#push('user', ev.text);
@@ -163,12 +214,17 @@ case 'permission.resolved':
 				this.permissions = this.permissions.filter((p) => p.toolCallId !== ev.tool_call_id);
 				break;
 			case 'turn.end':
+				if (this.activePromptId && ev.prompt_id !== this.activePromptId) break;
+				this.activePromptId = null;
+				this.status = ev.stop_reason === 'error' ? 'error' : 'idle';
+				if (this.compaction?.status === 'running') this.compaction = { status: 'unknown' };
 				this.permissions = [];
 				this.#canAppend = false;
 				if (ev.error) this.#push('error', ev.error);
 				break;
 			case 'error':
-								this.#push('error', ev.message);
+				if (this.compaction?.status === 'running') this.compaction = { status: 'unknown' };
+				this.#push('error', ev.message);
 				break;
 			case 'replay.end':
 				break;

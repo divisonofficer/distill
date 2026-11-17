@@ -214,6 +214,12 @@ enum TerminalCommand {
         reply: oneshot::Sender<KillOutcome>,
     },
 
+    KillScoped {
+        session_id: String,
+        task_id: String,
+        reply: oneshot::Sender<KillOutcome>,
+    },
+
     /// Sent on turn cancellation.
     KillForegroundCommands,
 
@@ -302,6 +308,19 @@ impl BackgroundReason {
             Self::ForegroundTimeout => "auto_backgrounded",
         }
     }
+}
+
+async fn reload_task_snapshot_output(snapshot: &mut TaskSnapshot) {
+    if snapshot.output_file.as_os_str().is_empty() {
+        snapshot.output = "[task output unavailable: task output file path missing]".to_string();
+        snapshot.truncated = true;
+        return;
+    }
+
+    let (output, incomplete) =
+        task_log::read_tail(&snapshot.output_file, task_log::MAX_SNAPSHOT_BYTES).await;
+    snapshot.output = output;
+    snapshot.truncated |= incomplete;
 }
 
 struct ProcessState {
@@ -452,13 +471,7 @@ impl ProcessState {
 
     async fn to_task_snapshot(&self, task_id: &str) -> TaskSnapshot {
         let swept = matches!(self.lifecycle, Lifecycle::Swept { .. });
-        let (output, short_of_full_log) = if swept && !self.output_file.as_os_str().is_empty() {
-            task_log::read_prefix(&self.output_file, task_log::MAX_SNAPSHOT_BYTES).await
-        } else {
-            (self.ring_output(), false)
-        };
-
-        TaskSnapshot {
+        let mut snapshot = TaskSnapshot {
             task_id: task_id.to_string(),
             command: self.command.clone(),
             display_command: self.display_command.clone(),
@@ -472,9 +485,13 @@ impl ProcessState {
             } else {
                 None
             },
-            output,
+            output: if swept {
+                String::new()
+            } else {
+                self.ring_output()
+            },
             output_file: self.output_file.clone(),
-            truncated: self.truncated || short_of_full_log,
+            truncated: self.truncated,
             output_total_bytes: self.total_bytes,
             exit_code: self.lifecycle.exit_status().and_then(|s| s.exit_code),
             signal: self.lifecycle.exit_status().and_then(|s| s.signal.clone()),
@@ -486,7 +503,11 @@ impl ProcessState {
             owner_session_id: self.owner_session_id.clone(),
             description: self.description.clone(),
             is_backgrounded: self.bg_status.is_backgrounded(),
+        };
+        if swept {
+            reload_task_snapshot_output(&mut snapshot).await;
         }
+        snapshot
     }
 
     /// Metadata-only row: no log reads, empty stdout.
@@ -1030,10 +1051,15 @@ impl LocalTerminalActor {
                 self.handle_run_background(request, reply).await;
             }
             TerminalCommand::GetTask { task_id, reply } => {
-                let snapshot = match self.processes.get(&task_id) {
+                let mut snapshot = match self.processes.get(&task_id) {
                     Some(p) => Some(p.to_task_snapshot(&task_id).await),
                     None => self.completed_task_snapshots.get(&task_id).cloned(),
                 };
+                if let Some(snapshot) = snapshot.as_mut()
+                    && !self.processes.contains_key(&task_id)
+                {
+                    reload_task_snapshot_output(snapshot).await;
+                }
                 let _ = reply.send(snapshot);
             }
             TerminalCommand::Kill {
@@ -1042,6 +1068,32 @@ impl LocalTerminalActor {
                 reply,
             } => {
                 let outcome = self.handle_kill(&task_id, source).await;
+                let _ = reply.send(outcome);
+            }
+            TerminalCommand::KillScoped {
+                session_id,
+                task_id,
+                reply,
+            } => {
+                let allowed = self
+                    .processes
+                    .get(&task_id)
+                    .map(|process| {
+                        process.owner_session_id.as_deref() == Some(session_id.as_str())
+                            && process.bg_status.is_backgrounded()
+                    })
+                    .or_else(|| {
+                        self.completed_task_snapshots.get(&task_id).map(|task| {
+                            task.owner_session_id.as_deref() == Some(session_id.as_str())
+                                && task.is_backgrounded
+                        })
+                    })
+                    .unwrap_or(false);
+                let outcome = if allowed {
+                    self.handle_kill(&task_id, KillSource::ClientUi).await
+                } else {
+                    KillOutcome::NotFound
+                };
                 let _ = reply.send(outcome);
             }
             TerminalCommand::WaitForCompletion {
@@ -1067,7 +1119,9 @@ impl LocalTerminalActor {
                 }
                 for snap in self.completed_task_snapshots.values() {
                     if include_output {
-                        snapshots.push(snap.clone());
+                        let mut snapshot = snap.clone();
+                        reload_task_snapshot_output(&mut snapshot).await;
+                        snapshots.push(snapshot);
                     } else {
                         let mut meta = snap.clone();
                         meta.output.clear();
@@ -1422,11 +1476,11 @@ impl LocalTerminalActor {
         let Some(process) = self.processes.get_mut(&task_id) else {
             // Imprint block_waited on the tombstone in place, but only when the reply
             // is delivered: a dropped receiver (cancelled turn) means the model never saw it.
-            let snapshot = self.completed_task_snapshots.get(&task_id).map(|s| {
-                let mut s = s.clone();
-                s.block_waited = true;
-                s
-            });
+            let mut snapshot = self.completed_task_snapshots.get(&task_id).cloned();
+            if let Some(snapshot) = snapshot.as_mut() {
+                snapshot.block_waited = true;
+                reload_task_snapshot_output(snapshot).await;
+            }
             let found = snapshot.is_some();
             let delivered = reply.send(snapshot).is_ok();
             if found
@@ -1759,8 +1813,8 @@ impl LocalTerminalActor {
                     end_time: p.end_wall_time,
                     output: String::new(),
                     output_file: p.output_file.clone(),
-                    // The output is dropped here; the log file keeps it.
-                    truncated: p.truncated || p.total_bytes > 0,
+                    // The log remains available for bounded snapshot reloads.
+                    truncated: p.truncated,
                     exit_code: p.lifecycle.exit_status().and_then(|s| s.exit_code),
                     signal: p.lifecycle.exit_status().and_then(|s| s.signal.clone()),
                     completed: true,
@@ -2598,6 +2652,27 @@ impl TerminalBackend for LocalTerminalBackend {
             return KillOutcome::NotFound;
         }
         reply_rx.await.unwrap_or(KillOutcome::NotFound)
+    }
+
+    fn scoped_kill_supported(&self) -> bool {
+        true
+    }
+
+    async fn kill_task_scoped(&self, session_id: &str, task_id: &str) -> KillOutcome {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(TerminalCommand::KillScoped {
+                session_id: session_id.to_string(),
+                task_id: task_id.to_string(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return KillOutcome::NotFound;
+        }
+        rx.await.unwrap_or(KillOutcome::NotFound)
     }
 
     async fn wait_for_completion(
@@ -3444,6 +3519,91 @@ mod tests {
             owner_session_id: None,
             description: None,
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_kill_checks_owner_and_background_atomically() {
+        let backend = LocalTerminalBackend::new();
+        assert!(backend.scoped_kill_supported());
+        let mut request = make_request("sleep 30");
+        request.owner_session_id = Some("owner".into());
+        let own = backend.run_background(request).await.unwrap();
+        assert_eq!(
+            backend.kill_task_scoped("sibling", &own.task_id).await,
+            KillOutcome::NotFound
+        );
+        assert!(!backend.get_task(&own.task_id).await.unwrap().completed);
+
+        let missing_owner = backend
+            .run_background(make_request("sleep 30"))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .kill_task_scoped("owner", &missing_owner.task_id)
+                .await,
+            KillOutcome::NotFound
+        );
+        assert_eq!(
+            backend.kill_task_scoped("owner", "missing").await,
+            KillOutcome::NotFound
+        );
+
+        let foreground_backend = backend.clone();
+        let mut request = make_request("sleep 29");
+        request.owner_session_id = Some("owner".into());
+        let foreground = tokio::spawn(async move { foreground_backend.run(request).await });
+        let foreground_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(task) = backend
+                    .list_tasks_metadata()
+                    .await
+                    .into_iter()
+                    .find(|task| task.command == "sleep 29")
+                {
+                    break task.task_id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            backend.kill_task_scoped("owner", &foreground_id).await,
+            KillOutcome::NotFound
+        );
+        assert!(!backend.get_task(&foreground_id).await.unwrap().completed);
+        assert_eq!(
+            backend.kill_task_scoped("owner", &own.task_id).await,
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            backend.kill_task_scoped("owner", &own.task_id).await,
+            KillOutcome::AlreadyExited
+        );
+        let mut request = make_request("true");
+        request.owner_session_id = Some("owner".into());
+        let completed = backend.run_background(request).await.unwrap();
+        assert!(
+            backend
+                .wait_for_completion(&completed.task_id, Some(Duration::from_secs(10)))
+                .await
+                .unwrap()
+                .completed
+        );
+        assert_eq!(
+            backend.kill_task_scoped("owner", &completed.task_id).await,
+            KillOutcome::AlreadyExited
+        );
+        assert_eq!(
+            backend
+                .kill_task_scoped("sibling", &completed.task_id)
+                .await,
+            KillOutcome::NotFound
+        );
+        backend.kill_task(&missing_owner.task_id).await;
+        backend.kill_task(&foreground_id).await;
+        foreground.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -4968,18 +5128,20 @@ mod tests {
         assert!(snap_after.completed);
         assert_eq!(snap_after.exit_code, Some(0));
         assert_eq!(snap_after.task_id, bg.task_id);
-        assert!(snap_after.output.is_empty());
+        assert_eq!(snap_after.output, "eviction_test_output\n");
         assert!(snap_after.output_total_bytes > 0);
         assert!(
-            snap_after.truncated,
-            "a tombstone that reports bytes must not claim complete output"
+            !snap_after.truncated,
+            "a tombstone reloaded from its complete log must report complete output"
         );
 
         let all = backend.list_tasks().await;
-        assert!(
-            all.iter().any(|t| t.task_id == bg.task_id),
-            "evicted task should appear in list_tasks"
-        );
+        let listed = all
+            .iter()
+            .find(|task| task.task_id == bg.task_id)
+            .expect("evicted task should appear in list_tasks");
+        assert_eq!(listed.output, "eviction_test_output\n");
+        assert!(!listed.truncated);
 
         let snap_wait = backend
             .wait_for_completion(&bg.task_id, Some(Duration::from_millis(100)))

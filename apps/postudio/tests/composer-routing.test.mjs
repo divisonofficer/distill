@@ -21,6 +21,14 @@ test('routing model selection is direct; separate button shows real account rout
   assert.match(routing, /<ModelSelect compact[^>]+host=\{host\}[^>]+commitOnSelect=\{false\} onselect=\{onselect\}/);
   assert.match(routing, /aria-label="계정 라우팅 정보"/);
   assert.match(routing, /height:34px/);
+  assert.match(routing, /void load\(\)/);
+  assert.match(routing, /request !== generation/);
+  assert.match(routing, /automatic && config\?\.enabled && config\.options\.length === 1/);
+  assert.match(routing, /설정 경로/);
+  assert.match(routing, /configured\.main_model/);
+  assert.match(routing, /configured\.worker_model/);
+  assert.match(routing, /config\.options\.length > 1/);
+  assert.match(routing, /summary-model\{min-width:0;overflow:hidden;text-overflow:ellipsis/);
   const popup = routing.slice(routing.indexOf('class="routing-popover"'), routing.indexOf('{/if}', routing.indexOf('class="routing-popover"')));
   assert.doesNotMatch(popup, /<ModelSelect/);
   assert.match(routing, /settings#routing-h/);
@@ -60,8 +68,22 @@ test('compact composer separates real usage and approval policy from routing', (
   assert.doesNotMatch(routing, /transform:translateY/);
 });
 
-test('composer preserves single running cancel control and 48px two-row input', () => {
+test('composer preserves single in-composer stop control and 48px two-row input', () => {
   assert.match(session, /<textarea[\s\S]*?rows="2"[\s\S]*?min-h-12/);
-  assert.match(session, /role="status"[\s\S]*?aria-label="중단"/);
-  assert.equal((session.match(/aria-label="중단"/g) ?? []).length, 1);
+  assert.match(session, /view\.running && !hasDraft[\s\S]*?aria-label="중지"/);
+  assert.match(session, /class:composer-running=\{view\.running\}/);
+  assert.doesNotMatch(session, /실행이 끝난 뒤 보낼/);
+  assert.equal((session.match(/aria-label="중지"/g) ?? []).length, 1);
+});
+
+test('approval policy control exposes mode-specific icons and accessible name', async () => {
+  const summary = session.match(/<summary aria-label={`승인 정책:[\s\S]*?<\/summary>/)?.[0];
+  assert.ok(summary);
+  assert.match(summary, /title={`승인 정책 · \${modeLabel}`}/);
+  assert.match(summary, /aria-label={`승인 정책: \${modeLabel}`}/);
+  assert.match(summary, /mode === 'auto' \? 'shield-check' : mode === 'always-approve' \? 'shield-off' : 'shield'/);
+  assert.match(summary, /text-blue-700 dark:text-blue-400/);
+  assert.match(summary, /text-amber-700 dark:text-amber-400/);
+  const icons = await readFile(new URL('../src/lib/components/Icon.svelte', root), 'utf8');
+  assert.match(icons, /'shield-off': '[^']*M3 3l18 18'/);
 });

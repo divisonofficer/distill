@@ -883,6 +883,7 @@ mod live_orphan_hook_tests {
             },
             parent_session_id: String::new(),
             child_session_id: format!("child-{id}"),
+            tool_call_id: None,
             fork_parent_prompt_id: None,
             resumed_from: None,
         }

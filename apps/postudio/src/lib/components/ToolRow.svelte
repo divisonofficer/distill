@@ -3,11 +3,13 @@ import Icon from './Icon.svelte';
 import type { ToolItem } from '$lib/session.svelte';
 import type { ToolContent } from '$lib/types';
 import type { Tone } from '$lib/format';
+import { childExecutionState, type AgentExecution } from '$lib/executions.svelte';
 
-let { item, id, onselect, grouped = false }: { item: ToolItem; id?: string; onselect?: (item: ToolItem) => void; grouped?: boolean } = $props();
+let { item, id, onselect, onoutput, childExecution = null, childExecutionFresh = false, childNeedsInput = false, grouped = false }: { item: ToolItem; id?: string; onselect?: (item: ToolItem) => void; onoutput?: (item: ToolItem) => void; childExecution?: AgentExecution | null; childExecutionFresh?: boolean; childNeedsInput?: boolean; grouped?: boolean } = $props();
+let expanded = $state(false);
 
-type ToolIcon = 'document' | 'terminal' | 'edit' | 'server';
-type OperationKind = 'read' | 'command' | 'edit' | 'other';
+type ToolIcon = 'document' | 'terminal' | 'edit' | 'server' | 'stop';
+type OperationKind = 'read' | 'command' | 'edit' | 'subagent' | 'other';
 
 const statusLabels: Record<string, { label: string; tone: Tone }> = {
 pending: { label: '대기', tone: 'idle' },
@@ -29,7 +31,7 @@ if (/(^|[_:/-])todo_write$/.test(name)) {
 const todos = Array.isArray(input.todos) ? input.todos : Array.isArray(input.tasks) ? input.tasks : undefined;
 return { kind: 'other' as const, label: '작업 목록 갱신', icon: 'edit' as const, detail: todos ? `할 일 ${todos.length}개` : undefined };
 }
-if (/(^|[_:/-])spawn_subagent$/.test(name)) return { kind: 'other' as const, label: '하위 에이전트', icon: 'server' as const, detail: description ?? firstString(input, ['subagent_type', 'agent_type', 'type']) };
+if (/(^|[_:/-])spawn_subagent$/.test(name)) return { kind: 'subagent' as const, label: '서브에이전트', icon: 'server' as const, role: childExecution?.subagentType || firstString(input, ['subagent_type', 'subagentType', 'agent_type', 'agentType', 'type']), description: childExecution?.description || description };
 if (!/(^|[_:/-])search_replace$/.test(name) && /(^|[_:/-])(grep|search)$/.test(name)) return { kind: 'other' as const, label: '검색', icon: 'document' as const, detail: [firstString(input, ['pattern', 'query']), firstString(input, ['path']), firstString(input, ['glob'])].filter(Boolean).join(' · ') || undefined };
 if (kind === 'read' || /(^|[^a-z])read(?:_|$)|readfile|file_reader/.test(name)) {
 return { kind: 'read' as const, label: '파일 읽기', icon: 'document' as const, detail: path ?? (item.title !== item.name ? item.title : undefined) };
@@ -58,8 +60,33 @@ const match = output.match(/(?:^|\n)\s*(?:exit:\s*(-?\d+)|exit code:\s*(-?\d+))(
 if (!match) return null;
 return Number(match[1] ?? match[2]);
 });
-const commandFailed = $derived(item.status === 'completed' && commandExitCode !== null && commandExitCode !== 0 && commandExitCode !== -1);
+const commandSignal = $derived.by(() => {
+if (operation.kind !== 'command') return null;
+return texts.map(content => content.text).join('\n').match(/(?:^|\n)\s*(?:signal|termination signal)\s*:\s*([^\s]+)/i)?.[1] ?? null;
+});
+const commandCancelled = $derived(operation.kind === 'command' && texts.some(content => /(?:^|\n)\s*(?:cancelled|canceled)\s*:\s*true\b/i.test(content.text)));
+const commandStopped = $derived(item.status === 'completed' && commandCancelled);
+const commandFailed = $derived(item.status === 'completed' && (commandSignal !== null || (commandExitCode !== null && commandExitCode !== 0 && commandExitCode !== -1)));
+const subagentRequestStatus = $derived.by(() => {
+if (operation.kind !== 'subagent') return null;
+if (childExecution) {
+const state = childExecutionState(childExecution.status, childExecutionFresh, childNeedsInput);
+return ({ running: '실행 중', blocked: '확인 필요', done: '완료', failed: '실패', stopped: '중지됨', unknown: '상태 확인 중' } as const)[state];
+}
+return ({ pending: '요청 대기', in_progress: '요청 중', failed: '호출 실패' } as Record<string, string>)[item.status ?? ''] ?? '상태 확인 중';
+});
+const subagentDuration = $derived(childExecution && ((childExecution.status !== 'running' && childExecution.status !== 'initializing') || childExecutionFresh) ? Math.floor(Math.max(0, childExecution.durationMs) / 1000) : null);
+const failureSummary = $derived.by(() => {
+if (item.status !== 'failed' && !commandFailed) return null;
+const actualText = texts.map((content) => content.text.trim()).find(Boolean);
+if (!actualText) return null;
+const lines = actualText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+return (lines.find(line => /error|failed|failure|exception/i.test(line)) ?? lines.find(line => !/^exit(?: code)?:/i.test(line)) ?? lines[0]).slice(0, 180);
+});
 const status = $derived.by(() => {
+if (commandStopped) return { label: '중지됨', tone: 'idle' as Tone };
+if (commandSignal) return { label: `신호 종료 · ${commandSignal}`, tone: 'err' as Tone };
+if (operation.kind === 'command' && item.status === 'completed' && commandExitCode === -1) return { label: '상태 확인 중', tone: 'idle' as Tone };
 if (commandFailed) return { label: `명령 실패 · 종료 코드 ${commandExitCode}`, tone: 'err' as Tone };
 return item.status ? (statusLabels[item.status] ?? { label: item.status, tone: 'idle' as Tone }) : null;
 });
@@ -109,35 +136,46 @@ return { added, removed };
 }
 </script>
 
-<details {id} tabindex="-1" open={item.status === 'failed' || item.status === 'in_progress' || commandFailed} class={grouped ? 'group bg-white text-sm text-neutral-700 dark:bg-neutral-900 dark:text-neutral-300' : 'group overflow-hidden rounded-xl border border-neutral-200 bg-white text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300'}>
+<details {id} bind:open={expanded} tabindex="-1" class={grouped ? 'group bg-white text-sm text-neutral-700 dark:bg-neutral-900 dark:text-neutral-300' : 'group overflow-hidden rounded-xl border border-neutral-200 bg-white text-sm text-neutral-700 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300'}>
 <summary class="flex min-h-10 cursor-pointer list-none items-center gap-2 px-3 select-none hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800/80">
-{#if item.status === 'failed' || commandFailed}<span aria-label="실패" class="size-2 shrink-0 rounded-full bg-red-500"></span>{:else if item.status === 'in_progress'}<span aria-label="실행 중" class="size-2 shrink-0 animate-pulse rounded-full bg-sky-500"></span>{:else if item.status === 'completed'}<span aria-label="완료" class="shrink-0 text-emerald-600 dark:text-emerald-400">✓</span>{:else if item.status === 'pending'}<span aria-label="대기" class="size-2 shrink-0 rounded-full bg-neutral-400"></span>{/if}
+{#if operation.kind === 'subagent'}
+<span aria-hidden="true" class="grid size-7 shrink-0 place-items-center rounded-full bg-neutral-100 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300"><Icon name="server" class="size-4" /></span>
+<span class="min-w-0 flex-1">
+<span class="flex flex-wrap items-center gap-x-2 gap-y-0.5"><span class="font-medium">{operation.label}</span>{#if operation.role}<span class="rounded-full bg-neutral-100 px-2 py-0.5 text-xs text-neutral-600 dark:bg-neutral-800 dark:text-neutral-300">{operation.role}</span>{/if}</span>
+{#if operation.description}<span class="mt-0.5 line-clamp-2 whitespace-normal break-words text-xs leading-5 text-neutral-600 dark:text-neutral-400">{operation.description}</span>{/if}
+</span>
+{#if subagentRequestStatus}<span class="shrink-0 rounded-full border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 dark:border-neutral-700 dark:text-neutral-300">{subagentRequestStatus}</span>{/if}{#if subagentDuration !== null}<time class="shrink-0 text-xs text-neutral-500" aria-label="실행 시간 {subagentDuration}초">{subagentDuration}초</time>{/if}
+{:else}
+{#if commandStopped}<Icon name="stop" class="size-3 shrink-0 text-neutral-500" />{:else if item.status === 'failed' || commandFailed}<span aria-label="실패" class="size-2 shrink-0 rounded-full bg-red-500"></span>{:else if item.status === 'in_progress'}<span aria-label="실행 중" class="size-2 shrink-0 animate-pulse rounded-full bg-sky-500"></span>{:else if item.status === 'completed' && operation.kind === 'command' && commandExitCode === -1}<span aria-label="상태 확인 중" class="size-2 shrink-0 rounded-full bg-neutral-400"></span>{:else if item.status === 'completed'}<span aria-label="완료" class="shrink-0 text-emerald-600 dark:text-emerald-400">✓</span>{:else if item.status === 'pending'}<span aria-label="대기" class="size-2 shrink-0 rounded-full bg-neutral-400"></span>{/if}
 <Icon name={operation.icon as ToolIcon} class="size-4 shrink-0 text-neutral-500" />
 <span class="max-w-[40%] shrink-0 truncate font-medium" title={operation.label}>{operation.label}</span>
 {#if operation.detail}<code class="min-w-0 flex-1 truncate text-left text-xs text-neutral-600 dark:text-neutral-400" title={operation.detail}>{operation.detail}</code>{:else}<span class="min-w-0 flex-1"></span>{/if}
+{/if}
 {#if changeSummary}<span class="shrink-0 text-xs text-neutral-500"><span class="text-emerald-700 dark:text-emerald-400">+{changeSummary.added}</span> / <span class="text-red-700 dark:text-red-400">−{changeSummary.removed}</span></span>{/if}
-{#if commandExitCode !== null}<span class="shrink-0 text-xs text-neutral-500">exit {commandExitCode}</span>{:else if status}<span class="shrink-0 text-xs text-neutral-500">{status.label}</span>{/if}
+{#if failureSummary}<span role="alert" class="min-w-0 flex-1 truncate text-left text-xs text-red-700 dark:text-red-300" title={failureSummary}>{failureSummary}</span>{/if}
+{#if commandStopped}<span class="shrink-0 text-xs text-neutral-500">중지됨</span>{:else if commandSignal}<span class="shrink-0 text-xs text-neutral-500">신호 종료</span>{:else if operation.kind === 'command' && commandExitCode === -1}<span class="shrink-0 text-xs text-neutral-500">상태 확인 중</span>{:else if commandExitCode !== null}<span class="shrink-0 text-xs text-neutral-500">exit {commandExitCode}</span>{:else if operation.kind !== 'subagent' && status && item.status !== 'completed'}<span class="shrink-0 text-xs text-neutral-500">{status.label}</span>{/if}
 </summary>
-<div class="flex flex-col gap-2 border-t border-neutral-200 bg-neutral-950 p-2 dark:border-neutral-800">
+<div class="flex max-h-72 flex-col gap-2 overflow-auto border-t border-neutral-200 bg-neutral-950 p-2 dark:border-neutral-800">
 {#if item.status === 'failed' && texts.length === 0}<p role="alert" class="font-mono text-xs text-red-300">도구 실행 실패</p>{/if}
 {#each item.content ?? [] as content, index (index)}
 {#if content.type === 'text'}
-<pre class="overflow-x-auto font-mono text-xs leading-5 whitespace-pre-wrap text-neutral-100">{content.text}</pre>
+<pre class="max-h-48 overflow-auto font-mono text-xs leading-5 whitespace-pre-wrap text-neutral-100">{content.text}</pre>
 {:else if content.type === 'diff'}
 <div class="text-xs">
 <p class="mb-1 break-all font-mono text-neutral-400">{content.path}</p>
-<div class="overflow-x-auto rounded bg-neutral-900 font-mono">
+<div class="max-h-48 overflow-auto rounded bg-neutral-900 font-mono">
 {#if content.old !== undefined}<pre class="bg-red-950/70 p-2 whitespace-pre-wrap text-red-200">- {content.old}</pre>{/if}
 <pre class="bg-emerald-950/70 p-2 whitespace-pre-wrap text-emerald-200">+ {content.new}</pre>
 </div>
 </div>
 {/if}
 {/each}
+{#if operation.kind === 'command' && onoutput}<button type="button" class="self-start rounded-md px-2 py-1 text-xs text-sky-700 hover:bg-neutral-800 dark:text-sky-300" onclick={(event) => { event.stopPropagation(); onoutput(item); }}>출력 보기</button>{/if}
 {#if onselect}<button type="button" class="self-start rounded-md px-2 py-1 text-xs text-sky-700 hover:bg-neutral-800 dark:text-sky-300" onclick={(event) => { event.stopPropagation(); onselect(item); }}>상세 탭 열기</button>{/if}
 {#each images as src, index (index)}
 <img {src} alt="도구 결과 이미지 {index + 1}" class="h-auto w-auto max-w-full self-start rounded-lg" />
 {/each}
-{#if item.input !== undefined}<details class="text-xs text-neutral-400"><summary class="min-h-8 cursor-pointer content-center">입력 데이터</summary><pre class="overflow-x-auto whitespace-pre-wrap font-mono text-neutral-100">{JSON.stringify(item.input, null, 2)}</pre></details>{/if}
+{#if item.input !== undefined}<details class="text-xs text-neutral-400"><summary class="min-h-8 cursor-pointer content-center">입력 데이터</summary><pre class="max-h-48 overflow-auto whitespace-pre-wrap font-mono text-neutral-100">{JSON.stringify(item.input, null, 2)}</pre></details>{/if}
 <details class="text-xs text-neutral-400"><summary class="min-h-8 cursor-pointer content-center">호출 정보</summary><code class="font-mono text-neutral-100">{item.id}</code></details>
 </div>
 </details>
