@@ -10,7 +10,13 @@ use distill_tools::types::tool::ToolKind;
 use tracing::Instrument;
 static TURNS_ACTIVE: distill_telemetry::activity::ActivityGauge =
     distill_telemetry::activity::ActivityGauge::work(distill_telemetry::activity::TURNS_ACTIVE_KEY);
-const JEV_FINAL_CHECK_REMINDER: &str = "Review the user request and current evidence. Complete any clearly outstanding requested work or proof, or explain the blocker. This reminder is advisory; do not claim work that was not done.";
+pub(super) const JEV_FINAL_CHECK_REMINDER: &str = "Review the user request and current evidence. Complete any clearly outstanding requested work or proof, or explain the blocker. This reminder is advisory; do not claim work that was not done. If nothing is outstanding, reply with exactly NOTHING_OUTSTANDING and nothing else: your previous message then stays the final answer. If you do more work, your previous message still stays in front of the user and your next one is shown right below it: write only what changed, and do not repeat what it already says.";
+/// The reminder as sent up to 2.0.77. A session an older version left with it
+/// unanswered still has to lose it before the next input.
+const JEV_FINAL_CHECK_REMINDER_UNTIL_2_0_77: &str = "Review the user request and current evidence. Complete any clearly outstanding requested work or proof, or explain the blocker. This reminder is advisory; do not claim work that was not done. If nothing is outstanding, reply with exactly NOTHING_OUTSTANDING and nothing else: your previous message then stays the final answer.";
+/// The whole reply that confirms the final check found nothing outstanding;
+/// [`JEV_FINAL_CHECK_REMINDER`] offers it.
+pub(super) const FINAL_CHECK_NOTHING_OUTSTANDING: &str = "NOTHING_OUTSTANDING";
 
 fn bounded_utf8(text: &str, max_bytes: usize, tail: bool) -> String {
     if text.len() <= max_bytes {
@@ -42,12 +48,69 @@ fn final_check_reminder(
     let c1_incomplete = c1.is_some_and(|check| {
         !check.deferred
             && check.continue_working
-            && check.confidence.is_some_and(|confidence| {
-                confidence >= distill_workspace::jev::catalog::verify::ITEM_DONE_FLOOR
-            })
+            && check
+                .confidence
+                .is_some_and(|confidence| confidence >= check.done_floor)
     });
     let c3_incomplete = c3.is_some_and(|check| !check.deferred && !check.complete);
     (c1_incomplete || c3_incomplete).then_some(JEV_FINAL_CHECK_REMINDER)
+}
+
+/// Chunk `_meta` key that marks the assistant message sent so far as the
+/// turn's answer. It rides an empty message chunk, so a client that does not
+/// know the key is sent nothing it would show.
+pub(super) const TURN_ANSWER_META_KEY: &str = "turnAnswer";
+
+/// Tells the client that the message it was sent so far is the turn's answer.
+///
+/// A reply to the final check that goes back to work puts tool calls between
+/// that answer and whatever the turn ends on. A client that shows a turn's
+/// last message as its reply would show that closing note alone; with the
+/// marker it can keep the answer and add the later text to it.
+fn turn_answer_marker() -> acp::SessionUpdate {
+    let mut meta = serde_json::Map::new();
+    meta.insert(TURN_ANSWER_META_KEY.into(), serde_json::json!(true));
+    acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new(acp::ContentBlock::Text(
+            acp::TextContent::new(String::new()),
+        ))
+        .meta(Some(meta)),
+    )
+}
+
+/// Whether the reply to the final-check reminder is only the confirmation
+/// token. Anything more, or any tool call, is a real reply and is kept.
+fn is_final_check_confirmation(text: &str, has_tool_calls: bool) -> bool {
+    !has_tool_calls && text.trim() == FINAL_CHECK_NOTHING_OUTSTANDING
+}
+
+/// What the harness itself saw, for the final check: each recorded check
+/// with whether it ran on the current working tree (`null` when a marker is
+/// missing), the failed tool calls and whether work was delivered.
+fn final_check_evidence(
+    facts: &super::turn_facts::TurnFacts,
+    current_tree: Option<&str>,
+) -> serde_json::Value {
+    let checks: Vec<_> = facts
+        .recorded_checks()
+        .iter()
+        .map(|check| {
+            let ran_after_last_change = match (check.worktree.as_deref(), current_tree) {
+                (Some(then), Some(now)) => Some(then == now),
+                _ => None,
+            };
+            serde_json::json!({
+                "command": bounded_utf8(&check.command, 200, false),
+                "outcome": check.outcome,
+                "ran_after_last_change": ran_after_last_change,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "recorded_checks": checks,
+        "failed_tool_calls": facts.failed_tool_count(),
+        "delivery_command_ran": facts.delivery_command_ran(),
+    })
 }
 
 /// Synthetic tool for schema-constrained final answers on backends without native
@@ -597,6 +660,8 @@ impl SessionActor {
             self.invalidate_side_calls_for_new_prompt();
         }
         self.ensure_session_disk_writable().await?;
+        // A reminder an earlier turn left unanswered must not precede this input.
+        self.drop_unanswered_final_check();
         let wake_message = match input_origin.as_prompt_origin() {
             super::super::PromptOrigin::SubagentCompleted { subagent_id } => {
                 Some(self.build_wake_turn_message(subagent_id).await)
@@ -878,6 +943,7 @@ impl SessionActor {
         *self.doom_loop_turn_tally.lock() = Default::default();
         self.retain_timed_out_image_strips_for_new_turn();
         self.turn_stream_drained.lock().clear();
+        self.jev_ledger.borrow_mut().take_final_check_hold();
         self.events.begin_turn();
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
@@ -1050,9 +1116,10 @@ impl SessionActor {
             // cached prefix, stay untouched.
             if matches!(input_origin.as_prompt_origin(), super::super::PromptOrigin::User)
                 && Self::extract_bash_command(&prompt_blocks).is_none()
-                && let Some(hint) = self
-                    .jev_skill_relevance_hint(&Self::queue_text_from_blocks(&prompt_blocks))
-                    .await
+                && let Some(hint) = Box::pin(
+                    self.turn_start_skill_hint(&Self::queue_text_from_blocks(&prompt_blocks)),
+                )
+                .await
             {
                 if !skill_info.is_empty() && !skill_info.ends_with('\n') {
                     skill_info.push('\n');
@@ -1193,7 +1260,7 @@ impl SessionActor {
             {
                 self.jev_auto_pick_mode(&user_message).await;
             }
-            self.inject_execution_mode_reminder();
+            self.inject_execution_mode_reminder_at_turn_start().await;
             self.inject_fork_reminder().await;
             self.inject_resumed_tasks_reminder();
             if policy.authority.is_human_intent() {
@@ -1476,6 +1543,8 @@ impl SessionActor {
                 }
             }
         };
+        Box::pin(self.emit_final_check_followup()).await;
+        self.jev_ledger.borrow_mut().last_request_end = Some(std::time::Instant::now());
         if matches!(
             result,
             Ok(TurnOutcome::Cancelled { .. }) | Ok(TurnOutcome::MaxTurnsReached { .. })
@@ -1760,8 +1829,11 @@ impl SessionActor {
                 }
             }
         }
-        let usage = self.freeze_prompt_usage(prompt_id).await;
+        let outcome = self.turn_outcome_record(prompt_id).await;
+        let mut usage = self.freeze_prompt_usage(prompt_id).await;
         self.persist_live_usage().await;
+        self.finish_turn_outcome(outcome, usage.as_mut()).await;
+        self.persist_cache_resume_state().await;
         drop(turn_scope_guard);
         match result {
             Ok(outcome) => {
@@ -2561,6 +2633,16 @@ impl SessionActor {
             }
         }
     }
+    /// After a turn: what a reload of this session needs to know about the prompt cache. Nothing
+    /// before the first completed main request.
+    async fn persist_cache_resume_state(&self) {
+        if let Some(state) = self.chat_state_handle.cache_resume_state().await {
+            let _ = self
+                .notifications
+                .persistence_tx
+                .send(PersistenceMsg::CacheResumeState(state));
+        }
+    }
     /// Shared round-completion bookkeeping (plan cleanup, cancel-streak reset, token sums, feedback prompt).
     /// Runs identically for the native and StructuredOutput-tool completion paths.
     /// The turn-end snapshot is taken once per turn after the last round (`take_completed_turn_snapshot`), and the analytics delta posts from the turn's terminal.
@@ -2778,7 +2860,15 @@ impl SessionActor {
         let mut last_prompt_tokens: Option<u32> = None;
         let mut report_budget_sent = false;
         let mut identical_tool_calls = IdenticalToolCallRun::default();
+        let mut hands_on = super::jev_tool_subset::HandsOnRun::default();
+        let mut hands_on_reminder_due = false;
         let mut todo_gate_fires: u32 = 0;
+        // Set when the final-check reminder was just sent: the next reply may
+        // be the bare confirmation token.
+        let mut final_check_reply_pending = false;
+        // Set while the reply to the reminder is back at work: the response
+        // that ends that work may be the bare confirmation token too.
+        let mut final_check_work_pending = false;
         let mut length_salvage_streak = LengthSalvageStreak::default();
         let mut auth_retry_schedule = AuthRetrySchedule::new();
         let mut rate_limit_waits = self.rate_limit_wait_budget(
@@ -2822,8 +2912,8 @@ impl SessionActor {
             // Auto and explicit /mode changes take effect before the next
             // action, including in children already running when the user switches.
             let execution_mode = self.execution_mode.load();
+            self.note_mode_round(execution_mode);
             if execution_mode != prepared_execution_mode {
-                self.inject_execution_mode_reminder();
                 let next_tools = self.prepare_tool_definitions_timed().await.0;
                 let same_tools = tool_definitions.len() == next_tools.len()
                     && tool_definitions.iter().zip(&next_tools).all(|(before, after)| {
@@ -2831,6 +2921,7 @@ impl SessionActor {
                             && before.function.description == after.function.description
                             && before.function.parameters == after.function.parameters
                     });
+                Box::pin(self.inject_execution_mode_reminder_on_switch(same_tools)).await;
                 if !same_tools {
                     self.jev_ledger.borrow_mut().invalidate_cached_prompt();
                 }
@@ -2921,6 +3012,7 @@ impl SessionActor {
                         tool_name: tool_name.clone(),
                     },
                 );
+                self.note_escalation(super::escalation::EscalationTrigger::IdenticalCalls);
                 let reminder = self
                     .tool_bridge_handle()
                     .render_prompt(
@@ -2936,6 +3028,10 @@ impl SessionActor {
             }
             if !salvage.awaiting_continuation() {
                 self.jev_flush_delegation_hint().await;
+                if std::mem::take(&mut hands_on_reminder_due) {
+                    self.flush_hands_on_reminder();
+                }
+                self.flush_late_skill_hint(loop_index);
                 self.flush_report_budget(
                     loop_index.saturating_sub(1),
                     last_prompt_tokens,
@@ -3661,10 +3757,62 @@ impl SessionActor {
             let record_response_span = distill_telemetry::region::Region::from_span(
                 tracing::info_span!("turn.record_response", item_count = response_item_count),
             );
-            self.record_response_items(response.items, usage_reported)
-                .await;
+            // A bare confirmation after the final-check reminder is dropped,
+            // so the earlier final message stays the turn's last word.
+            let final_check_reply = std::mem::take(&mut final_check_reply_pending);
+            let final_check_work = std::mem::take(&mut final_check_work_pending);
+            let final_check_confirmed = (final_check_reply || final_check_work)
+                && final_answer_text.is_none()
+                && is_final_check_confirmation(&response.assistant_text(), !tool_calls.is_empty());
+            if final_check_confirmed
+                && let Some(followup) = self.jev_ledger.borrow_mut().final_check_followup.as_mut()
+            {
+                followup.fixed_token = true;
+            }
+            let held_final_check = self.jev_ledger.borrow_mut().take_final_check_hold();
+            if final_check_confirmed {
+                tracing::info!(
+                    prompt_id = %req_id,
+                    "final check: nothing outstanding; keeping the earlier final message"
+                );
+                self.drop_unanswered_final_check();
+            } else {
+                self.record_response_items(response.items, usage_reported)
+                    .await;
+            }
             record_response_span.close();
-            if let Some(text) = fallback_text {
+            // A reply that goes back to work: the answer is marked before
+            // the reply's reasoning or tool calls can close it in the client.
+            if final_check_reply && !tool_calls.is_empty() {
+                self.send_update(turn_answer_marker(), None).await;
+            }
+            // The work the reply went back to may end on the token as well. A
+            // client adds what follows the marked answer to it, so a token
+            // sent there is shown as the answer's last paragraph.
+            if (final_check_reply || final_check_work) && !tool_calls.is_empty() {
+                final_check_work_pending = true;
+                self.jev_ledger
+                    .borrow_mut()
+                    .begin_final_check_hold_after_tool_calls();
+            }
+            // A real reply gets back what was held: its text as the next
+            // paragraph of the earlier final message, or its reasoning when it
+            // only calls tools. A bare confirmation leaves nothing between the
+            // earlier final message and what the harness appends to it.
+            if !final_check_confirmed && let Some(held) = held_final_check {
+                let (reasoning, chunks) = held.released();
+                Box::pin(self.send_held_reasoning(reasoning)).await;
+                for text in chunks {
+                    self.send_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(text)),
+                        )),
+                        None,
+                    )
+                    .await;
+                }
+            }
+            if !final_check_confirmed && let Some(text) = fallback_text {
                 tracing::warn!(
                     text_len = text.len(),
                     "emitting fallback AgentMessageChunk — no text chunks were streamed"
@@ -3842,6 +3990,16 @@ impl SessionActor {
                 {
                     *self.jev_final_check_prompt.borrow_mut() = Some(prompt_id.clone());
                     self.push_system_reminder(JEV_FINAL_CHECK_REMINDER);
+                    final_check_reply_pending = true;
+                    self.jev_ledger.borrow_mut().begin_final_check_hold();
+                    salvage.step_boundary();
+                    continue;
+                }
+                if !turn_refused
+                    && structured_output_validator.is_none()
+                    && let Some(reminder) = Box::pin(self.ultracode_turn_review(&prompt_id)).await
+                {
+                    self.push_system_reminder(&reminder);
                     salvage.step_boundary();
                     continue;
                 }
@@ -3942,6 +4100,7 @@ impl SessionActor {
                 .iter()
                 .map(|tc| tool_bridge.tool_kind(&tc.name))
                 .collect::<Vec<_>>();
+            hands_on_reminder_due |= hands_on.observe(&step_tool_kinds);
             let step_problematic = step_is_problematically_repeating(&step_tool_kinds);
             let is_true_noop = self.is_run_true_step(&tool_calls).await;
             identical_tool_calls.observe(
@@ -3978,6 +4137,7 @@ impl SessionActor {
                     },
                 )
                 .await;
+            Box::pin(self.ultracode_turn_snapshot(&prompt_id)).await;
             let execute_tool_calls_result = {
                 let _tool_phase = turn_phases.begin_tool_blocking();
                 self.execute_tool_calls(tool_call_responses).await
@@ -4024,6 +4184,7 @@ impl SessionActor {
                 return Ok(TurnOutcome::MaxTurnsReached { limit });
             }
             tool_turn_count = next_turn;
+            Box::pin(self.escalation_after_round()).await;
             if self.execution_mode.is_auto()
                 && let Some(request) = self.jev_last_human_request().await
             {
@@ -4192,6 +4353,7 @@ impl SessionActor {
     /// C1/C3 at the end of a main turn: whether Jev confidently finds requested
     /// work or proof missing. Advisory; any failure or doubt returns `false`.
     async fn jev_final_check(&self, req_id: &str, turn_tools_called: &[String]) -> bool {
+        use distill_workspace::jev::catalog::thresholds::{self, Threshold};
         use distill_workspace::jev::catalog::verify;
         use distill_workspace::jev::flags::JevLever;
         let Some(request_text) = self.jev_last_human_request().await else {
@@ -4215,13 +4377,22 @@ impl SessionActor {
         let edits_made = turn_tools_called.iter().any(|tool| {
             matches!(tool.as_str(), "search_replace" | "write" | "hashline_edit" | "apply_patch")
         });
-        let state = serde_json::json!({
+        let current_tree =
+            super::turn_facts::worktree_marker(self.tool_context.cwd.as_path()).await;
+        let mut state = serde_json::json!({
             "user_request": user_request,
             "final_message": final_message,
             "todos": todos,
             "edits_made": edits_made,
             "last_execution": self.jev_ledger.borrow().last_execution.clone(),
         });
+        // Additive: the harness's own evidence next to the model's account.
+        if let (Some(state), serde_json::Value::Object(evidence)) = (
+            state.as_object_mut(),
+            final_check_evidence(&self.jev_ledger.borrow().facts, current_tree.as_deref()),
+        ) {
+            state.extend(evidence);
+        }
         let items = vec!["user request".to_owned()];
         let (Ok(c1_questions), Ok(c3_questions)) = (
             verify::premature_stop_questions(&items),
@@ -4249,7 +4420,10 @@ impl SessionActor {
             crate::jev::record_item(
                 JevLever::C1PrematureStop,
                 label,
-                "final-turn completeness advisory",
+                &format!(
+                    "final-turn completeness advisory; {}",
+                    thresholds::calibration_word(&answers.model, &[Threshold::C1ItemDone])
+                ),
                 result.confidence,
                 Some(&answers),
             );
@@ -4267,18 +4441,172 @@ impl SessionActor {
             crate::jev::record_item(
                 JevLever::C3CompletionCheck,
                 label,
-                "final-turn requirement/proof advisory",
+                &format!(
+                    "final-turn requirement/proof advisory; {}",
+                    thresholds::calibration_word(
+                        &answers.model,
+                        &[Threshold::C3ItemSatisfied, Threshold::C3Leftover]
+                    )
+                ),
                 None,
                 Some(&answers),
             );
             result
         });
-        final_check_reminder(c1.as_ref(), c3.as_ref(), false).is_some()
+        let fires = final_check_reminder(c1.as_ref(), c3.as_ref(), false).is_some();
+        if fires {
+            self.note_final_check_reminder(
+                final_check_label(c1.as_ref(), c3.as_ref()),
+                current_tree,
+            );
+        }
+        fires
     }
+
+    /// The `final_check_reminder` fact; the caller appends the reminder.
+    fn note_final_check_reminder(&self, label: String, worktree: Option<String>) {
+        let mut ledger = self.jev_ledger.borrow_mut();
+        ledger.final_check_reminders = ledger.final_check_reminders.saturating_add(1);
+        let seq = ledger.final_check_reminders;
+        crate::jev::emit_outcome_event(None, |_| {
+            distill_session_events::Event::FinalCheckReminder {
+                seq,
+                label,
+                worktree_hash: worktree.as_deref().map(crate::jev::outcome_hash),
+            }
+        });
+        ledger.final_check_followup = Some(super::jev_ledger::FinalCheckFollowup {
+            reminder_seq: seq,
+            worktree,
+            ..Default::default()
+        });
+    }
+
+    /// What one finished tool call adds to the outcome facts: a round, edit
+    /// or delivery after a final-check reminder, and a skill read.
+    pub(super) async fn note_tool_outcome_facts(
+        &self,
+        tool_name: &str,
+        output: &distill_tools::types::output::ToolOutput,
+    ) {
+        use distill_tools::types::output::{ReadFileOutput, ToolOutput};
+        if let Some(followup) = self.jev_ledger.borrow_mut().final_check_followup.as_mut() {
+            let round = crate::jev::telemetry_context().2;
+            if followup.last_round != Some(round) {
+                followup.last_round = Some(round);
+                followup.tool_rounds = followup.tool_rounds.saturating_add(1);
+            }
+            followup.edited |= is_edit_tool(tool_name);
+            followup.delivered |= matches!(output, ToolOutput::Bash(bash)
+                if super::turn_facts::is_delivery_command(&bash.command));
+        }
+        match output {
+            ToolOutput::Skill(skill) if skill.success => {
+                crate::jev::emit_skill_fact(&skill.skill_name, true);
+            }
+            // A skill is read through its catalog path. Only a Markdown read
+            // pays for the catalog lookup.
+            ToolOutput::ReadFile(ReadFileOutput::FileContent(file))
+                if file
+                    .absolute_path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("md")) =>
+            {
+                let read = dunce::canonicalize(&file.absolute_path).ok();
+                let catalog = self.tool_bridge_handle().slash_skills().await;
+                if let Some(skill) = catalog.iter().find(|skill| {
+                    let path = std::path::Path::new(&skill.path);
+                    path == file.absolute_path
+                        || (path.file_name() == file.absolute_path.file_name()
+                            && read.is_some()
+                            && dunce::canonicalize(path).ok() == read)
+                }) {
+                    crate::jev::emit_skill_fact(&skill.name, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `final_check_followup` fact of a request that got a reminder, once.
+    async fn emit_final_check_followup(&self) {
+        let Some(followup) = self.jev_ledger.borrow_mut().final_check_followup.take() else {
+            return;
+        };
+        let worktree_changed = match followup.worktree.as_deref() {
+            Some(then) => super::turn_facts::worktree_marker(self.tool_context.cwd.as_path())
+                .await
+                .map(|now| now != then),
+            None => None,
+        };
+        crate::jev::emit_outcome_event(None, |_| {
+            distill_session_events::Event::FinalCheckFollowup {
+                reminder_seq: followup.reminder_seq,
+                tool_rounds: followup.tool_rounds,
+                edited: followup.edited,
+                delivered: followup.delivered,
+                fixed_token: followup.fixed_token,
+                worktree_changed,
+            }
+        });
+    }
+
+    /// Takes the final-check reminder out of the history once nothing will
+    /// answer it: its reply was the bare confirmation, was cancelled or
+    /// failed. Left in, it reaches the model glued to the next instruction,
+    /// and the model answers the reminder with the token instead.
+    fn drop_unanswered_final_check(&self) {
+        for reminder in [
+            JEV_FINAL_CHECK_REMINDER,
+            JEV_FINAL_CHECK_REMINDER_UNTIL_2_0_77,
+        ] {
+            self.chat_state_handle.drop_unanswered_question(
+                super::reminders::wrap_in_reminder_tag(reminder, "system-reminder").text_content(),
+                FINAL_CHECK_NOTHING_OUTSTANDING.to_owned(),
+            );
+        }
+    }
+}
+
+/// The labels C1 and C3 recorded for a final check, as one id.
+fn final_check_label(
+    c1: Option<&distill_workspace::jev::catalog::verify::PrematureStop>,
+    c3: Option<&distill_workspace::jev::catalog::verify::CompletionCheck>,
+) -> String {
+    let c1 = c1.map_or("none", |check| {
+        if check.deferred {
+            "defer"
+        } else if check.continue_working {
+            "incomplete"
+        } else {
+            "complete"
+        }
+    });
+    let c3 = c3.map_or("none", |check| {
+        if check.deferred {
+            "defer"
+        } else if check.complete {
+            "complete"
+        } else {
+            "incomplete"
+        }
+    });
+    format!("c1:{c1},c3:{c3}")
+}
+
+/// The edit tools the final check's `edits_made` counts.
+fn is_edit_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "search_replace" | "write" | "hashline_edit" | "apply_patch"
+    )
 }
 #[cfg(test)]
 mod jev_final_check_tests {
-    use super::{JEV_FINAL_CHECK_REMINDER, bounded_utf8, final_check_reminder};
+    use super::{
+        FINAL_CHECK_NOTHING_OUTSTANDING, JEV_FINAL_CHECK_REMINDER, bounded_utf8,
+        final_check_evidence, final_check_reminder, is_final_check_confirmation,
+    };
     use distill_workspace::jev::catalog::verify::{CompletionCheck, PrematureStop};
 
     fn c1(continue_working: bool) -> PrematureStop {
@@ -4287,6 +4615,7 @@ mod jev_final_check_tests {
             continue_working,
             deferred: false,
             confidence: continue_working.then_some(0.9),
+            done_floor: distill_workspace::jev::catalog::verify::ITEM_DONE_FLOOR,
         }
     }
 
@@ -4319,6 +4648,1097 @@ mod jev_final_check_tests {
     fn request_and_final_message_bounds_preserve_utf8() {
         assert_eq!(bounded_utf8("éé", 2, false), "é");
         assert_eq!(bounded_utf8("aé", 2, true), "é");
+    }
+
+    /// The model can only use the token the reminder names.
+    #[test]
+    fn the_reminder_offers_the_confirmation_token() {
+        assert!(JEV_FINAL_CHECK_REMINDER.contains(FINAL_CHECK_NOTHING_OUTSTANDING));
+    }
+
+    /// Only the bare token is dropped; a token with an explanation or a tool
+    /// call is real work or a real answer and must reach the user.
+    #[test]
+    fn only_a_bare_token_without_tool_calls_confirms() {
+        assert!(is_final_check_confirmation("NOTHING_OUTSTANDING", false));
+        assert!(is_final_check_confirmation("  NOTHING_OUTSTANDING\n", false));
+        assert!(!is_final_check_confirmation("NOTHING_OUTSTANDING", true));
+        assert!(!is_final_check_confirmation(
+            "NOTHING_OUTSTANDING. I also fixed the lint.",
+            false
+        ));
+        assert!(!is_final_check_confirmation("nothing_outstanding", false));
+        assert!(!is_final_check_confirmation("", false));
+    }
+
+    /// Jev must see the harness's own record: a check that failed, one whose
+    /// outcome is unknown, whether each ran on the current tree, failed calls
+    /// and a delivery command, none of which depends on edit-tool names.
+    #[test]
+    fn the_final_check_state_carries_the_harness_evidence() {
+        use super::super::turn_facts::{CheckContext, TurnFacts};
+        use distill_tools::types::output::{BashOutput, ToolOutput};
+        let bash = |command: &str, exit_code: i32, output: &str| {
+            ToolOutput::Bash(BashOutput {
+                output: Vec::new(),
+                output_for_prompt: output.to_owned(),
+                exit_code,
+                command: command.to_owned(),
+                truncated: false,
+                signal: None,
+                timed_out: false,
+                description: None,
+                current_dir: "/repo".to_owned(),
+                output_file: String::new(),
+                total_bytes: 0,
+                output_delta: None,
+                was_bare_echo: false,
+            })
+        };
+        let at = |tree: &str| CheckContext {
+            cwd: "/repo".to_owned(),
+            worktree: Some(tree.to_owned()),
+        };
+        let mut facts = TurnFacts::default();
+        facts.note_tool_result_at(
+            "1",
+            &bash("cargo test 2>&1 | tail -3", 0, "test result: FAILED. 1 failed"),
+            &at("tree-1"),
+        );
+        facts.note_tool_result_at(
+            "2",
+            &bash("cargo build 2>&1 | grep -E '^error'", 1, ""),
+            &at("tree-2"),
+        );
+        facts.note_tool_result_at("3", &bash("git commit -m fix", 0, ""), &at("tree-2"));
+        let evidence = final_check_evidence(&facts, Some("tree-2"));
+        let checks = evidence["recorded_checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0]["command"], "cargo test 2>&1 | tail -3");
+        assert_eq!(checks[0]["outcome"], "failed");
+        assert_eq!(checks[0]["ran_after_last_change"], false, "the tree moved since");
+        assert_eq!(checks[1]["outcome"], "unknown");
+        assert_eq!(checks[1]["ran_after_last_change"], true);
+        assert_eq!(evidence["failed_tool_calls"], 1, "the grep exited 1");
+        assert_eq!(evidence["delivery_command_ran"], true);
+        let unknown_tree = final_check_evidence(&facts, None);
+        assert!(unknown_tree["recorded_checks"][0]["ran_after_last_change"].is_null());
+    }
+}
+
+/// Outcome facts: each lands once in `events.jsonl` at its point, with ids,
+/// numbers and hashes only, so a decision can be judged by what followed it
+/// without the session's text ever reaching the event log.
+#[cfg(test)]
+mod outcome_fact_tests {
+    use super::super::support::*;
+    use super::super::turn_facts::{CheckContext, TurnFacts};
+    use super::*;
+    use distill_tools::types::output::{BashOutput, ToolOutput};
+
+    const SENTINEL: &str = "SENTINEL-7f3a-private-text";
+
+    /// [`crate::jev::session_events_text_for_test`] and its lines.
+    async fn facts_of(
+        session_id: &str,
+        body: impl std::future::Future<Output = ()>,
+    ) -> (String, Vec<serde_json::Value>) {
+        let text = crate::jev::session_events_text_for_test(session_id, body).await;
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event line is JSON"))
+            .collect();
+        (text, lines)
+    }
+
+    fn of_type<'a>(events: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+        events
+            .iter()
+            .filter(|event| event["type"] == kind)
+            .collect()
+    }
+
+    fn bash(command: &str, exit_code: i32, output: &str) -> ToolOutput {
+        ToolOutput::Bash(BashOutput {
+            output: Vec::new(),
+            output_for_prompt: output.to_owned(),
+            exit_code,
+            command: command.to_owned(),
+            truncated: false,
+            signal: None,
+            timed_out: false,
+            description: None,
+            current_dir: "/repo".to_owned(),
+            output_file: String::new(),
+            total_bytes: 0,
+            output_delta: None,
+            was_bare_echo: false,
+        })
+    }
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// Every recorded check is one fact, merged runs included, so a lean pick
+    /// can later be labelled by a failing check; the command itself (here
+    /// holding a sentinel) never reaches the file, only its hash.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn each_recorded_check_is_one_fact_without_its_command() {
+        let failing = format!("cargo test {SENTINEL}");
+        let (text, events) = facts_of("check-facts", async {
+            crate::jev::begin_model_round();
+            let mut facts = TurnFacts::default();
+            let marked = CheckContext {
+                cwd: "/repo".to_owned(),
+                worktree: Some("tree-1".to_owned()),
+            };
+            facts.note_tool_result_at("1", &bash(&failing, 101, "test result: FAILED"), &marked);
+            facts.note_tool_result_at("2", &bash("ls src", 0, ""), &marked);
+            facts.note_tool_result_at("3", &bash("cargo build", 0, ""), &CheckContext::default());
+        })
+        .await;
+        let checks = of_type(&events, "check_recorded");
+        assert_eq!(checks.len(), 2, "one per check, none for `ls`: {events:?}");
+        assert_eq!(checks[0]["outcome"], "failed");
+        assert_eq!(
+            checks[0]["command_hash"],
+            crate::jev::outcome_hash(&failing)
+        );
+        assert_eq!(checks[0]["command_hash"].as_str().map(str::len), Some(12));
+        assert_eq!(checks[0]["on_current_tree"], true);
+        assert_eq!(checks[0]["round"], 1);
+        assert_eq!(checks[1]["outcome"], "passed");
+        assert!(
+            checks[1].get("on_current_tree").is_none(),
+            "no marker, no claim"
+        );
+        assert!(!text.contains(SENTINEL), "{text}");
+        assert!(!text.contains("cargo"), "{text}");
+    }
+
+    /// The floor fact says the next call's effort really rose; the second
+    /// raise in a turn is refused and records nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_effort_floor_fact_comes_only_when_the_floor_rises() {
+        use distill_sampling_types::ReasoningEffort;
+        let (_, events) = facts_of("floor-facts", async {
+            let mut ledger = super::super::jev_ledger::JevTurnLedger::default();
+            assert!(ledger.raise_effort_floor("high", ReasoningEffort::High));
+            assert!(!ledger.raise_effort_floor("max", ReasoningEffort::Max));
+        })
+        .await;
+        let raised = of_type(&events, "effort_floor_raised");
+        assert_eq!(raised.len(), 1, "{events:?}");
+        assert_eq!(raised[0]["level"], "high");
+        assert_eq!(raised[0]["trigger"], "unspecified");
+    }
+
+    /// A reminder is one fact with its session sequence and the C1/C3 labels;
+    /// its follow-up comes once, when the request ends, counting tool rounds
+    /// (not calls) after the reminder, an edit, a delivery and a shell change
+    /// to the working tree, which only the tree marker can see.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn a_reminder_and_its_followup_are_one_fact_each() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let repo = tempfile::tempdir().unwrap();
+                git(repo.path(), &["init", "-q"]);
+                std::fs::write(repo.path().join("app.rs"), "one\n").unwrap();
+                let mut actor = plain_actor().await;
+                actor.tool_context.cwd =
+                    distill_paths::AbsPathBuf::new(repo.path().to_path_buf()).unwrap();
+                let session_id = actor.session_info.id.0.to_string();
+                let (text, events) = facts_of(&session_id, async {
+                    crate::jev::begin_model_round();
+                    let tree = super::super::turn_facts::worktree_marker(repo.path()).await;
+                    assert!(tree.is_some());
+                    actor.note_final_check_reminder(
+                        "c1:incomplete,c3:complete".to_owned(),
+                        tree.clone(),
+                    );
+                    crate::jev::begin_model_round();
+                    actor
+                        .note_tool_outcome_facts("read_file", &bash("cat app.rs", 0, ""))
+                        .await;
+                    actor
+                        .note_tool_outcome_facts("search_replace", &bash("true", 0, ""))
+                        .await;
+                    crate::jev::begin_model_round();
+                    std::fs::write(repo.path().join("app.rs"), "two, longer\n").unwrap();
+                    actor
+                        .note_tool_outcome_facts(
+                            "run_terminal_command",
+                            &bash(&format!("git commit -m '{SENTINEL}'"), 0, ""),
+                        )
+                        .await;
+                    crate::jev::begin_model_round();
+                    actor.emit_final_check_followup().await;
+                    actor.emit_final_check_followup().await;
+
+                    // A second reminder with nothing done after it.
+                    actor.note_final_check_reminder(
+                        "c1:complete,c3:incomplete".to_owned(),
+                        super::super::turn_facts::worktree_marker(repo.path()).await,
+                    );
+                    actor.emit_final_check_followup().await;
+                })
+                .await;
+                let reminders = of_type(&events, "final_check_reminder");
+                assert_eq!(reminders.len(), 2, "{events:?}");
+                assert_eq!(reminders[0]["seq"], 1);
+                assert_eq!(reminders[0]["label"], "c1:incomplete,c3:complete");
+                assert_eq!(
+                    reminders[0]["worktree_hash"].as_str().map(str::len),
+                    Some(12)
+                );
+                assert_eq!(reminders[1]["seq"], 2);
+                let followups = of_type(&events, "final_check_followup");
+                assert_eq!(followups.len(), 2, "one per reminder: {events:?}");
+                assert_eq!(followups[0]["reminder_seq"], 1);
+                assert_eq!(followups[0]["tool_rounds"], 2, "three calls in two rounds");
+                assert_eq!(followups[0]["edited"], true);
+                assert_eq!(followups[0]["delivered"], true);
+                assert_eq!(followups[0]["fixed_token"], false);
+                assert_eq!(followups[0]["worktree_changed"], true);
+                assert_eq!(followups[1]["reminder_seq"], 2);
+                assert_eq!(followups[1]["tool_rounds"], 0);
+                assert_eq!(followups[1]["edited"], false);
+                assert_eq!(followups[1]["delivered"], false);
+                assert_eq!(followups[1]["worktree_changed"], false);
+                assert!(!text.contains(SENTINEL), "{text}");
+            })
+            .await;
+    }
+
+    /// Outside a Git worktree there is no marker: the hash and the change
+    /// flag are left out rather than guessed.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn without_a_worktree_marker_the_tree_fields_are_absent() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let outside = tempfile::tempdir().unwrap();
+                let mut actor = plain_actor().await;
+                actor.tool_context.cwd =
+                    distill_paths::AbsPathBuf::new(outside.path().to_path_buf()).unwrap();
+                let session_id = actor.session_info.id.0.to_string();
+                let (_, events) = facts_of(&session_id, async {
+                    actor.note_final_check_reminder("c1:none,c3:incomplete".to_owned(), None);
+                    actor.emit_final_check_followup().await;
+                })
+                .await;
+                let reminder = of_type(&events, "final_check_reminder");
+                assert_eq!(reminder.len(), 1);
+                assert!(reminder[0].get("worktree_hash").is_none());
+                let followup = of_type(&events, "final_check_followup");
+                assert_eq!(followup.len(), 1);
+                assert!(followup[0].get("worktree_changed").is_none());
+            })
+            .await;
+    }
+}
+
+/// The final-check reminder against a real turn loop and a scripted model:
+/// what the model answers to the reminder decides what the turn's last word is.
+#[cfg(test)]
+mod final_check_confirmation_turn_tests {
+    use super::super::support::*;
+    use super::*;
+    use distill_test_support::sse::{
+        responses_api_reasoning_and_text_events, responses_api_reasoning_then_tool_call_events,
+        responses_api_script_exact,
+    };
+    use distill_test_support::{MockInferenceServer, ScriptedResponse};
+    use std::sync::Arc;
+
+    /// One assistant chunk the client was sent.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Sent {
+        Thought(String),
+        Message(String),
+        /// The empty message chunk that marks the answer so far.
+        AnswerMarker,
+    }
+
+    thread_local! {
+        /// Every assistant thought and message chunk the client was sent, in order.
+        static STREAMED: std::cell::RefCell<Vec<Sent>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn capture_streamed_text(mut rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) {
+        tokio::task::spawn_local(async move {
+            while let Some(event) = rx.recv().await {
+                let SessionEvent::Notification(SessionNotification::Acp(notification)) = event
+                else {
+                    continue;
+                };
+                let sent = match &notification.update {
+                    acp::SessionUpdate::AgentMessageChunk(chunk)
+                        if chunk
+                            .meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.contains_key(TURN_ANSWER_META_KEY)) =>
+                    {
+                        assert!(
+                            matches!(&chunk.content, acp::ContentBlock::Text(text) if text.text.is_empty()),
+                            "the marker must carry no text a client would show"
+                        );
+                        Sent::AnswerMarker
+                    }
+                    acp::SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                        acp::ContentBlock::Text(text) => Sent::Message(text.text.clone()),
+                        _ => continue,
+                    },
+                    acp::SessionUpdate::AgentThoughtChunk(chunk) => match &chunk.content {
+                        acp::ContentBlock::Text(text) => Sent::Thought(text.text.clone()),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                STREAMED.with(|streamed| streamed.borrow_mut().push(sent));
+            }
+        });
+    }
+
+    /// `sent` with neighbouring chunks of one kind joined, which is how a
+    /// client groups them into thoughts and messages.
+    fn grouped(sent: Vec<Sent>) -> Vec<Sent> {
+        let mut groups: Vec<Sent> = Vec::new();
+        for chunk in sent {
+            match (groups.last_mut(), chunk) {
+                (Some(Sent::Thought(group)), Sent::Thought(text))
+                | (Some(Sent::Message(group)), Sent::Message(text)) => group.push_str(&text),
+                (_, chunk) => groups.push(chunk),
+            }
+        }
+        groups
+    }
+
+    const FIRST_FINAL: &str = "Updated the todo list.";
+    const TODO_ARGS: &str = r#"{"todos":[{"id":"t1","content":"poll","status":"completed"}]}"#;
+
+    fn tool_call(call_id: &str) -> ScriptedResponse {
+        ScriptedResponse::sse(responses_api_reasoning_then_tool_call_events(
+            "update", call_id, "todo_write", TODO_ARGS, "test",
+        ))
+    }
+
+    fn text(text: &str) -> ScriptedResponse {
+        ScriptedResponse::sse(responses_api_script_exact(text, "test"))
+    }
+
+    fn reasoning_then_text(reasoning: &str, text: &str) -> ScriptedResponse {
+        ScriptedResponse::sse(responses_api_reasoning_and_text_events(
+            reasoning, text, "test",
+        ))
+    }
+
+    /// Jev answers that make both C1 and C3 report the request unfinished.
+    /// Other decisions in the turn get answers with none of their ids and
+    /// defer, so the queue holds enough copies for all of them.
+    fn final_check_finds_work_missing() {
+        use distill_workspace::jev::types::{Answer, JevAnswerSet, Usage};
+        let answers: std::collections::BTreeMap<_, _> = [
+            ("0:rank_user request", 0.1),
+            ("0:requested_work_remains", 0.9),
+            ("1:rank_user request", 0.1),
+            ("1:anything_left_out", 0.9),
+        ]
+        .into_iter()
+        .map(|(id, noul)| (id.to_owned(), Answer::Noul { noul }))
+        .collect();
+        let set = JevAnswerSet {
+            model: "test".to_owned(),
+            answers,
+            usage: Usage::default(),
+            request_id: None,
+            latency_ms: 0,
+        };
+        crate::jev::set_test_decision_answers(std::iter::repeat_n(Some(set), 32));
+    }
+
+    async fn actor_for(server: &MockInferenceServer) -> Arc<SessionActor> {
+        let sampler_config = distill_sampler::SamplerConfig {
+            api_key: Some("test-key".to_string()),
+            base_url: server.url(),
+            model: "test".to_string(),
+            api_backend: distill_sampler::ApiBackend::Responses,
+            context_window: 256_000,
+            max_retries: Some(0),
+            idle_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        let (sampler_event_tx, mut sampler_event_rx) =
+            tokio::sync::mpsc::unbounded_channel::<distill_sampler::SamplingEvent>();
+        let sampler_handle = distill_sampler::SamplerActor::spawn(
+            sampler_config,
+            distill_sampler::RetryPolicy {
+                max_retries: 0,
+                ..Default::default()
+            },
+            sampler_event_tx,
+        );
+        let (gateway_tx, gateway_rx) =
+            tokio::sync::mpsc::unbounded_channel::<distill_acp_lib::AcpClientMessage>();
+        drain_gateway(gateway_rx);
+        let (persistence_tx, persistence_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+        drain_persistence(persistence_rx);
+        let (mut actor, event_rx) =
+            create_test_actor_ex(0, 256_000, 85, gateway_tx, persistence_tx).await;
+        capture_streamed_text(event_rx);
+        actor.sampler_handle = sampler_handle;
+        *actor.agent.borrow_mut() = test_distill_agent_with_todo().await;
+        let mut cfg = actor
+            .chat_state_handle
+            .get_sampling_config()
+            .await
+            .expect("test actor has sampling config");
+        cfg.base_url = server.url();
+        cfg.api_backend = distill_sampling_types::ApiBackend::Responses;
+        cfg.model = "test".to_string();
+        actor.chat_state_handle.update_sampling_config(cfg);
+        let mut creds = actor.chat_state_handle.get_credentials().await;
+        creds.api_key = Some("test-key".to_string());
+        actor.chat_state_handle.update_credentials(creds);
+        actor
+            .workspace_ops
+            .bind_local_session(
+                &actor.session_id_string(),
+                actor.tool_context.cwd.as_path().to_path_buf(),
+                actor.tool_context.hunk_tracker_handle.clone(),
+                actor.agent.borrow().tool_bridge().toolset(),
+                None,
+            )
+            .expect("bind_local_session");
+        let actor = Arc::new(actor);
+        let drainer = actor.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(event) = sampler_event_rx.recv().await {
+                drainer.handle_sampling_event(event).await;
+            }
+        });
+        actor
+    }
+
+    /// Runs one prompt whose model first calls a tool, then ends with
+    /// [`FIRST_FINAL`], then answers the reminder with `after_reminder`.
+    /// Returns the turn's last word and the conversation.
+    fn run_turn(after_reminder: Vec<ScriptedResponse>) -> (Option<String>, Vec<ConversationItem>) {
+        let (report, conversation, _) =
+            run_turn_streamed(distill_tool_types::ExecutionMode::Normal, after_reminder);
+        (report, conversation)
+    }
+
+    /// [`run_turn`] that also returns the assistant text sent to the client.
+    fn run_turn_streamed(
+        mode: distill_tool_types::ExecutionMode,
+        after_reminder: Vec<ScriptedResponse>,
+    ) -> (Option<String>, Vec<ConversationItem>, String) {
+        let (report, conversation, sent) = run_turn_sent(mode, after_reminder);
+        let streamed = sent
+            .into_iter()
+            .filter_map(|chunk| match chunk {
+                Sent::Message(text) => Some(text),
+                Sent::Thought(_) | Sent::AnswerMarker => None,
+            })
+            .collect();
+        (report, conversation, streamed)
+    }
+
+    /// [`run_turn`] that also returns every thought and message chunk sent to
+    /// the client, in order.
+    fn run_turn_sent(
+        mode: distill_tool_types::ExecutionMode,
+        after_reminder: Vec<ScriptedResponse>,
+    ) -> (Option<String>, Vec<ConversationItem>, Vec<Sent>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            // A debug-build turn future outgrows the usual 16 MiB test stack.
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                tokio::task::LocalSet::new().block_on(&runtime, async move {
+                    let server = MockInferenceServer::start().await.expect("mock server");
+                    server.enqueue_response("/v1/responses", tool_call("call-1"));
+                    server.enqueue_response("/v1/responses", text(FIRST_FINAL));
+                    let scripted = 2 + after_reminder.len();
+                    for response in after_reminder {
+                        server.enqueue_response("/v1/responses", response);
+                    }
+                    let actor = actor_for(&server).await;
+                    actor.execution_mode.store(mode);
+                    // Whatever the developer's config says, an UltraCode turn
+                    // here ends with its status line (the thread is this run's own).
+                    crate::session::goal_classifier::turn_review::set_contract_v2_for_tests(Some(
+                        true,
+                    ));
+                    final_check_finds_work_missing();
+                    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "mark the todo done".to_string(),
+                    ))];
+                    let outcome = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        actor.handle_prompt(
+                            "final-check-confirmation",
+                            prompt,
+                            PromptMode::Agent,
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                            false,
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await
+                    .expect("turn must finish within timeout");
+                    crate::jev::clear_test_decision_answers();
+                    assert!(outcome.is_ok(), "turn must not error: {outcome:?}");
+                    assert_eq!(
+                        server.request_count_for("/v1/responses"),
+                        scripted,
+                        "the final check must have fired and its replies been requested"
+                    );
+                    let report = actor.chat_state_handle.get_trailing_assistant_report().await;
+                    let conversation = actor.chat_state_handle.get_conversation().await;
+                    let sent = STREAMED.with(|streamed| streamed.borrow().clone());
+                    sender
+                        .send((report, conversation, sent))
+                        .expect("send result");
+                });
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread");
+        receiver.recv().expect("turn result")
+    }
+
+    fn reminder_sent(conversation: &[ConversationItem]) -> bool {
+        conversation.iter().any(|item| {
+            matches!(item, ConversationItem::User(_))
+                && item.text_content().contains(FINAL_CHECK_NOTHING_OUTSTANDING)
+        })
+    }
+
+    /// Nothing outstanding: the first final message is what the user and any
+    /// parent read, and the token never enters the history. The reminder
+    /// leaves it with its reply: kept, it would be the history's last word,
+    /// and whatever the turn or the user says next would reach the model
+    /// glued to an instruction to answer with the token.
+    #[test]
+    fn a_bare_token_keeps_the_first_final_message() {
+        let (report, conversation) = run_turn(vec![text(FINAL_CHECK_NOTHING_OUTSTANDING)]);
+        assert!(
+            !reminder_sent(&conversation),
+            "the confirmed reminder must leave the history"
+        );
+        assert_eq!(report.as_deref(), Some(FIRST_FINAL));
+        assert!(!conversation.iter().any(|item| {
+            matches!(item, ConversationItem::Assistant(_))
+                && item.text_content().contains(FINAL_CHECK_NOTHING_OUTSTANDING)
+        }));
+    }
+
+    /// The client must never be sent the token: it renders it as the turn's
+    /// last message even though the history drops it.
+    #[test]
+    fn a_bare_token_is_never_sent_to_the_client() {
+        let (_, _, streamed) = run_turn_streamed(
+            distill_tool_types::ExecutionMode::Normal,
+            vec![text(FINAL_CHECK_NOTHING_OUTSTANDING)],
+        );
+        assert_eq!(streamed, FIRST_FINAL);
+    }
+
+    /// The final check is not mode-gated, so the token must stay hidden in
+    /// every execution mode.
+    #[test]
+    fn a_bare_token_is_never_sent_to_the_client_in_any_mode() {
+        for mode in distill_tool_types::ExecutionMode::ALL {
+            let (report, _, streamed) =
+                run_turn_streamed(mode, vec![text(FINAL_CHECK_NOTHING_OUTSTANDING)]);
+            // UltraCode appends its review status line to the final message.
+            assert!(
+                streamed.starts_with(FIRST_FINAL)
+                    && !streamed.contains(FINAL_CHECK_NOTHING_OUTSTANDING),
+                "{mode:?} streamed: {streamed:?}"
+            );
+            assert!(
+                report.as_deref().is_some_and(|r| r.starts_with(FIRST_FINAL)),
+                "{mode:?} lost the answer: {report:?}"
+            );
+        }
+    }
+
+    const CHECK_REASONING: &str = "Nothing else is left to do.";
+
+    /// A model that reasons before it confirms must still leave the answer as
+    /// the last thing the client was sent. A thought after the answer closes
+    /// it in the client, so the status line UltraCode appends next becomes a
+    /// message of its own and replaces the answer as the turn's last message.
+    #[test]
+    fn a_confirmed_replys_reasoning_is_never_sent_to_the_client() {
+        let (report, _, sent) = run_turn_sent(
+            distill_tool_types::ExecutionMode::Ultracode,
+            vec![reasoning_then_text(
+                CHECK_REASONING,
+                FINAL_CHECK_NOTHING_OUTSTANDING,
+            )],
+        );
+        let groups = grouped(sent);
+        let Some(Sent::Message(last)) = groups.last() else {
+            panic!("the turn must end on a message: {groups:?}");
+        };
+        assert!(
+            last.starts_with(FIRST_FINAL) && last.trim_end().ends_with("(no repository)"),
+            "the status line must continue the answer's own message: {groups:?}"
+        );
+        assert!(
+            !groups.contains(&Sent::Thought(format!("{CHECK_REASONING} "))),
+            "the confirmed reply's reasoning leaked: {groups:?}"
+        );
+        assert!(
+            report.as_deref().is_some_and(|r| r.starts_with(FIRST_FINAL)),
+            "lost the answer: {report:?}"
+        );
+    }
+
+    /// A reply that adds text to the answer must reach the client inside the
+    /// answer's own message, in every mode. A client shows a turn's last
+    /// message as its reply and closes a message at a thought: sent as a
+    /// thought and then a message of its own, the addition was all the user
+    /// saw, and the answer it corrected was hidden with the turn's work.
+    #[test]
+    fn a_text_reply_continues_the_answers_own_message() {
+        let reply = "The lint warning is gone too.";
+        for mode in distill_tool_types::ExecutionMode::ALL {
+            let (_, conversation, sent) =
+                run_turn_sent(mode, vec![reasoning_then_text(CHECK_REASONING, reply)]);
+            let groups = grouped(sent);
+            let Some(Sent::Message(last)) = groups.last() else {
+                panic!("{mode:?}: the turn must end on a message: {groups:?}");
+            };
+            // The script streams reasoning and text a word at a time, each
+            // with a trailing space. UltraCode appends its status line.
+            assert!(
+                last.starts_with(&format!("{FIRST_FINAL}\n\n{reply} ")),
+                "{mode:?}: the reply must be the answer's next paragraph: {groups:?}"
+            );
+            assert!(
+                !groups.contains(&Sent::Thought(format!("{CHECK_REASONING} "))),
+                "{mode:?}: a thought split the answer from the reply: {groups:?}"
+            );
+            assert!(
+                reminder_sent(&conversation)
+                    && conversation.iter().any(|item| {
+                        matches!(item, ConversationItem::Assistant(_))
+                            && item.text_content().trim() == reply
+                    }),
+                "{mode:?}: the history keeps the reminder and the reply as the model wrote it"
+            );
+        }
+    }
+
+    /// A reply that calls a tool is a real reply too: its reasoning is sent
+    /// once the reply is complete, before the turn goes on.
+    ///
+    /// The tool calls come between the answer and the note the turn ends on,
+    /// and a client that shows a turn's last message as its reply would show
+    /// that note alone. So the answer is marked first, while it is still the
+    /// client's open message: the reasoning sent next closes it.
+    #[test]
+    fn a_reply_that_goes_back_to_work_marks_the_answer_first() {
+        let last = "Re-ran the update; done.";
+        let (_, _, sent) = run_turn_sent(
+            distill_tool_types::ExecutionMode::Normal,
+            vec![tool_call("call-2"), text(last)],
+        );
+        let groups = grouped(sent);
+        let tail: Vec<Sent> = groups.into_iter().rev().take(4).rev().collect();
+        assert_eq!(
+            tail,
+            vec![
+                Sent::Message(FIRST_FINAL.to_owned()),
+                Sent::AnswerMarker,
+                Sent::Thought("update ".to_owned()),
+                Sent::Message(last.to_owned()),
+            ]
+        );
+    }
+
+    /// A turn that ends on its answer, or on a paragraph added to it, has no
+    /// later message to keep the answer from, so nothing is marked.
+    #[test]
+    fn a_reply_that_adds_no_work_marks_nothing() {
+        for reply in [
+            text(FINAL_CHECK_NOTHING_OUTSTANDING),
+            reasoning_then_text(CHECK_REASONING, "The lint warning is gone too."),
+        ] {
+            let (_, _, sent) =
+                run_turn_sent(distill_tool_types::ExecutionMode::Normal, vec![reply]);
+            assert!(!sent.contains(&Sent::AnswerMarker), "{sent:?}");
+        }
+    }
+
+    /// A token with more text is an answer, kept as the new last word.
+    #[test]
+    fn a_token_with_text_is_kept_as_a_new_message() {
+        let reply = "NOTHING_OUTSTANDING. The lint warning is gone too.";
+        let (report, conversation, streamed) = run_turn_streamed(
+            distill_tool_types::ExecutionMode::Normal,
+            vec![text(reply)],
+        );
+        assert!(reminder_sent(&conversation));
+        assert_eq!(report.as_deref(), Some(reply));
+        assert_eq!(
+            streamed,
+            format!("{FIRST_FINAL}\n\n{reply}"),
+            "the reply follows the answer as its next paragraph; nothing is lost or reordered"
+        );
+    }
+
+    /// A reply with tool calls continues the turn as before the token existed.
+    #[test]
+    fn a_reply_with_tool_calls_continues_the_turn() {
+        let last = "Re-ran the update; done.";
+        let (report, conversation) = run_turn(vec![tool_call("call-2"), text(last)]);
+        assert!(reminder_sent(&conversation));
+        assert_eq!(report.as_deref(), Some(last));
+        let results = conversation
+            .iter()
+            .filter(|item| matches!(item, ConversationItem::ToolResult(_)))
+            .count();
+        assert_eq!(results, 2, "the second tool call ran");
+    }
+
+    /// The work a reply goes back to can end on the token: the model checks
+    /// again, finds nothing to add and confirms. A client adds what follows
+    /// the marked answer to it, so a token sent there is shown as the
+    /// answer's last paragraph (RemoteCode, 2026-11-16). It must stay hidden
+    /// in every execution mode, and out of the history and the report.
+    #[test]
+    fn a_token_after_the_replys_tool_calls_is_never_sent_to_the_client() {
+        for mode in distill_tool_types::ExecutionMode::ALL {
+            let (report, conversation, streamed) = run_turn_streamed(
+                mode,
+                vec![tool_call("call-2"), text(FINAL_CHECK_NOTHING_OUTSTANDING)],
+            );
+            // UltraCode appends its review status line to the final message.
+            assert!(
+                streamed.starts_with(FIRST_FINAL)
+                    && !streamed.contains(FINAL_CHECK_NOTHING_OUTSTANDING),
+                "{mode:?} streamed: {streamed:?}"
+            );
+            assert!(
+                report.as_deref().is_some_and(|r| r.starts_with(FIRST_FINAL)),
+                "{mode:?} lost the answer: {report:?}"
+            );
+            assert!(
+                !conversation.iter().any(|item| {
+                    matches!(item, ConversationItem::Assistant(_))
+                        && item.text_content().contains(FINAL_CHECK_NOTHING_OUTSTANDING)
+                }),
+                "{mode:?} kept the token in the history"
+            );
+            let results = conversation
+                .iter()
+                .filter(|item| matches!(item, ConversationItem::ToolResult(_)))
+                .count();
+            assert_eq!(results, 2, "{mode:?} lost the work the reply did");
+        }
+    }
+
+    /// Only the reply itself has its reasoning held. After its tool calls
+    /// the answer is already closed in the client, so the thoughts and the
+    /// text of the work that follows reach it as the model wrote them.
+    #[test]
+    fn work_after_the_replys_tool_calls_streams_its_reasoning_and_text() {
+        let last = "Re-ran the update; done.";
+        let (report, _, sent) = run_turn_sent(
+            distill_tool_types::ExecutionMode::Normal,
+            vec![
+                tool_call("call-2"),
+                reasoning_then_text(CHECK_REASONING, last),
+            ],
+        );
+        let groups = grouped(sent);
+        let tail: Vec<Sent> = groups.into_iter().rev().take(2).rev().collect();
+        // The scripted reply ends its reasoning and its text on a space.
+        assert_eq!(
+            tail,
+            vec![
+                Sent::Thought(format!("update {CHECK_REASONING} ")),
+                Sent::Message(format!("{last} ")),
+            ]
+        );
+        assert_eq!(report.as_deref().map(str::trim), Some(last));
+    }
+
+    const NEXT_PROMPT: &str = "and the changelog?";
+    const NEXT_ANSWER: &str = "The changelog is updated.";
+
+    /// How the session's last turn left the final-check reminder.
+    enum LastTurn {
+        /// The turn ran here and the model confirmed with the bare token.
+        Confirmed,
+        /// The history ends on the reminder, in this wording: an older
+        /// version kept it after a confirmation, or its reply was cancelled
+        /// or failed.
+        LeftUnanswered(&'static str),
+    }
+
+    /// Sends [`NEXT_PROMPT`] to a session whose last turn asked the final
+    /// check. Returns every request body the model was sent and the text the
+    /// client was sent for the new prompt.
+    fn run_next_prompt(last_turn: LastTurn) -> (Vec<String>, String) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            // A debug-build turn future outgrows the usual 16 MiB test stack.
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                tokio::task::LocalSet::new().block_on(&runtime, async move {
+                    let server = MockInferenceServer::start().await.expect("mock server");
+                    let actor = actor_for(&server).await;
+                    let prompt = |actor: Arc<SessionActor>, id: &'static str, text: &'static str| async move {
+                        let outcome = tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            actor.handle_prompt(
+                                id,
+                                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                    text.to_string(),
+                                ))],
+                                PromptMode::Agent,
+                                None,
+                                None,
+                                None,
+                                None,
+                                true,
+                                false,
+                                None,
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                        .expect("turn must finish within timeout");
+                        assert!(outcome.is_ok(), "turn must not error: {outcome:?}");
+                    };
+                    match last_turn {
+                        LastTurn::Confirmed => {
+                            server.enqueue_response("/v1/responses", tool_call("call-1"));
+                            server.enqueue_response("/v1/responses", text(FIRST_FINAL));
+                            server.enqueue_response(
+                                "/v1/responses",
+                                text(FINAL_CHECK_NOTHING_OUTSTANDING),
+                            );
+                            final_check_finds_work_missing();
+                            prompt(actor.clone(), "last-turn", "mark the todo done").await;
+                            crate::jev::clear_test_decision_answers();
+                        }
+                        LastTurn::LeftUnanswered(reminder) => {
+                            actor
+                                .chat_state_handle
+                                .push_user_message(ConversationItem::user("mark the todo done"));
+                            actor
+                                .chat_state_handle
+                                .push_assistant_response(ConversationItem::assistant(FIRST_FINAL));
+                            actor.push_system_reminder(reminder);
+                        }
+                    }
+                    STREAMED.with(|streamed| streamed.borrow_mut().clear());
+                    server.enqueue_response("/v1/responses", text(NEXT_ANSWER));
+                    prompt(actor.clone(), "next-prompt", NEXT_PROMPT).await;
+                    let streamed = STREAMED.with(|streamed| {
+                        streamed
+                            .borrow()
+                            .iter()
+                            .filter_map(|chunk| match chunk {
+                                Sent::Message(text) => Some(text.clone()),
+                                Sent::Thought(_) | Sent::AnswerMarker => None,
+                            })
+                            .collect::<String>()
+                    });
+                    let requests = server
+                        .request_bodies()
+                        .iter()
+                        .map(serde_json::Value::to_string)
+                        .collect();
+                    sender.send((requests, streamed)).expect("send result");
+                });
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread");
+        receiver.recv().expect("turn result")
+    }
+
+    /// The request for [`NEXT_PROMPT`] must carry the earlier answer and the
+    /// prompt, and nothing that asks for the token.
+    fn assert_next_prompt_is_clean(requests: &[String], streamed: &str) {
+        let request = requests.last().expect("the next prompt was sampled");
+        assert!(
+            request.contains(NEXT_PROMPT) && request.contains(FIRST_FINAL),
+            "not the next prompt's request: {request}"
+        );
+        assert!(
+            !request.contains(FINAL_CHECK_NOTHING_OUTSTANDING),
+            "the model was asked for the token along with the user's prompt: {request}"
+        );
+        assert_eq!(streamed, NEXT_ANSWER);
+    }
+
+    /// A confirmed final check must not leak into the next prompt. With the
+    /// reminder still in the history the model reads it and the new prompt
+    /// as one message, answers the reminder, and the user gets the bare
+    /// token as the whole reply to what they asked.
+    #[test]
+    fn the_next_prompt_is_not_sent_a_confirmed_reminder() {
+        let (requests, streamed) = run_next_prompt(LastTurn::Confirmed);
+        assert_eq!(requests.len(), 4, "{requests:?}");
+        assert!(
+            requests[2].contains(FINAL_CHECK_NOTHING_OUTSTANDING),
+            "the final check must have fired in the last turn: {}",
+            requests[2]
+        );
+        assert_next_prompt_is_clean(&requests, &streamed);
+    }
+
+    /// Sessions written before the reminder was dropped on confirmation end
+    /// on it, and so does a turn whose final-check reply was cancelled or
+    /// failed. Their next prompt must not meet it either, in the wording
+    /// sent today or in the one a session written up to 2.0.77 ends on.
+    #[test]
+    fn the_next_prompt_is_not_sent_a_reminder_left_unanswered() {
+        for reminder in [
+            JEV_FINAL_CHECK_REMINDER,
+            JEV_FINAL_CHECK_REMINDER_UNTIL_2_0_77,
+        ] {
+            let (requests, streamed) = run_next_prompt(LastTurn::LeftUnanswered(reminder));
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_next_prompt_is_clean(&requests, &streamed);
+        }
+    }
+
+    const SENTINEL: &str = "SENTINEL-c41b-user-text";
+
+    /// [`run_turn`] with the session's outcome facts written to a file and a
+    /// sentinel in the prompt; returns that file's text.
+    fn run_turn_facts(after_reminder: Vec<ScriptedResponse>) -> String {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            // A debug-build turn future outgrows the usual 16 MiB test stack.
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                tokio::task::LocalSet::new().block_on(&runtime, async move {
+                    let server = MockInferenceServer::start().await.expect("mock server");
+                    server.enqueue_response("/v1/responses", tool_call("call-1"));
+                    server.enqueue_response("/v1/responses", text(FIRST_FINAL));
+                    for response in after_reminder {
+                        server.enqueue_response("/v1/responses", response);
+                    }
+                    let actor = actor_for(&server).await;
+                    let dir = tempfile::tempdir().unwrap();
+                    let writer = distill_session_events::EventWriter::open(dir.path());
+                    crate::jev::register_session_events(actor.session_info.id.0.as_ref(), &writer);
+                    final_check_finds_work_missing();
+                    let prompt = vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+                        "mark the todo done {SENTINEL}"
+                    )))];
+                    let outcome = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        actor.handle_prompt(
+                            "final-check-facts",
+                            prompt,
+                            PromptMode::Agent,
+                            None,
+                            None,
+                            None,
+                            None,
+                            true,
+                            false,
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await
+                    .expect("turn must finish within timeout");
+                    crate::jev::clear_test_decision_answers();
+                    assert!(outcome.is_ok(), "turn must not error: {outcome:?}");
+                    drop(writer);
+                    let text = std::fs::read_to_string(dir.path().join("events.jsonl"))
+                        .unwrap_or_default();
+                    sender.send(text).expect("send result");
+                });
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread");
+        receiver.recv().expect("turn result")
+    }
+
+    fn facts(text: &str, kind: &str) -> Vec<serde_json::Value> {
+        text.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON line"))
+            .filter(|event| event["type"] == kind)
+            .collect()
+    }
+
+    /// Real work after the reminder: one reminder fact and, when the turn
+    /// ends, one follow-up counting the two tool rounds that ran after it.
+    /// Neither the request, the replies nor the reminder text is written.
+    #[test]
+    fn the_followup_counts_the_tool_rounds_after_the_reminder() {
+        let last = format!("Re-ran the update twice; done. {SENTINEL}");
+        let text = run_turn_facts(vec![tool_call("call-2"), tool_call("call-3"), text(&last)]);
+        let reminders = facts(&text, "final_check_reminder");
+        assert_eq!(reminders.len(), 1, "{text}");
+        assert_eq!(reminders[0]["seq"], 1);
+        assert_eq!(reminders[0]["label"], "c1:incomplete,c3:incomplete");
+        let followups = facts(&text, "final_check_followup");
+        assert_eq!(followups.len(), 1, "{text}");
+        assert_eq!(followups[0]["reminder_seq"], 1);
+        assert_eq!(followups[0]["tool_rounds"], 2);
+        assert_eq!(followups[0]["edited"], false, "todo_write is not an edit");
+        assert_eq!(followups[0]["delivered"], false);
+        assert_eq!(followups[0]["fixed_token"], false);
+        assert!(!text.contains(SENTINEL), "{text}");
+        assert!(!text.contains(FINAL_CHECK_NOTHING_OUTSTANDING), "{text}");
+        assert!(!text.contains("Review the user request"), "{text}");
+    }
+
+    /// The bare token is a no-op reply: no tool round, `fixed_token` set.
+    #[test]
+    fn the_followup_marks_the_bare_token() {
+        let text = run_turn_facts(vec![text(FINAL_CHECK_NOTHING_OUTSTANDING)]);
+        let followups = facts(&text, "final_check_followup");
+        assert_eq!(followups.len(), 1, "{text}");
+        assert_eq!(followups[0]["tool_rounds"], 0);
+        assert_eq!(followups[0]["fixed_token"], true);
     }
 }
 

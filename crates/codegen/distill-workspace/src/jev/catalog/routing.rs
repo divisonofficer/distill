@@ -389,18 +389,25 @@ pub const UTILITY_EFFORT_QUESTION: &str = "utility_effort";
 
 /// B2: the effort to use for this call, or `None` to keep the session's.
 pub fn compose_micro_effort(answers: &JevAnswerSet, offered: &[EffortChoice]) -> Option<String> {
-    compose_micro_effort_for(answers, offered, MICRO_EFFORT_QUESTION)
+    compose_micro_effort_for(
+        answers,
+        offered,
+        MICRO_EFFORT_QUESTION,
+        distill_tool_types::JEV_CHOICE_QUANTILE,
+    )
 }
 
 /// `offered` is cheapest first. The pick is the cheapest offered level holding
-/// at least half of the answer's probability mass (labels outside the menu are
-/// ignored), so a split answer lands in the middle instead of on the session's
-/// effort. Without a usable distribution the answer's own `choice` applies if
-/// offered. No confidence floor.
+/// at least `quantile` of the answer's probability mass (labels outside the
+/// menu are ignored; the mode's policy row names the quantile), so a split
+/// answer lands in the middle instead of on the session's effort. Without a
+/// usable distribution the answer's own `choice` applies if offered. No
+/// confidence floor.
 pub fn compose_micro_effort_for(
     answers: &JevAnswerSet,
     offered: &[EffortChoice],
     question_id: &str,
+    quantile: f64,
 ) -> Option<String> {
     let Some(Answer::Choice {
         choice,
@@ -416,7 +423,7 @@ pub fn compose_micro_effort_for(
         let mut cumulative = 0.0;
         for candidate in offered {
             cumulative += mass(&candidate.id);
-            if cumulative / total >= 0.5 {
+            if cumulative / total >= quantile {
                 return Some(candidate.id.clone());
             }
         }
@@ -472,11 +479,14 @@ pub fn delegation_questions() -> Result<BTreeMap<QuestionId, Question>, JevError
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DelegationHint {
     pub suggest_delegation: bool,
+    /// The work has independent parts worth launching together.
+    pub parallel: bool,
     pub deferred: bool,
 }
 
-/// B6: suggests delegation only when the work is neither single-call nor pure
-/// sequential; defers on any missing answer.
+/// B6: suggests delegation for any work that takes more than one call, since
+/// the worker is cheaper for sequential work too; `parallel` only picks the
+/// wording. Defers on any missing answer.
 pub fn compose_delegation(answers: &JevAnswerSet) -> DelegationHint {
     let (Some(single), Some(parallel)) = (
         super::noul_of(answers, DELEGATION_SINGLE_QUESTION),
@@ -484,12 +494,14 @@ pub fn compose_delegation(answers: &JevAnswerSet) -> DelegationHint {
     ) else {
         return DelegationHint {
             suggest_delegation: false,
+            parallel: false,
             deferred: true,
         };
     };
+    let suggest_delegation = single < (1.0 - DELEGATION_HINT_FLOOR);
     DelegationHint {
-        suggest_delegation: single < (1.0 - DELEGATION_HINT_FLOOR)
-            && parallel >= DELEGATION_HINT_FLOOR,
+        suggest_delegation,
+        parallel: suggest_delegation && parallel >= DELEGATION_HINT_FLOOR,
         deferred: false,
     }
 }
@@ -970,27 +982,30 @@ mod tests {
     }
 
     #[test]
-    fn b6_hints_delegation_only_for_parallel_multi_step_work() {
+    fn b6_hints_delegation_for_any_multi_step_work() {
         let questions = delegation_questions().expect("battery builds");
         assert_eq!(questions.len(), 2);
 
-        let parallel = answers(vec![
+        let parallel = compose_delegation(&answers(vec![
             ("fits_single_call", noul(0.1)),
             ("needs_parallel", noul(0.85)),
-        ]);
-        assert!(compose_delegation(&parallel).suggest_delegation);
+        ]));
+        assert!(parallel.suggest_delegation && parallel.parallel);
 
-        let sequential = answers(vec![
+        // The worker is cheaper for sequential work too: a main model that
+        // only heard about parallel parts did all multi-step work itself.
+        let sequential = compose_delegation(&answers(vec![
             ("fits_single_call", noul(0.1)),
             ("needs_parallel", noul(0.2)),
-        ]);
-        assert!(!compose_delegation(&sequential).suggest_delegation);
+        ]));
+        assert!(sequential.suggest_delegation && !sequential.parallel);
 
-        let one_call = answers(vec![
+        // One call costs less done directly than specified and reviewed.
+        let one_call = compose_delegation(&answers(vec![
             ("fits_single_call", noul(0.95)),
             ("needs_parallel", noul(0.9)),
-        ]);
-        assert!(!compose_delegation(&one_call).suggest_delegation);
+        ]));
+        assert!(!one_call.suggest_delegation && !one_call.parallel);
 
         let partial = answers(vec![("fits_single_call", noul(0.1))]);
         assert!(
@@ -1137,11 +1152,14 @@ mod tests {
             compose_micro_effort(&answers, &main).as_deref(),
             Some("low")
         );
+        let quantile = distill_tool_types::JEV_CHOICE_QUANTILE;
         assert_eq!(
-            compose_micro_effort_for(&answers, &other, OTHER_EFFORT_QUESTION).as_deref(),
+            compose_micro_effort_for(&answers, &other, OTHER_EFFORT_QUESTION, quantile).as_deref(),
             Some("max")
         );
-        assert!(compose_micro_effort_for(&answers, &other, MICRO_EFFORT_QUESTION).is_none());
+        assert!(
+            compose_micro_effort_for(&answers, &other, MICRO_EFFORT_QUESTION, quantile).is_none()
+        );
     }
 
     /// The menu handed to the battery is the model's own, cheapest first.

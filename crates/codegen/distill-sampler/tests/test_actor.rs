@@ -1514,6 +1514,364 @@ async fn responses_doom_loop_does_not_resample_after_output_when_retry_only_befo
 }
 
 // ---------------------------------------------------------------------------
+// Account route: a stream that drops after output
+// ---------------------------------------------------------------------------
+
+fn account_routed_config(base_url: String) -> SamplerConfig {
+    let mut cfg = responses_config(base_url, None);
+    cfg.extra_headers
+        .insert("x-distill-account-route".into(), "{}".into());
+    cfg
+}
+
+/// Serves `/v1/responses`: the first `broken_attempts` calls stream two text deltas and then end as `first_ending` says.
+/// Later calls stream the whole answer.
+fn responses_app_breaking_after_output(
+    counter: Arc<AtomicU32>,
+    broken_attempts: u32,
+    first_ending: fn() -> Vec<Result<Event, std::io::Error>>,
+) -> Router {
+    Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let mut events: Vec<Result<Event, std::io::Error>> = sse_events_to_axum(
+                    sse::responses_api_script_exact("the whole answer", "test-model"),
+                )
+                .into_iter()
+                .map(Ok)
+                .collect();
+                let broken = attempt < broken_attempts;
+                if broken {
+                    // `response.created` and the first two text deltas, then the ending under test
+                    events.truncate(3);
+                    events.extend(first_ending());
+                }
+                // The deltas must reach the client before the ending does, or the attempt fails with no output observed
+                Sse::new(stream::iter(events.into_iter().enumerate()).then(
+                    move |(i, event)| async move {
+                        if broken && i == 3 {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        event
+                    },
+                ))
+            }
+        }),
+    )
+}
+
+/// The connection dies mid-body: the client sees a body error, not a server-reported one.
+fn dropped_connection() -> Vec<Result<Event, std::io::Error>> {
+    vec![Err(std::io::Error::other("connection dropped"))]
+}
+
+/// The provider itself reports the failure, which is the verdict the session's account fallback reads.
+fn server_reported_failure() -> Vec<Result<Event, std::io::Error>> {
+    vec![
+        Ok(Event::default().data(
+            json!({
+                "type": "response.failed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_test", "object": "response", "created_at": 1234567890,
+                    "model": "test-model", "status": "failed", "output": [],
+                    "error": { "code": "server_error", "message": "upstream failed" }
+                }
+            })
+            .to_string(),
+        )),
+        Ok(Event::default().data("[DONE]")),
+    ]
+}
+
+/// A subscription stream that drops mid-answer used to end the whole agent turn: the account route forbade any retry
+/// once output had started. A dropped connection carries no provider verdict, so it is retried on the same route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_route_retries_a_stream_dropped_after_output() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let server = MockServer::spawn(responses_app_breaking_after_output(
+        Arc::clone(&counter),
+        1,
+        dropped_connection,
+    ))
+    .await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        account_routed_config(server.base_url()),
+        RetryPolicy::default(),
+        event_tx,
+    );
+
+    handle.submit(RequestId::from("req-account-drop"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(30)).await;
+    server.shutdown();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SamplingEvent::Retrying { .. })),
+        "the dropped stream is retried: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Completed { .. })),
+        "the retry completes the request: {:?}",
+        events.last()
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "one retry");
+}
+
+/// The caller's own opt-in still wins: it cannot retract the text it already received, on any route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_route_drop_after_output_is_not_retried_for_a_caller_that_cannot_retract() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let server = MockServer::spawn(responses_app_breaking_after_output(
+        Arc::clone(&counter),
+        1,
+        dropped_connection,
+    ))
+    .await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        account_routed_config(server.base_url()),
+        RetryPolicy {
+            retry_only_before_output: true,
+            ..RetryPolicy::default()
+        },
+        event_tx,
+    );
+
+    handle.submit(
+        RequestId::from("req-account-no-retract"),
+        user_request("hi"),
+    );
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(30)).await;
+    server.shutdown();
+
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Failed { .. })),
+        "the failure is surfaced: {:?}",
+        events.last()
+    );
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "no replay over delivered output"
+    );
+}
+
+/// A failure the provider reports after output still goes to the session untouched: quota and refused-tier verdicts
+/// are what its account fallback switches accounts on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn account_route_server_failure_after_output_still_reaches_the_session() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let server = MockServer::spawn(responses_app_breaking_after_output(
+        Arc::clone(&counter),
+        1,
+        server_reported_failure,
+    ))
+    .await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        account_routed_config(server.base_url()),
+        RetryPolicy::default(),
+        event_tx,
+    );
+
+    handle.submit(
+        RequestId::from("req-account-server-failure"),
+        user_request("hi"),
+    );
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(30)).await;
+    server.shutdown();
+
+    match events.last() {
+        Some(SamplingEvent::Failed { error, .. }) => {
+            assert_eq!(
+                error.kind,
+                SamplingErrorKind::Api,
+                "a server verdict: {error:?}"
+            );
+        }
+        other => panic!("expected Failed(Api), got {other:?}"),
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "left to the account fallback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Output cap: a response cut while the model was still reasoning
+// ---------------------------------------------------------------------------
+
+/// A chat-completions turn the output cap cut while the model was still reasoning: reasoning deltas, `finish_reason:
+/// "length"`, no text and no tool call.
+fn chat_completions_reasoning_cut_by_length(model: &str) -> Vec<SseEvent> {
+    let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                "created": 1234567890, "model": model,
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
+            })
+            .to_string(),
+        )
+    };
+    vec![
+        chunk(
+            json!({ "role": "assistant", "reasoning_content": "weighing every option at length" }),
+            json!(null),
+        ),
+        chunk(json!({}), json!("length")),
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-test", "object": "chat.completion.chunk",
+                "created": 1234567890, "model": model,
+                "choices": [],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 1024, "total_tokens": 1034 }
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]"),
+    ]
+}
+
+/// Serves `/v1/chat/completions`: the first `cut_attempts` calls are cut while reasoning, later ones answer.
+/// Every request body is kept for the test to read.
+fn chat_app_cut_while_reasoning(
+    bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    cut_attempts: usize,
+) -> Router {
+    Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let bodies = Arc::clone(&bodies);
+            async move {
+                let attempt = {
+                    let mut bodies = bodies.lock().unwrap();
+                    bodies.push(body);
+                    bodies.len() - 1
+                };
+                let events = if attempt < cut_attempts {
+                    sse_events_to_axum(chat_completions_reasoning_cut_by_length("test-model"))
+                } else {
+                    sse::chat_completion_events("the next step", "test-model")
+                };
+                Sse::new(stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                ))
+            }
+        }),
+    )
+}
+
+/// A model at a high reasoning effort can spend its whole output cap thinking and deliver nothing.
+/// That used to fail the request, and with it the agent turn, although the window had room for a shorter answer.
+/// The request is resampled with a reminder to reason less.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_cut_by_the_output_cap_is_resampled_with_a_reminder() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = MockServer::spawn(chat_app_cut_while_reasoning(Arc::clone(&bodies), 1)).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+
+    handle.submit(RequestId::from("req-output-cap"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(30)).await;
+    server.shutdown();
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SamplingEvent::Retrying { kind, .. } if *kind == SamplingErrorKind::MaxTokensTruncation
+        )),
+        "the cut is announced as a retry: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Completed { .. })),
+        "the resample completes the request: {:?}",
+        events.last()
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "one resample");
+    assert!(
+        !bodies[0]
+            .to_string()
+            .contains("reached the output token limit"),
+        "the first request carries no reminder"
+    );
+    assert!(
+        bodies[1]
+            .to_string()
+            .contains("reached the output token limit"),
+        "the resample tells the model why it was cut: {}",
+        bodies[1]
+    );
+}
+
+/// The resample budget is small: a model that keeps spending the cap on reasoning fails as it did before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_cut_every_time_fails_after_two_resamples() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = MockServer::spawn(chat_app_cut_while_reasoning(
+        Arc::clone(&bodies),
+        usize::MAX,
+    ))
+    .await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(
+        test_config(server.base_url(), "test-model"),
+        RetryPolicy::default(),
+        event_tx,
+    );
+
+    handle.submit(RequestId::from("req-output-cap-stuck"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(30)).await;
+    server.shutdown();
+
+    match events.last() {
+        Some(SamplingEvent::Failed { error, .. }) => {
+            assert_eq!(error.kind, SamplingErrorKind::MaxTokensTruncation);
+        }
+        other => panic!("expected Failed(MaxTokensTruncation), got {other:?}"),
+    }
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        3,
+        "the first attempt and two resamples"
+    );
+}
+
+/// With no output cap configured, `Length` means the context window ran out, and a replay cannot fit either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reasoning_cut_with_no_output_cap_is_not_resampled() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = MockServer::spawn(chat_app_cut_while_reasoning(Arc::clone(&bodies), 1)).await;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let mut config = test_config(server.base_url(), "test-model");
+    config.max_completion_tokens = None;
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+
+    handle.submit(RequestId::from("req-window-exhausted"), user_request("hi"));
+    let events = drain_until_terminal(&mut event_rx, Duration::from_secs(30)).await;
+    server.shutdown();
+
+    assert!(
+        matches!(events.last(), Some(SamplingEvent::Failed { .. })),
+        "the truncation is surfaced: {:?}",
+        events.last()
+    );
+    assert_eq!(bodies.lock().unwrap().len(), 1, "no replay");
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for draining the event channel
 // ---------------------------------------------------------------------------
 

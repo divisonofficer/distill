@@ -19,6 +19,7 @@ impl SessionActor {
             endpoint: None,
             requested_effort: None,
             applied_effort: None,
+            cache_lifetime_secs: None,
         });
         context.attempt_id = format!(
             "{}:retry:{}:{attempt}",
@@ -49,6 +50,31 @@ impl SessionActor {
             Some(chunk_index),
         )
         .await;
+    }
+
+    /// Sends the reasoning held from a reply to the final-check reminder, in
+    /// order, once the reply ended with no text to continue the answer with.
+    pub(super) async fn send_held_reasoning(&self, held: Vec<super::jev_ledger::HeldReasoning>) {
+        use super::jev_ledger::HeldReasoning;
+        for reasoning in held {
+            match reasoning {
+                HeldReasoning::Thought(text) => {
+                    self.send_update(
+                        acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                            acp::ContentBlock::Text(acp::TextContent::new(text)),
+                        )),
+                        None,
+                    )
+                    .await;
+                }
+                HeldReasoning::Completed(signature) => {
+                    self.send_buffered_xai_update(XaiSessionUpdate::ReasoningCompleted {
+                        signature: Some(signature),
+                    })
+                    .await;
+                }
+            }
+        }
     }
 
     /// Stamp ttft on the first token of any channel (reasoning, text, or tool call).
@@ -211,6 +237,7 @@ impl SessionActor {
                     }
                     cap.start_request_stream(request_id.as_str(), timestamp_ms);
                 }
+                self.jev_ledger.borrow_mut().restart_final_check_hold();
                 self.chat_state_handle.record_stream_start(timestamp_ms);
                 self.open_stream_apply_span(&request_id);
             }
@@ -252,13 +279,20 @@ impl SessionActor {
                     self.emit_event(crate::session::events::Event::PhaseChanged {
                         phase: crate::session::events::Phase::StreamingText,
                     });
-                    self.send_update(
-                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                            acp::ContentBlock::Text(acp::TextContent::new(text)),
-                        )),
-                        Some(chunk_index),
-                    )
-                    .await;
+                    // The reply to the final-check reminder may be the bare confirmation token, which no client may see
+                    let released = self.jev_ledger.borrow_mut().filter_final_check_chunk(
+                        text,
+                        super::turn::FINAL_CHECK_NOTHING_OUTSTANDING,
+                    );
+                    for text in released {
+                        self.send_update(
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                acp::ContentBlock::Text(acp::TextContent::new(text)),
+                            )),
+                            Some(chunk_index),
+                        )
+                        .await;
+                    }
                 }
                 SamplingChannel::Reasoning => {
                     self.bump_stream_apply_span(&request_id, text.len());
@@ -286,7 +320,11 @@ impl SessionActor {
                     self.emit_event(crate::session::events::Event::PhaseChanged {
                         phase: crate::session::events::Phase::StreamingReasoning,
                     });
-                    self.send_thought_chunk(text, chunk_index).await;
+                    // The reply to the final-check reminder is invisible when it is the bare confirmation token, and so is its reasoning
+                    let text = self.jev_ledger.borrow_mut().hold_final_check_thought(text);
+                    if let Some(text) = text {
+                        self.send_thought_chunk(text, chunk_index).await;
+                    }
                 }
             },
             SamplingEvent::ToolCallDelta {
@@ -339,10 +377,17 @@ impl SessionActor {
             SamplingEvent::ReasoningCompleted { signature, .. } => {
                 // Ride the buffered chunk rail so this lands right after the response's thought chunks and before its text
                 // That lets partial framing in headless mode emit `signature_delta` before the thinking block's `content_block_stop`
-                self.send_buffered_xai_update(XaiSessionUpdate::ReasoningCompleted {
-                    signature: Some(signature),
-                })
-                .await;
+                // Held reasoning of the final-check reply keeps its signature behind it
+                let signature = self
+                    .jev_ledger
+                    .borrow_mut()
+                    .hold_final_check_signature(signature);
+                if let Some(signature) = signature {
+                    self.send_buffered_xai_update(XaiSessionUpdate::ReasoningCompleted {
+                        signature: Some(signature),
+                    })
+                    .await;
+                }
             }
             SamplingEvent::DoomLoopSignals {
                 request_id,

@@ -184,9 +184,11 @@ pub enum ChatStateCommand {
     UpdateSamplingConfig { config: Box<SamplingConfig> },
 
     /// Sent once, before the first request of a session spawned with a history: a verbatim
-    /// fork's `parent_trims` are the request trims its parent sent; any other history is cold.
+    /// fork's `parent_trims` are the request trims its parent sent; a reloaded session's
+    /// `resumed` record keeps it warm inside its cache lifetime; any other history is cold.
     StartFromInheritedHistory {
         parent_trims: Option<crate::actor::history_eviction::RequestTrims>,
+        resumed: Option<crate::actor::history_eviction::CacheResumeState>,
     },
 
     /// The cache lifetime the last main request had; `None` when the endpoint's is unknown.
@@ -284,6 +286,13 @@ pub enum ChatStateCommand {
     /// continuation), so the dead cue does not persist into later turns.
     PopStrandedContinueReminder,
 
+    /// Drop a harness question that nothing will answer any more
+    /// ([`crate::ChatStateHandle::drop_unanswered_question`]).
+    DropUnansweredQuestion {
+        question: String,
+        bare_reply: String,
+    },
+
     /// Build a ConversationRequest ready to send to the API.
     /// Clones, prunes old tool results, repairs dangling calls, injects the memory reminder.
     BuildConversationRequest {
@@ -323,6 +332,11 @@ pub enum ChatStateCommand {
     /// The request trims this session's requests sent (see [`Self::StartFromInheritedHistory`]).
     GetRequestTrims {
         reply: oneshot::Sender<crate::actor::history_eviction::RequestTrims>,
+    },
+
+    /// What a reload of this session needs to know about the cache; `None` before any request.
+    GetCacheResumeState {
+        reply: oneshot::Sender<Option<crate::actor::history_eviction::CacheResumeState>>,
     },
 
     /// Retrieve the most recent stashed per-turn `TokenUsage`. Returns

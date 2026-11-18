@@ -190,8 +190,16 @@ mod jev_memory;
 mod jev_routing;
 #[path = "acp_session_impl/jev_tier_route.rs"]
 mod jev_tier_route;
+#[path = "acp_session_impl/escalation.rs"]
+mod escalation;
 #[path = "acp_session_impl/jev_auto_mode.rs"]
 pub(crate) mod jev_auto_mode;
+#[path = "acp_session_impl/jev_shadow_packs.rs"]
+mod jev_shadow_packs;
+#[path = "acp_session_impl/mode_policy.rs"]
+pub(crate) mod mode_policy;
+#[path = "acp_session_impl/mode_effort.rs"]
+pub(crate) mod mode_effort;
 #[path = "acp_session_impl/jev_tool_result.rs"]
 mod jev_tool_result;
 #[path = "acp_session_impl/native_tool_output.rs"]
@@ -979,6 +987,8 @@ pub(crate) struct SessionActor {
     /// Whether goal mode (`/goal`) is enabled for this session (feature flag).
     pub(crate) goal_enabled: bool,
     pub(crate) background_workflows_enabled: bool,
+    /// Code Mode: the tool calls running scripts make, and what they leave for the turn; see `script_tool_calls.rs`.
+    pub(crate) script_calls: tool_calls::script_tool_calls::ScriptCalls,
     goal_harness_enabled: std::sync::atomic::AtomicBool,
     goal_harness_availability_reconciled: std::sync::atomic::AtomicBool,
     /// Session-scoped state for the `/goal` Design-Execute-Verify loop.
@@ -1550,6 +1560,9 @@ fn load_prompt_context_from_dir(
 #[cfg(test)]
 #[path = "acp_session_tests/client_hooks_tests.rs"]
 mod client_hooks_tests;
+#[cfg(test)]
+#[path = "acp_session_tests/code_mode_tests.rs"]
+mod code_mode_tests;
 #[cfg(test)]
 #[path = "acp_session_tests/managed_hooks_tests.rs"]
 mod managed_hooks_tests;

@@ -207,7 +207,7 @@ async fn a_stale_task_completion_is_frame_bounded() {
     let path = dir.path().join("updates.jsonl");
     std::fs::write(&path, line).unwrap();
 
-    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
+    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path), false);
 
     let params = next_ext_notification_params(&mut rx).expect("the stale task must be reported");
     assert!(
@@ -226,7 +226,7 @@ async fn stale_task_reconcile_keeps_incrementals_without_list() {
     let path = dir.path().join("updates.jsonl");
     std::fs::write(&path, line).unwrap();
 
-    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
+    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path), false);
 
     let notifs = drain_ext_notifications(&mut rx);
     assert!(
@@ -253,7 +253,7 @@ async fn cold_load_with_no_orphans_emits_no_reconcile_notifications() {
     let path = dir.path().join("updates.jsonl");
     std::fs::write(&path, line).unwrap();
 
-    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path));
+    agent.reconcile_stale_background_tasks(&acp::SessionId::new("s"), &Some(path), false);
 
     let notifs = drain_ext_notifications(&mut rx);
     assert!(

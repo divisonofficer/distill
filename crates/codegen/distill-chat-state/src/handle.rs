@@ -407,7 +407,23 @@ impl ChatStateHandle {
     pub fn start_from_inherited_history(&self, parent_trims: Option<crate::RequestTrims>) {
         let _ = self
             .cmd_tx
-            .send(ChatStateCommand::StartFromInheritedHistory { parent_trims });
+            .send(ChatStateCommand::StartFromInheritedHistory {
+                parent_trims,
+                resumed: None,
+            });
+    }
+
+    /// [`Self::start_from_inherited_history`] for a session reloaded from disk with the record its
+    /// last process kept ([`Self::cache_resume_state`]): inside that request's cache lifetime the
+    /// history is warm and repeats the trims it sent; past it, or with a record that cannot be
+    /// trusted, it is cold as before.
+    pub fn start_from_resumed_history(&self, resumed: crate::CacheResumeState) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::StartFromInheritedHistory {
+                parent_trims: None,
+                resumed: Some(resumed),
+            });
     }
 
     /// The cache lifetime the last main request had (`None`: unknown for its endpoint); idle past
@@ -586,6 +602,21 @@ impl ChatStateHandle {
             .send(ChatStateCommand::PopStrandedContinueReminder);
     }
 
+    /// Drop a harness question that nothing will answer any more: every user
+    /// item whose text is `question` after the last real assistant reply
+    /// (one that is more than `bare_reply`). Left in, the question sits right
+    /// before the next instruction and the model answers it instead of the
+    /// instruction. Fire-and-forget; mailbox order puts the drop before any
+    /// subsequent command's view of history.
+    pub fn drop_unanswered_question(&self, question: String, bare_reply: String) {
+        let _ = self
+            .cmd_tx
+            .send(ChatStateCommand::DropUnansweredQuestion {
+                question,
+                bare_reply,
+            });
+    }
+
     // ═══ Async queries (via oneshot) ═══
 
     /// Send a query to the actor and await the reply.
@@ -689,6 +720,16 @@ impl ChatStateHandle {
         })
         .await
         .unwrap_or_default()
+    }
+
+    /// What a reload of this session needs to know about the cache; `None` before any main
+    /// request completed (or when the actor is gone).
+    pub async fn cache_resume_state(&self) -> Option<crate::CacheResumeState> {
+        self.query("GetCacheResumeState", |reply| {
+            ChatStateCommand::GetCacheResumeState { reply }
+        })
+        .await
+        .flatten()
     }
 
     /// Get total accumulated tokens.

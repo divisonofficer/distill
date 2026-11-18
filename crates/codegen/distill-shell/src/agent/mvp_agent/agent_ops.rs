@@ -4509,6 +4509,7 @@ impl MvpAgent {
                 mode: Arc::new(distill_tool_types::AtomicExecutionMode::default()),
                 max_depth: self.cfg.borrow().subagents_ultracode_max_depth,
                 off_max_depth: self.cfg.borrow().subagents_max_depth,
+                v2: crate::session::acp_session::mode_policy::v2_modes(),
                 capability_ceiling: None,
                 allowed_subagent_types: None,
             },
@@ -4827,6 +4828,10 @@ impl MvpAgent {
             .cfg
             .borrow()
             .is_feature_enabled(crate::agent::config::Feature::WriteFile);
+        let code_mode_enabled = self
+            .cfg
+            .borrow()
+            .is_feature_enabled(crate::agent::config::Feature::CodeMode);
         let active_agent_messages_enabled = self
             .cfg
             .borrow()
@@ -5086,6 +5091,7 @@ impl MvpAgent {
                     video_gen_config,
                     app_builder_deployer_config,
                     write_file_enabled,
+                    code_mode_enabled,
                     active_agent_messages_enabled,
                     None,
                     goal_enabled,
