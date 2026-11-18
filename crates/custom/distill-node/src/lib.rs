@@ -13,6 +13,7 @@ pub mod chat_store;
 pub mod chat_sync;
 pub mod chats;
 pub mod configuration;
+pub mod connections;
 pub mod fleet;
 pub mod guard;
 pub mod interaction;
@@ -76,11 +77,18 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     let keeper = Keeper::start(cfg.agent.clone()).await?;
     let push = Arc::new(Push::load_or_create(&cfg.state_dir)?);
     let chat_store = chat_store::Store::open(&cfg.state_dir.join("chats"))?;
-    let peer_sync = cfg
-        .chat_peer_config
-        .as_deref()
-        .map(|path| chat_sync::PeerSync::load(path, chat_store.clone()))
-        .transpose()?;
+    let sync = match cfg.chat_peer_config.as_deref() {
+        Some(path) => chat_sync::PeerSync::load(path, chat_store.clone())?,
+        None => chat_sync::PeerSync::empty(chat_store.clone())?,
+    };
+    let connections = connections::Connections::load_or_create(
+        &cfg.state_dir,
+        chat_store.clone(),
+        sync.clone(),
+        cfg.allowed_origins.clone(),
+        cfg.untrusted_origin.clone().unwrap_or_default(),
+    )?;
+    let peer_sync = Some(sync);
     let completion: Arc<dyn chats::ChatCompleter> =
         Arc::new(chats::AcpChatCompleter::new(keeper.clone()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -105,6 +113,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         (Some(completion), peer_sync.clone()),
         WebConfig {
             untrusted_origin: cfg.untrusted_origin.clone(),
+            connections: Some(connections),
             blocked_ports: blocked_ports.clone(),
         },
     );
@@ -194,6 +203,7 @@ pub fn trusted_router_with_chat_services(
 
 #[derive(Default)]
 struct WebConfig {
+    connections: Option<connections::Connections>,
     untrusted_origin: Option<String>,
     blocked_ports: Vec<u16>,
 }
@@ -216,7 +226,13 @@ fn trusted_services_router(
         .as_ref()
         .map(chat_sync::PeerSync::status)
         .unwrap_or_else(chat_sync::SyncStatus::disabled);
+    let connections = web.connections;
+    let connection_routes = connections
+        .as_ref()
+        .map(|c| c.owner_routes())
+        .unwrap_or_default();
     let guarded = Router::new()
+        .merge(connection_routes)
         .route(
             "/api/node",
             get(move || node_info(web.untrusted_origin.clone())),
@@ -242,6 +258,11 @@ fn trusted_services_router(
         .merge(guarded);
     if let Some(peer_sync) = peer_sync {
         app = app.merge(peer_sync.routes());
+    }
+    if let Some(connections) = connections {
+        app = app
+            .merge(connections.public_routes())
+            .layer(axum::Extension(connections));
     }
     app.fallback(move |req: Request| {
         let web_dir = web_dir.clone();

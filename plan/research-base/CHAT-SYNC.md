@@ -1,6 +1,18 @@
 # General chat peer sync
 
-Configure sync on each node with its own private JSON file and pass it as `postudio-node serve --chat-peer-config <path>`. Use a local file with mode `0600` on Unix. Never commit configs or put real URLs, bearer tokens, or private keys in this repository.
+## Native connection settings
+
+Once both nodes are running and reachable through their trusted HTTPS origins, open **Settings → 연결 및 채팅 공유** on each node. Generate an invitation on one node, paste it into the other node, verify the displayed address and public-key fingerprint, and confirm sharing. Invitations expire after ten minutes and can be used once. Enrollment must originate from an explicitly allowed web origin on the node being configured; plain HTTP is accepted only on loopback for local testing.
+
+Run the same Postudio version on both nodes. New title events include a signed causal revision so a later rename from either node wins over earlier edits; old snapshots without revisions remain readable. Pairing shares all existing and future general chats using the signed-event protocol. It also permits the paired node's browser origin through the API/WebSocket origin guard; the Tailscale owner identity check remains mandatory. Discovery never grants trust. Coding sessions remain on their owning host and can be opened through the paired host link; project files are not replicated.
+
+Peer credentials are written atomically to `state-dir/managed-chat-peers.json`, with mode `0600` on Unix, and applied without restarting the node. Restart restores this configuration. Removing a peer revokes its sync credentials and dynamically granted origin access, but does not delete previously copied history or manually configured origins. If a pairing request fails after the other node accepted it, inspect both nodes and remove any one-sided connection before creating a new invitation.
+
+Tailscale installation, HTTPS exposure, initial owner/allowed-origin configuration, and service startup remain deployment prerequisites. Pairing does not install or start a server on another device.
+
+## Legacy configuration
+
+Manual configurations remain supported with `postudio-node serve --chat-peer-config <path>`. The managed configuration becomes authoritative once it exists; the legacy file is used only when there is no managed configuration. Use a local file with mode `0600` on Unix. Never commit configs or put real URLs, bearer tokens, invitations, or private keys in this repository.
 
 Each file has this shape; replace every placeholder locally:
 

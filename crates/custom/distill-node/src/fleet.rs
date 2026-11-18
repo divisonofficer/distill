@@ -16,8 +16,13 @@ pub fn routes() -> Router {
     Router::new().route("/api/fleet", get(discover))
 }
 
-async fn discover() -> Json<Vec<PeerHost>> {
-    Json(discover_peers().await.unwrap_or_default())
+async fn discover() -> Result<Json<Vec<PeerHost>>, (axum::http::StatusCode, Json<Value>)> {
+    discover_peers().await.map(Json).map_err(|_| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "tailscale_discovery_unavailable"})),
+        )
+    })
 }
 
 async fn discover_peers() -> anyhow::Result<Vec<PeerHost>> {

@@ -58,7 +58,7 @@ impl SyncStatus {
     fn configured(peer_count: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SyncHealth {
-                available: true,
+                available: peer_count != 0,
                 peer_count,
                 last_attempt_unix_seconds: None,
                 last_success_unix_seconds: None,
@@ -100,10 +100,16 @@ pub struct PeerSync {
 
 struct PeerSyncInner {
     store: Store,
-    peers: Vec<Peer>,
-    trusted_keys: BTreeMap<String, String>,
+    snapshot: Mutex<Arc<PeerSnapshot>>,
+    changes: tokio::sync::watch::Sender<()>,
     client: reqwest::Client,
     status: SyncStatus,
+}
+
+struct PeerSnapshot {
+    configs: Vec<PeerConfig>,
+    peers: Vec<Peer>,
+    trusted_keys: BTreeMap<String, String>,
 }
 
 struct Peer {
@@ -118,14 +124,14 @@ struct ConfigFile {
     peers: Vec<PeerConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PeerConfig {
-    node_id: String,
-    public_key: String,
-    incoming_token: String,
-    outgoing_url: String,
-    outgoing_token: String,
+pub(crate) struct PeerConfig {
+    pub node_id: String,
+    pub public_key: String,
+    pub incoming_token: String,
+    pub outgoing_url: String,
+    pub outgoing_token: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -170,13 +176,45 @@ impl PeerSync {
             bail!("chat peer config must contain at least one peer");
         }
 
-        let own_identity = store.identity();
+        let sync = Self::empty(store)?;
+        sync.replace_peers(config.peers)?;
+        Ok(sync)
+    }
+
+    pub fn empty(store: Store) -> Result<Self> {
+        let identity = store.identity();
+        let snapshot = PeerSnapshot {
+            configs: Vec::new(),
+            peers: Vec::new(),
+            trusted_keys: BTreeMap::from([(identity.node_id, identity.public_key)]),
+        };
+        let client = distill_extra_ca::build_reqwest_client(|builder| {
+            builder
+                .timeout(PEER_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+        })
+        .context("build chat peer HTTP client")?;
+        let status = SyncStatus::configured(0);
+        let (changes, _) = tokio::sync::watch::channel(());
+        Ok(Self {
+            inner: Arc::new(PeerSyncInner {
+                store,
+                snapshot: Mutex::new(Arc::new(snapshot)),
+                changes,
+                client,
+                status,
+            }),
+        })
+    }
+
+    pub(crate) fn replace_peers(&self, configs: Vec<PeerConfig>) -> Result<()> {
+        let own_identity = self.inner.store.identity();
         let mut trusted_keys =
             BTreeMap::from([(own_identity.node_id.clone(), own_identity.public_key)]);
-        let mut peers = Vec::with_capacity(config.peers.len());
+        let mut peers = Vec::with_capacity(configs.len());
         let mut peer_ids = std::collections::BTreeSet::new();
         let mut incoming_tokens = std::collections::BTreeSet::new();
-        for peer in config.peers {
+        for peer in &configs {
             if peer.node_id == own_identity.node_id
                 || !peer_ids.insert(peer.node_id.clone())
                 || peer.node_id.len() != 64
@@ -208,25 +246,44 @@ impl PeerSync {
             peers.push(Peer {
                 incoming_token_tag: token_tag(&peer.incoming_token),
                 outgoing_url,
-                outgoing_token: peer.outgoing_token,
+                outgoing_token: peer.outgoing_token.clone(),
             });
         }
-        let client = distill_extra_ca::build_reqwest_client(|builder| {
-            builder
-                .timeout(PEER_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-        })
-        .context("build chat peer HTTP client")?;
-        let status = SyncStatus::configured(peers.len());
-        Ok(Self {
-            inner: Arc::new(PeerSyncInner {
-                store,
-                peers,
-                trusted_keys,
-                client,
-                status,
-            }),
-        })
+        let mut current = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut status = self
+            .inner
+            .status
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.available = !peers.is_empty();
+        status.peer_count = peers.len();
+        status.last_attempt_unix_seconds = None;
+        status.last_success_unix_seconds = None;
+        status.last_error = None;
+        *current = Arc::new(PeerSnapshot {
+            configs,
+            peers,
+            trusted_keys,
+        });
+        self.inner.changes.send_replace(());
+        Ok(())
+    }
+
+    pub(crate) fn peer_configs(&self) -> Vec<PeerConfig> {
+        self.snapshot().configs.clone()
+    }
+
+    fn snapshot(&self) -> Arc<PeerSnapshot> {
+        self.inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn status(&self) -> SyncStatus {
@@ -262,17 +319,52 @@ impl PeerSync {
     }
 
     async fn sync_round(&self) {
+        let (snapshot, mut changes) = {
+            let current = self
+                .inner
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (current.clone(), self.inner.changes.subscribe())
+        };
+        if snapshot.peers.is_empty() {
+            return;
+        }
         let mut success = true;
-        for peer in &self.inner.peers {
-            if exchange(self, peer).await.is_err() {
-                success = false;
-                tracing::warn!("chat peer exchange failed");
+        for peer in &snapshot.peers {
+            let events = {
+                let current = self
+                    .inner
+                    .snapshot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !Arc::ptr_eq(&current, &snapshot) {
+                    return;
+                }
+                self.inner.store.export()
+            };
+            tokio::select! {
+                biased;
+                _ = changes.changed() => return,
+                result = exchange(self, peer, events) => {
+                    if result.is_err() {
+                        success = false;
+                        tracing::warn!("chat peer exchange failed");
+                    }
+                }
             }
         }
-        self.inner.status.record_round(success);
+        let current = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::ptr_eq(&current, &snapshot) {
+            self.inner.status.record_round(success);
+        }
     }
 
-    fn authenticate(&self, headers: &HeaderMap) -> bool {
+    fn authenticate(snapshot: &PeerSnapshot, headers: &HeaderMap) -> bool {
         let Some(value) = headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
@@ -287,7 +379,7 @@ impl PeerSync {
         }
         let supplied_key = HmacKey::new(HMAC_SHA256, token.as_bytes());
         let mut matched = 0_u8;
-        for peer in &self.inner.peers {
+        for peer in &snapshot.peers {
             matched |= u8::from(
                 hmac_verify(
                     &supplied_key,
@@ -309,7 +401,12 @@ async fn receive_snapshot(
     if headers.contains_key(ORIGIN) {
         return api_error(StatusCode::FORBIDDEN, "browser_origin_forbidden");
     }
-    if !sync.authenticate(&headers) {
+    let snapshot = sync
+        .inner
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !PeerSync::authenticate(&snapshot, &headers) {
         return api_error(StatusCode::UNAUTHORIZED, "unauthorized");
     }
     if body.len() > MAX_SYNC_BODY_BYTES {
@@ -322,7 +419,7 @@ async fn receive_snapshot(
     if sync
         .inner
         .store
-        .import(request.events, &sync.inner.trusted_keys)
+        .import(request.events, &snapshot.trusted_keys)
         .is_err()
     {
         return api_error(StatusCode::BAD_REQUEST, "invalid_snapshot");
@@ -344,11 +441,9 @@ fn sync_response(store: &Store) -> Response {
         .into_response()
 }
 
-async fn exchange(sync: &PeerSync, peer: &Peer) -> Result<()> {
-    let request_body = serde_json::to_vec(&SyncRequest {
-        events: sync.inner.store.export(),
-    })
-    .context("serialize chat peer snapshot")?;
+async fn exchange(sync: &PeerSync, peer: &Peer, events: Vec<Envelope>) -> Result<()> {
+    let request_body =
+        serde_json::to_vec(&SyncRequest { events }).context("serialize chat peer snapshot")?;
     if request_body.len() > MAX_SYNC_BODY_BYTES {
         return Err(anyhow!("local chat snapshot exceeds peer body limit"));
     }
@@ -388,7 +483,7 @@ async fn exchange(sync: &PeerSync, peer: &Peer) -> Result<()> {
         serde_json::from_slice(&bytes).context("parse chat peer response")?;
     sync.inner
         .store
-        .import(response.events, &sync.inner.trusted_keys)
+        .import(response.events, &sync.snapshot().trusted_keys)
         .context("validate chat peer response")?;
     Ok(())
 }
@@ -445,4 +540,149 @@ fn hex(bytes: &[u8]) -> String {
 
 fn api_error(status: StatusCode, error: &'static str) -> Response {
     (status, axum::Json(ApiError { error })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn replace_peers_updates_trust_atomically() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let local = Store::open(&local_dir.path().join("store")).unwrap();
+        let remote = Store::open(&peer_dir.path().join("store")).unwrap();
+        let identity = remote.identity();
+        let token = "incoming-secret-01234567890123456789";
+        let peer = PeerConfig {
+            node_id: identity.node_id,
+            public_key: identity.public_key,
+            incoming_token: token.into(),
+            outgoing_url: "http://127.0.0.1/api/chat-sync".into(),
+            outgoing_token: "outgoing-secret-01234567890123456789".into(),
+        };
+        let sync = PeerSync::empty(local).unwrap();
+        let health = sync.status();
+        sync.sync_round().await;
+        assert!(!health.snapshot().available);
+        assert_eq!(health.snapshot().last_success_unix_seconds, None);
+        let receive = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat-sync")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(r#"{"events":[]}"#))
+                .unwrap()
+        };
+        assert_eq!(
+            sync.routes().oneshot(receive()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        sync.replace_peers(vec![peer.clone()]).unwrap();
+        assert_eq!(sync.peer_configs().len(), 1);
+        assert!(health.snapshot().available);
+        assert_eq!(health.snapshot().peer_count, 1);
+        assert_eq!(
+            sync.routes().oneshot(receive()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let mut invalid = peer.clone();
+        invalid.outgoing_url = "http://example.com/".into();
+        assert!(sync.replace_peers(vec![invalid]).is_err());
+        assert_eq!(sync.peer_configs()[0].node_id, peer.node_id);
+        assert_eq!(
+            sync.routes().oneshot(receive()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        sync.replace_peers(vec![]).unwrap();
+        assert!(!health.snapshot().available);
+        assert_eq!(health.snapshot().peer_count, 0);
+        assert_eq!(
+            sync.routes().oneshot(receive()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    #[tokio::test]
+    async fn removal_cancels_round_before_later_peer_receives_new_chat() {
+        use crate::chat_store::ChatEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let local_dir = tempfile::tempdir().unwrap();
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let local = Store::open(&local_dir.path().join("store")).unwrap();
+        let a = Store::open(&a_dir.path().join("store")).unwrap();
+        let b = Store::open(&b_dir.path().join("store")).unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let a_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a_url = format!("http://{}/api/chat-sync", a_listener.local_addr().unwrap());
+        let b_url = format!("http://{}/api/chat-sync", b_listener.local_addr().unwrap());
+        let a_app = Router::new().route(
+            "/api/chat-sync",
+            post({
+                let entered = entered.clone();
+                let release = release.clone();
+                move || async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    axum::Json(serde_json::json!({"events": []}))
+                }
+            }),
+        );
+        let b_app = Router::new().route(
+            "/api/chat-sync",
+            post({
+                let count = count.clone();
+                move || async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"events": []}))
+                }
+            }),
+        );
+        let a_server = tokio::spawn(async move { axum::serve(a_listener, a_app).await.unwrap() });
+        let b_server = tokio::spawn(async move { axum::serve(b_listener, b_app).await.unwrap() });
+        let config = |store: &Store, url, token: &str| {
+            let identity = store.identity();
+            PeerConfig {
+                node_id: identity.node_id,
+                public_key: identity.public_key,
+                incoming_token: token.into(),
+                outgoing_url: url,
+                outgoing_token: "outgoing-secret-01234567890123456789".into(),
+            }
+        };
+        let a_config = config(&a, a_url, "incoming-a-secret-01234567890123456789");
+        let b_config = config(&b, b_url, "incoming-b-secret-01234567890123456789");
+        let sync = PeerSync::empty(local.clone()).unwrap();
+        sync.replace_peers(vec![a_config.clone(), b_config])
+            .unwrap();
+        let round_sync = sync.clone();
+        let round = tokio::spawn(async move { round_sync.sync_round().await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        sync.replace_peers(vec![a_config]).unwrap();
+        local
+            .append(ChatEvent::Create {
+                chat_id: "new".into(),
+                title: "New".into(),
+            })
+            .unwrap();
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), round)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(sync.status().snapshot().last_success_unix_seconds, None);
+        a_server.abort();
+        b_server.abort();
+    }
 }

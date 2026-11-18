@@ -542,6 +542,7 @@ async fn rename_chat(
         .append(ChatEvent::Title {
             chat_id: chat_id.clone(),
             title: title.clone(),
+            revision: None,
         })
         .is_err()
     {
