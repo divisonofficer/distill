@@ -2696,3 +2696,17 @@ async fn corrupt_usage_json_does_not_read_as_missing() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
 }
+
+#[tokio::test]
+async fn metadata_only_load_never_opens_chat_history() {
+    let temp_dir = TempDir::new().unwrap();
+    let info = create_test_info();
+    let adapter = JsonlStorageAdapter::with_root(temp_dir.path().to_path_buf());
+    adapter.init_session(&info, default_model_id()).await.unwrap();
+    let chat = adapter.chat_file(&info);
+    if chat.exists() { std::fs::remove_file(&chat).unwrap(); }
+    std::fs::create_dir(&chat).unwrap();
+    let metadata = adapter.load_session_without_chat_history(&info).unwrap();
+    assert!(metadata.chat_history.is_empty());
+    assert!(adapter.load_session_without_updates(&info).await.is_err());
+}

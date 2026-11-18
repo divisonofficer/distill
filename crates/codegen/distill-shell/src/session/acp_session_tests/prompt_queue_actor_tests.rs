@@ -2239,10 +2239,11 @@ async fn queue_input_send_now_during_goal_turn_merges_as_interjections_fifo() {
 
             let _ = prompt_queue::take_queued_commit_count();
             for id in ["sn-1", "sn-2"] {
-                let (respond_to, _prx) = oneshot::channel();
+                let (respond_to, response) = oneshot::channel();
                 let cancel = actor
                     .queue_input(QueueInputRequest {
                         send_now: true,
+                        strict_queue: true,
                         ..queue_input_request(
                             vec![acp::ContentBlock::Text(acp::TextContent::new(id))],
                             id,
@@ -2251,6 +2252,10 @@ async fn queue_input_send_now_during_goal_turn_merges_as_interjections_fifo() {
                     })
                     .await;
                 assert!(!cancel, "goal turns never cancel-and-send");
+                assert!(
+                    response.await.expect("goal steering reply").is_ok(),
+                    "goal steering must accept prompt RPC without queue membership"
+                );
             }
             assert_eq!(prompt_queue::take_queued_commit_count(), 0);
 
@@ -2372,6 +2377,50 @@ async fn queue_input_queue_mode_wait_does_not_auto_send_now() {
             assert!(
                 !first.send_now,
                 "Queue mode wait prompt is a plain held append"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(follow_up_steer_cache)]
+async fn postudio_prompt_keeps_strict_queue_when_follow_up_steer_is_enabled() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            crate::util::config::set_follow_up_steer_cache(true);
+            let (actor, _rx) = build_actor().await;
+            {
+                let mut state = actor.state.lock().await;
+                state.pending_inputs.push_back(user_item("running", "A"));
+                state.running_task = Some(running_task_stub("running"));
+                state.front_message_committed = true;
+            }
+            *actor
+                .current_prompt_id
+                .lock()
+                .expect("current_prompt_id mutex poisoned") = Some("running".into());
+            actor.tool_context.blocking_wait_depth.set_depth_for_test(1);
+
+            let (respond_to, _response) = oneshot::channel();
+            let mut request = queue_input_request(
+                vec![acp::ContentBlock::Text(acp::TextContent::new("strict"))],
+                "postudio-strict",
+                respond_to,
+            );
+            request.strict_queue = true;
+            let cancel = actor.queue_input(request).await;
+            assert!(
+                !cancel,
+                "Postudio Enter must remain queued during configured steer wait"
+            );
+            let state = actor.state.lock().await;
+            assert!(
+                state
+                    .pending_inputs
+                    .iter()
+                    .any(|item| item.prompt_id == "postudio-strict" && !item.send_now),
+                "Postudio prompt must be visible queued work"
             );
         })
         .await;

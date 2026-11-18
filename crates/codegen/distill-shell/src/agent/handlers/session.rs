@@ -44,9 +44,20 @@ pub(crate) async fn handle(
 /// Clients poll this while the dashboard is open and reconcile against the `x.ai/sessions/changed` broadcast.
 async fn handle_roster_list(
     agent: &MvpAgent,
-    _args: &acp::ExtRequest,
+    args: &acp::ExtRequest,
 ) -> Result<acp::ExtResponse, acp::Error> {
-    let sessions = agent.build_roster().await;
+    #[derive(Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
+    struct Options {
+        #[serde(default)]
+        include_subagents: bool,
+    }
+    let options: Options = serde_json::from_str::<Option<Options>>(args.params.get())
+        .map_err(|e| acp::Error::invalid_params().data(format!("invalid params: {e}")))?
+        .unwrap_or_default();
+    let sessions = agent
+        .build_roster_with_subagents(options.include_subagents)
+        .await;
     ExtMethodResult::success(crate::agent::roster::RosterListResponse { sessions })
         .to_ext_response()
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))

@@ -103,7 +103,7 @@ pub struct TerminalRunRequest {
     pub auto_background_on_timeout: bool,
 
     /// When [`Self::auto_background_on_timeout`] is true, maximum time the command may block the turn before being moved to the background (process
-    /// keeps running). Independent of [`Self::timeout`]. `None` → use the terminal backend default (typically 15s). `Some(Duration::MAX)` → no
+    /// keeps running). Independent of [`Self::timeout`]. `None` → use the terminal backend default (typically 120s). `Some(Duration::MAX)` → no
     /// short budget; auto-bg only when `timeout` elapses. `Some(d)` → auto-bg after `d` if still running.
     pub foreground_block_budget: Option<Duration>,
 
@@ -334,6 +334,16 @@ pub trait TerminalBackend: Send + Sync {
     async fn kill_task_with_source(&self, task_id: &str, source: KillSource) -> KillOutcome {
         let _ = source;
         self.kill_task(task_id).await
+    }
+
+    /// Whether scoped background kills are checked atomically by this backend.
+    fn scoped_kill_supported(&self) -> bool {
+        false
+    }
+
+    /// Kill only a background task owned by the requested session.
+    async fn kill_task_scoped(&self, _session_id: &str, _task_id: &str) -> KillOutcome {
+        KillOutcome::NotFound
     }
 
     /// Kill all running foreground processes.

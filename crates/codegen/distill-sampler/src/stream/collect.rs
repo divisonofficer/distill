@@ -18,6 +18,14 @@ use crate::metrics::InferenceLatencyStats;
 pub async fn collect_response(
     stream: impl Stream<Item = SamplingEvent>,
 ) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingErrorInfo> {
+    collect_response_with_text(stream, |_| {}).await
+}
+
+/// Collect a response while forwarding real assistant text deltas in stream order.
+pub async fn collect_response_with_text(
+    stream: impl Stream<Item = SamplingEvent>,
+    mut on_text: impl FnMut(&str),
+) -> Result<(ConversationResponse, InferenceLatencyStats), SamplingErrorInfo> {
     tokio::pin!(stream);
 
     while let Some(event) = stream.next().await {
@@ -26,7 +34,12 @@ pub async fn collect_response(
                 response, metrics, ..
             } => return Ok((*response, metrics)),
             SamplingEvent::Failed { error, .. } => return Err(error),
-            // Drop intermediate events; this is a buffered collector.
+            SamplingEvent::ChannelToken {
+                channel: crate::events::SamplingChannel::Text,
+                text,
+                ..
+            } => on_text(&text),
+            // Ignore reasoning and other events in this text-only collector.
             _ => {}
         }
     }
@@ -50,16 +63,16 @@ pub async fn collect_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::stream;
     use distill_sampling_types::{ConversationItem, SamplingError, StopReason};
+    use futures_util::stream;
 
     use crate::events::SamplingChannel;
     use crate::stream::stream_chat_completions;
     use crate::types::RequestId;
-    use std::time::Duration;
     use distill_sampling_types::{
         ChatChunkChoice, ChatChunkDelta, ChatCompletionChunk, FinishReason, Role,
     };
+    use std::time::Duration;
 
     fn rid() -> RequestId {
         RequestId::from("collect-test")
@@ -110,10 +123,14 @@ mod tests {
         let raw = stream::iter(chunks).boxed();
         let events = stream_chat_completions(raw, None, rid(), Duration::from_secs(60));
 
-        let (response, _metrics) = collect_response(events)
-            .await
-            .expect("happy path returns Ok");
+        let mut emitted = Vec::new();
+        let (response, _metrics) = collect_response_with_text(events, |text| {
+            emitted.push(text.to_owned());
+        })
+        .await
+        .expect("happy path returns Ok");
         let a = response.assistant().expect("assistant item present");
+        assert_eq!(emitted.concat(), a.content.as_ref());
         assert_eq!(a.content.as_ref(), "hello");
         assert_eq!(response.stop_reason, Some(StopReason::Stop));
     }
@@ -172,5 +189,52 @@ mod tests {
         let (response, _) = collect_response(s).await.expect("ok");
         let a = response.assistant().expect("assistant item present");
         assert_eq!(a.content.as_ref(), "hi");
+    }
+
+    #[tokio::test]
+    async fn text_callback_runs_before_completion_and_ignores_reasoning() {
+        let token = |channel, text: &str| SamplingEvent::ChannelToken {
+            request_id: rid(),
+            channel,
+            text: text.into(),
+            chunk_index: 1,
+        };
+        let completed = SamplingEvent::Completed {
+            request_id: rid(),
+            response: Box::new(ConversationResponse {
+                items: vec![ConversationItem::assistant("visible")],
+                stop_reason: Some(StopReason::Stop),
+                usage: None,
+                cost_usd_ticks: None,
+                message_chunks_emitted: 1,
+                doom_loop_signals: Vec::new(),
+                stop_message: None,
+                message_id: None,
+                raw_stop_reason: None,
+                stop_sequence: None,
+            }),
+            metrics: InferenceLatencyStats::default(),
+        };
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = async_stream::stream! {
+            yield token(SamplingChannel::Reasoning, "hidden");
+            yield token(SamplingChannel::Text, "visible");
+            let _ = release_rx.await;
+            yield completed;
+        };
+        let task = tokio::spawn(async move {
+            collect_response_with_text(events, move |text| {
+                delta_tx.send(text.to_owned()).unwrap();
+            })
+            .await
+        });
+
+        assert_eq!(delta_rx.recv().await.as_deref(), Some("visible"));
+        assert!(delta_rx.try_recv().is_err());
+        assert!(!task.is_finished());
+        release_tx.send(()).unwrap();
+        let (response, _) = task.await.unwrap().unwrap();
+        assert_eq!(response.assistant_text(), "visible");
     }
 }

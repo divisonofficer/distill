@@ -287,6 +287,12 @@ pub enum PersistenceMsg {
         prompt_id: Option<String>,
         live: crate::session::usage_file::UsageSummary,
     },
+    /// The turn outcome record of `prompt_id`, attached to the usage.json row
+    /// its `UsageTurn` wrote (sent after it, so the row exists).
+    TurnOutcome {
+        prompt_id: String,
+        outcome: distill_session_events::TurnOutcomeRecord,
+    },
     /// Child usage the session ledger accepted after its spawning prompt's
     /// turn ended. `late` moves to that prompt's row; `live` is the session
     /// ledger right after the fold and is then persisted like `UsageTurn`.
@@ -303,6 +309,8 @@ pub enum PersistenceMsg {
     },
     /// Persist announcement tracking state (MCP and skill announcement dedup).
     AnnouncementState(crate::session::announcement_state::AnnouncementState),
+    /// Persist what a reload needs to know about the prompt cache ([`CACHE_STATE_FILE`]).
+    CacheResumeState(distill_chat_state::CacheResumeState),
     GoalModeState(crate::session::goal_tracker::GoalOrchestration),
     DeleteGoalModeState {
         respond_to: tokio::sync::oneshot::Sender<io::Result<()>>,
@@ -943,6 +951,32 @@ fn ensure_owner_only_session_dir_in_with(
         sync_dir,
     )?;
     Ok(dir)
+}
+
+/// What the last main request left in the provider cache, so a reload inside its lifetime starts
+/// warm (see `ChatStateHandle::start_from_resumed_history`). Relative to the session directory.
+pub(crate) const CACHE_STATE_FILE: &str = "cache_state.json";
+
+/// Writes [`CACHE_STATE_FILE`] into an existing session directory; a missing one is left alone.
+async fn write_cache_resume_state(
+    dir: &Path,
+    state: &distill_chat_state::CacheResumeState,
+) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let json = serde_json::to_vec(state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::session::storage::write_bytes_atomic_async(&dir.join(CACHE_STATE_FILE), json).await
+}
+
+/// The record [`CACHE_STATE_FILE`] holds; `None` when it is missing or unreadable, which keeps
+/// the reload cold as before.
+pub(crate) fn load_cache_resume_state(dir: &Path) -> Option<distill_chat_state::CacheResumeState> {
+    let bytes = std::fs::read(dir.join(CACHE_STATE_FILE)).ok()?;
+    serde_json::from_slice(&bytes)
+        .inspect_err(|error| tracing::warn!(%error, "unreadable cache state; resuming cold"))
+        .ok()
 }
 
 /// `session_dir` with an injectable grok home (pure path computation).
@@ -2408,6 +2442,11 @@ impl SessionPersistence {
                         }
                     }
                 }
+                PersistenceMsg::TurnOutcome { prompt_id, outcome } => {
+                    if let Err(e) = self.persist_turn_outcome(&prompt_id, outcome).await {
+                        tracing::warn!(?e, "failed to write the turn outcome");
+                    }
+                }
                 PersistenceMsg::LateSubagentUsage {
                     prompt_id,
                     turn_number,
@@ -2434,6 +2473,12 @@ impl SessionPersistence {
                         .await
                     {
                         tracing::warn!(?e, "failed to write announcement state");
+                    }
+                }
+                PersistenceMsg::CacheResumeState(state) => {
+                    if let Err(e) = write_cache_resume_state(&session_dir(&self.info), &state).await
+                    {
+                        tracing::warn!(?e, "failed to write cache state");
                     }
                 }
                 PersistenceMsg::Feedback(entry) => {
@@ -2620,6 +2665,24 @@ impl SessionPersistence {
         self.last_usage_live = Some(live.clone());
         self.last_incoming_turn = incoming;
         self.last_usage_turn = written;
+        Ok(())
+    }
+
+    /// Attach `outcome` to the row written for `prompt_id`; nothing when no row was written.
+    async fn persist_turn_outcome(
+        &mut self,
+        prompt_id: &str,
+        outcome: distill_session_events::TurnOutcomeRecord,
+    ) -> io::Result<()> {
+        let Some(turn) = self.usage_turn_by_prompt.get(prompt_id).copied() else {
+            return Ok(());
+        };
+        let Some(mut file) = self.storage.read_usage(&self.info).await? else {
+            return Ok(());
+        };
+        if file.set_turn_outcome(turn, outcome) {
+            self.storage.write_usage(&self.info, &file).await?;
+        }
         Ok(())
     }
 
@@ -3034,6 +3097,17 @@ pub(crate) async fn new_with_explicit_dir(
     title: String,
     open: ExplicitSessionOpen,
 ) -> io::Result<PersistenceHandle> {
+    new_with_explicit_dir_with_parent(info, target_dir, model_id, title, open, None).await
+}
+
+pub(crate) async fn new_with_explicit_dir_with_parent(
+    info: &Info,
+    target_dir: PathBuf,
+    model_id: acp::ModelId,
+    title: String,
+    open: ExplicitSessionOpen,
+    parent_session_id: Option<&str>,
+) -> io::Result<PersistenceHandle> {
     let storage = JsonlStorageAdapter::with_explicit_session_dir(target_dir);
 
     let is_wake = matches!(open, ExplicitSessionOpen::Wake);
@@ -3050,6 +3124,16 @@ pub(crate) async fn new_with_explicit_dir(
         storage.init_session(info, model_id.clone()).await?
     };
     touch_worktree_for_session(info).await;
+    let parent_stamped = if summary.parent_session_id.is_none() {
+        if let Some(parent_session_id) = parent_session_id {
+            summary.parent_session_id = Some(parent_session_id.to_owned());
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     if !is_wake {
         if summary
             .session_kind
@@ -3059,6 +3143,8 @@ pub(crate) async fn new_with_explicit_dir(
             summary.session_kind = Some("subagent".to_string());
             summary.source_workspace_dir = None;
         }
+    }
+    if !is_wake || parent_stamped {
         storage.write_summary_sync(info, &summary)?;
     }
 
@@ -3162,6 +3248,18 @@ async fn pull_on_miss(
     try_pull_from_remote(info, client).await.ok_or(err)
 }
 
+async fn load_light_data(
+    storage: &JsonlStorageAdapter,
+    info: &Info,
+    metadata_only: bool,
+) -> io::Result<crate::session::storage::PersistedDataLight> {
+    if metadata_only {
+        storage.load_session_without_chat_history(info)
+    } else {
+        storage.load_session_without_updates(info).await
+    }
+}
+
 /// Load a session without reading updates into memory.
 /// Instead, provides the path to the updates file for streaming reads.
 /// `starts_attempt` is false unless the caller already won cold actor creation.
@@ -3169,6 +3267,7 @@ pub(crate) async fn load_light(
     info: &Info,
     backend: Option<&crate::remote::BackendClient>,
     starts_attempt: bool,
+    metadata_only: bool,
     deps: SessionDeps,
 ) -> io::Result<(PersistedInfo, PersistenceHandle)> {
     let SessionDeps {
@@ -3186,12 +3285,12 @@ pub(crate) async fn load_light(
     let root_dir = distill_home();
     let storage = JsonlStorageAdapter::with_root(root_dir.clone());
 
-    let (mut persisted, loaded_info) = match storage.load_session_without_updates(info).await {
+    let (mut persisted, loaded_info) = match load_light_data(&storage, info, metadata_only).await {
         Ok(p) => (p, info.clone()),
         Err(e) => match backend {
             Some(client) => {
                 let pulled = pull_on_miss(info, client, e).await?;
-                let p = storage.load_session_without_updates(&pulled).await?;
+                let p = load_light_data(&storage, &pulled, metadata_only).await?;
                 (p, pulled)
             }
             None => return Err(e),
@@ -3445,6 +3544,11 @@ mod worktree_stamp_tests;
 
 /// List the `limit` most recently modified session summaries across all workspaces.
 /// Uses stat-based mtime sorting to avoid reading every summary file on disk; final order uses `last_active_at` else `updated_at`.
+pub(crate) async fn list_recent_summaries_with_subagents(limit: usize) -> io::Result<Vec<Summary>> {
+    JsonlStorageAdapter::with_root(crate::util::distill_home::distill_home())
+        .list_sessions_recent_with_subagents(limit).await
+}
+
 pub async fn list_recent_summaries(limit: usize) -> io::Result<Vec<Summary>> {
     let root_dir = crate::util::distill_home::distill_home();
     let storage = JsonlStorageAdapter::with_root(root_dir);

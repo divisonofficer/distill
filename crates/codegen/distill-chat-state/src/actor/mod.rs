@@ -302,8 +302,11 @@ impl ChatStateActor {
                 }
                 self.state.sampling_config = *config;
             }
-            ChatStateCommand::StartFromInheritedHistory { parent_trims } => {
-                self.start_from_inherited_history(parent_trims);
+            ChatStateCommand::StartFromInheritedHistory {
+                parent_trims,
+                resumed,
+            } => {
+                self.start_from_inherited_history(parent_trims, resumed);
             }
             ChatStateCommand::RecordCacheLifetime { lifetime } => {
                 self.record_cache_lifetime(lifetime);
@@ -407,6 +410,12 @@ impl ChatStateActor {
             ChatStateCommand::PopStrandedContinueReminder => {
                 self.pop_stranded_continue_reminder();
             }
+            ChatStateCommand::DropUnansweredQuestion {
+                question,
+                bare_reply,
+            } => {
+                self.drop_unanswered_question(&question, &bare_reply);
+            }
 
             // Queries are pure reads — repair only at write boundaries
             // (`ChatState::new`, `push_user_message`).
@@ -455,6 +464,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetRequestTrims { reply } => {
                 let _ = reply.send(self.eviction.request_trims.clone());
+            }
+            ChatStateCommand::GetCacheResumeState { reply } => {
+                let _ = reply.send(self.cache_resume_state());
             }
             ChatStateCommand::GetLastTurnUsage { reply } => {
                 let _ = reply.send(self.state.last_turn_usage.clone());

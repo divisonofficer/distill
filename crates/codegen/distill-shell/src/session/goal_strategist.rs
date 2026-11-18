@@ -162,6 +162,7 @@ impl ChannelSpawner {
     ) -> Result<String, SpawnError> {
         let request = SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: id.to_string(),
             prompt,
             description: GOAL_STRATEGIST_SUBAGENT_DESCRIPTION.to_string(),
@@ -264,11 +265,12 @@ pub(crate) async fn run_goal_strategist(
     let plan_file_str = inputs.plan_file.to_string_lossy();
     let traces_dir_str = inputs.session_traces_dir.to_string_lossy();
     let scratch_root_str = inputs.scratch_root.to_string_lossy();
-    let with_paths = distill_agent::prompt::template::strip_source_notice(GOAL_STRATEGIST_PROMPT_TEMPLATE)
-        .replace("{STRATEGY_FILE}", &strategy_file_str)
-        .replace("{PLAN_FILE}", &plan_file_str)
-        .replace("{SESSION_TRACES_DIR}", &traces_dir_str)
-        .replace("{SCRATCH_ROOT}", &scratch_root_str);
+    let with_paths =
+        distill_agent::prompt::template::strip_source_notice(GOAL_STRATEGIST_PROMPT_TEMPLATE)
+            .replace("{STRATEGY_FILE}", &strategy_file_str)
+            .replace("{PLAN_FILE}", &plan_file_str)
+            .replace("{SESSION_TRACES_DIR}", &traces_dir_str)
+            .replace("{SCRATCH_ROOT}", &scratch_root_str);
     // Render once per toolset: `primary` for the resolved toolset, `fallback` for the default/parent toolset the explicit-pair retry falls back to
     let render = |tool_names: &RoleToolNames| -> String {
         let rendered = tool_names.apply(&with_paths);

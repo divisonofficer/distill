@@ -13,6 +13,7 @@ fn human_unsupported_operation_rejects_without_command() {
         artifact_upload_ctx: None,
         client_identifier: None,
         screen_mode: None,
+        strict_queue: false,
         verbatim: false,
         traceparent: None,
         json_schema: None,

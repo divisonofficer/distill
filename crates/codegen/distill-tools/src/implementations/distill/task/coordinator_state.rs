@@ -584,6 +584,7 @@ pub(super) struct RunningSeed {
     pub(super) parent_session_id: String,
     pub(super) child_session_id: String,
     pub(super) fork_parent_prompt_id: Option<String>,
+    pub(super) tool_call_id: Option<String>,
     pub(super) resumed_from: Option<String>,
 }
 
@@ -843,6 +844,7 @@ pub(super) fn running_seed<C>(child: &ActiveChild<C>) -> RunningSeed {
         parent_session_id: child.request.parent_session_id.clone(),
         child_session_id: child.child_session_id.clone(),
         fork_parent_prompt_id: child.request.parent_prompt_id.clone(),
+        tool_call_id: child.request.tool_call_id.clone(),
         resumed_from: child.resumed_from.clone(),
     }
 }
@@ -873,6 +875,7 @@ pub(super) fn running_inspection(
         parent_session_id: seed.parent_session_id,
         child_session_id: seed.child_session_id,
         fork_parent_prompt_id: seed.fork_parent_prompt_id,
+        tool_call_id: seed.tool_call_id,
         resumed_from: seed.resumed_from,
     }
 }
@@ -895,6 +898,7 @@ pub(super) fn pending_inspection(child: &PendingChild) -> SubagentInspection {
         parent_session_id: child.request.parent_session_id.clone(),
         child_session_id: String::new(),
         fork_parent_prompt_id: child.request.parent_prompt_id.clone(),
+        tool_call_id: child.request.tool_call_id.clone(),
         resumed_from: child.request.resume_from.clone(),
     }
 }
@@ -927,6 +931,7 @@ pub(super) fn queued_inspection(
         parent_session_id: request.parent_session_id.clone(),
         child_session_id: String::new(),
         fork_parent_prompt_id: request.parent_prompt_id.clone(),
+        tool_call_id: request.tool_call_id.clone(),
         resumed_from: request.resume_from.clone(),
     }
 }
@@ -994,6 +999,7 @@ pub(super) fn completed_inspection(
         parent_session_id: child.request.parent_session_id.clone(),
         child_session_id: child.child_session_id.clone(),
         fork_parent_prompt_id: child.request.parent_prompt_id.clone(),
+        tool_call_id: child.request.tool_call_id.clone(),
         resumed_from: child.resumed_from.clone(),
     }
 }

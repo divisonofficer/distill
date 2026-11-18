@@ -250,6 +250,11 @@ pub async fn run_tui_login_at(path: &Path, url_feedback: oneshot::Sender<String>
     let (fallback, _rx) = oneshot::channel();
     run_login_at(path, fallback, Some(url_feedback)).await
 }
+
+fn should_auto_open_browser(url_feedback_present: bool) -> bool {
+    !url_feedback_present
+}
+
 async fn run_login_at(
     path: &Path,
     browser_fallback: oneshot::Sender<String>,
@@ -273,15 +278,18 @@ async fn run_login_at(
     let app = Router::new()
         .route(&callback_path, get(callback))
         .with_state(Arc::new(Mutex::new(Some(sender))));
+    let open_browser = should_auto_open_browser(url_feedback.is_some());
     if let Some(tx) = url_feedback {
         let _ = tx.send(url.clone());
     }
-    let open_url = url.clone();
-    if !matches!(
-        tokio::task::spawn_blocking(move || webbrowser::open(&open_url)).await,
-        Ok(Ok(()))
-    ) {
-        let _ = browser_fallback.send(url);
+    if open_browser {
+        let open_url = url.clone();
+        if !matches!(
+            tokio::task::spawn_blocking(move || webbrowser::open(&open_url)).await,
+            Ok(Ok(()))
+        ) {
+            let _ = browser_fallback.send(url);
+        }
     }
     let code = tokio::select! {
         result = tokio::time::timeout(Duration::from_secs(300), receiver) => {
@@ -354,6 +362,12 @@ pub fn apply_openrouter_backend_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_feedback_disables_automatic_browser_launch() {
+        assert!(!should_auto_open_browser(true));
+        assert!(should_auto_open_browser(false));
+    }
 
     #[test]
     fn usage_schema_preserves_key_label_and_nullable_limit() {

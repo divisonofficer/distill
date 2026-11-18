@@ -1344,6 +1344,7 @@ fn inspection(id: &str, status: SubagentSnapshotStatus) -> SubagentInspection {
         },
         parent_session_id: "parent-x".to_string(),
         child_session_id: format!("child-{id}"),
+        tool_call_id: None,
         fork_parent_prompt_id: None,
         resumed_from: None,
     }

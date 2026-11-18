@@ -521,6 +521,10 @@ pub async fn run_tui_login_at(
     Ok(())
 }
 
+fn should_auto_open_browser(url_feedback_present: bool) -> bool {
+    !url_feedback_present
+}
+
 async fn run_browser_login_at(
     path: &Path,
     endpoints: &ClaudeEndpoints,
@@ -550,15 +554,18 @@ async fn run_browser_login_at(
         eprintln!("Open this URL if your browser does not open automatically:");
         eprintln!("  {auth_url}");
     }
+    let open_browser = should_auto_open_browser(url_feedback.is_some());
     if let Some(tx) = url_feedback {
         let _ = tx.send(auth_url.clone());
     }
-    let open_url = auth_url.clone();
-    let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url)).await;
-    if let Ok(Err(error)) = &browser_result {
-        tracing::warn!(%error, "Claude OAuth browser launch failed; waiting for manual sign-in");
-        if let Some(browser_fallback) = browser_fallback {
-            let _ = browser_fallback.send(auth_url.clone());
+    if open_browser {
+        let open_url = auth_url.clone();
+        let browser_result = tokio::task::spawn_blocking(move || webbrowser::open(&open_url)).await;
+        if let Ok(Err(error)) = &browser_result {
+            tracing::warn!(%error, "Claude OAuth browser launch failed; waiting for manual sign-in");
+            if let Some(browser_fallback) = browser_fallback {
+                let _ = browser_fallback.send(auth_url.clone());
+            }
         }
     }
 
@@ -920,6 +927,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn url_feedback_disables_automatic_browser_launch() {
+        assert!(!should_auto_open_browser(true));
+        assert!(should_auto_open_browser(false));
+    }
+
     fn store(expires_in_secs: i64) -> ClaudeAuthStore {
         ClaudeAuthStore {
             access_token: "access".to_owned(),
@@ -1126,7 +1139,10 @@ mod tests {
             email: None,
         };
         let mut headers = IndexMap::new();
-        headers.insert("X-Distill-Claude-Account-Anchor".to_owned(), "forged".to_owned());
+        headers.insert(
+            "X-Distill-Claude-Account-Anchor".to_owned(),
+            "forged".to_owned(),
+        );
         set_identity_anchor(&mut headers, Some(&credentials));
         assert_eq!(
             ClaudeBearerResolver::from_headers(&headers).expected_identity,

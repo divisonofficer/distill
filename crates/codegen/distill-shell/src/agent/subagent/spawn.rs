@@ -754,6 +754,7 @@ fn send_wake_prompt(
             traceparent: None,
             json_schema: None,
             send_now: false,
+            strict_queue: false,
             admission: None,
             tool_overrides_update: None,
             respond_to,

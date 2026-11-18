@@ -74,6 +74,28 @@ pub fn effective_conversation_output_tokens(
         })
 }
 
+/// The serving path a request to `base_url` may carry: none on OpenRouter, where the model
+/// variant carries it, and no economy tier on the ChatGPT Codex backend, which refuses `flex`
+/// with a client error.
+pub(crate) fn effective_provider_tier(
+    tier: Option<crate::config::ProviderTier>,
+    base_url: &str,
+) -> Option<crate::config::ProviderTier> {
+    tier.filter(|tier| {
+        !is_openrouter_base_url(base_url)
+            && !(matches!(tier, crate::config::ProviderTier::Economy)
+                && is_codex_base_url(base_url))
+    })
+}
+
+/// Whether an `anthropic-beta` header value carries the flag that accepts a
+/// Claude subscription (OAuth) bearer.
+pub(crate) fn names_claude_oauth_beta(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|flag| flag.trim() == CLAUDE_OAUTH_BETA)
+}
+
 fn is_codex_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
@@ -209,7 +231,10 @@ fn prepend_claude_code_identity(system: &mut Option<messages::SystemParam>) {
             },
         ]),
         Some(SystemParam::Blocks(mut blocks)) => {
-            if blocks.first().is_none_or(|first| first.text != CLAUDE_CODE_IDENTITY) {
+            if blocks
+                .first()
+                .is_none_or(|first| first.text != CLAUDE_CODE_IDENTITY)
+            {
                 blocks.insert(0, identity);
             }
             SystemParam::Blocks(blocks)
@@ -348,7 +373,10 @@ fn latch_messages_refusals(first: MessagesCacheOptions, accepted: MessagesCacheO
         ),
     ] {
         if was_on && !is_on && !refused.swap(true, Ordering::Relaxed) {
-            tracing::warn!(option, "messages API refused an option and took the request without it; it stays off for this process");
+            tracing::warn!(
+                option,
+                "messages API refused an option and took the request without it; it stays off for this process"
+            );
         }
     }
 }
@@ -453,7 +481,7 @@ fn apply_openrouter_variant(model: &mut String, base_url: &str, variant: Option<
     model.push_str(variant);
 }
 
-fn is_openrouter_base_url(base_url: &str) -> bool {
+pub(crate) fn is_openrouter_base_url(base_url: &str) -> bool {
     reqwest::Url::parse(base_url).is_ok_and(|url| {
         url.scheme() == "https"
             && url
@@ -854,6 +882,8 @@ struct ClientDefaults {
     doom_loop_recovery: Option<distill_sampling_types::DoomLoopRecoveryPolicy>,
     /// OpenRouter routing suffix (`floor`, `nitro`, `exacto`) appended to the wire model slug.
     openrouter_variant: Option<String>,
+    /// See [`SamplerConfig::provider_tier`].
+    provider_tier: Option<crate::config::ProviderTier>,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request only appends its path.
@@ -1180,6 +1210,7 @@ impl SamplingClient {
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
             openrouter_variant: config.openrouter_variant,
+            provider_tier: config.provider_tier,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -1204,8 +1235,14 @@ impl SamplingClient {
         if self.codex_turn_affinity.is_none() || !is_codex_base_url(&self.base_url) {
             return None;
         }
-        let session = request.x_grok_session_id.as_deref().filter(|id| !id.is_empty())?;
-        let turn = request.x_grok_turn_idx.as_deref().filter(|idx| !idx.is_empty())?;
+        let session = request
+            .x_grok_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())?;
+        let turn = request
+            .x_grok_turn_idx
+            .as_deref()
+            .filter(|idx| !idx.is_empty())?;
         Some(CodexTurnKey {
             session: session.to_owned(),
             turn: turn.to_owned(),
@@ -1461,8 +1498,7 @@ impl SamplingClient {
     }
 
     fn should_set_openrouter_session_header(&self) -> bool {
-        is_openrouter_base_url(&self.base_url)
-            && !self.default_headers.contains_key("x-session-id")
+        is_openrouter_base_url(&self.base_url) && !self.default_headers.contains_key("x-session-id")
     }
 
     fn apply_defaults(&self, mut request: ChatCompletionRequest) -> Result<ChatCompletionRequest> {
@@ -1896,6 +1932,13 @@ impl SamplingClient {
         // The API defaults `store` to true, which breaks ZDR compliance
         if request.inner.store.is_none() {
             request.inner.store = Some(false);
+        }
+
+        if request.inner.service_tier.is_none() {
+            request.inner.service_tier = self.provider_tier().map(|tier| match tier {
+                crate::config::ProviderTier::Fast => rs::ServiceTier::Priority,
+                crate::config::ProviderTier::Economy => rs::ServiceTier::Flex,
+            });
         }
 
         if let Some(summary) = self.defaults.reasoning_summary {
@@ -2339,7 +2382,22 @@ impl SamplingClient {
             prepend_claude_code_identity(&mut request.inner.system);
         }
 
+        // A Claude subscription refuses fast mode without usage credits, and it
+        // answers with a rate-limit error that no retry clears, so a
+        // subscription request never asks for it.
+        if request.inner.speed.is_none()
+            && self.provider_tier() == Some(crate::config::ProviderTier::Fast)
+            && !self.uses_claude_subscription_bearer()
+        {
+            request.inner.speed = Some("fast".to_owned());
+        }
+
         Ok(())
+    }
+
+    /// The serving path this client's requests carry; see [`effective_provider_tier`].
+    fn provider_tier(&self) -> Option<crate::config::ProviderTier> {
+        effective_provider_tier(self.defaults.provider_tier, &self.base_url)
     }
 
     /// True when the request carries the Anthropic beta flag that accepts a
@@ -2349,11 +2407,7 @@ impl SamplingClient {
         self.default_headers
             .get("anthropic-beta")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(',')
-                    .any(|flag| flag.trim() == CLAUDE_OAUTH_BETA)
-            })
+            .is_some_and(names_claude_oauth_beta)
     }
 
     /// Create a message using the Anthropic Messages API (non-streaming).
@@ -2985,8 +3039,22 @@ impl SamplingClient {
         &self,
         request: ConversationRequest,
     ) -> Result<ConversationResponse> {
-        self.conversation_collect_with_idle_timeout(request, std::time::Duration::from_secs(300))
-            .await
+        self.conversation_collect_with_text(request, |_| {}).await
+    }
+
+    /// Collect a response and forward actual text deltas from any supported backend.
+    pub async fn conversation_collect_with_text(
+        &self,
+        request: ConversationRequest,
+        on_text: impl FnMut(&str) + Send,
+    ) -> Result<ConversationResponse> {
+        self.conversation_collect_with_text_and_idle_timeout(
+            request,
+            std::time::Duration::from_secs(300),
+            on_text,
+        )
+        .await
+        .0
     }
 
     /// [`Self::conversation_collect`] with a caller-chosen idle timeout, for short side calls (autocomplete, memory notes) that must give up fast.
@@ -2995,9 +3063,23 @@ impl SamplingClient {
         request: ConversationRequest,
         idle_timeout: std::time::Duration,
     ) -> Result<ConversationResponse> {
-        self.conversation_collect_with_idle_timeout_and_rejection(request, idle_timeout)
+        self.conversation_collect_with_text_and_idle_timeout(request, idle_timeout, |_| {})
             .await
             .0
+    }
+
+    async fn conversation_collect_with_text_and_idle_timeout(
+        &self,
+        request: ConversationRequest,
+        idle_timeout: std::time::Duration,
+        on_text: impl FnMut(&str) + Send,
+    ) -> (Result<ConversationResponse>, Option<ConversationResponse>) {
+        self.conversation_collect_with_text_and_idle_timeout_and_rejection(
+            request,
+            idle_timeout,
+            on_text,
+        )
+        .await
     }
 
     /// Collect a response and retain it when the existing length gate rejects
@@ -3009,6 +3091,20 @@ impl SamplingClient {
         request: ConversationRequest,
         idle_timeout: std::time::Duration,
     ) -> (Result<ConversationResponse>, Option<ConversationResponse>) {
+        self.conversation_collect_with_text_and_idle_timeout_and_rejection(
+            request,
+            idle_timeout,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn conversation_collect_with_text_and_idle_timeout_and_rejection(
+        &self,
+        request: ConversationRequest,
+        idle_timeout: std::time::Duration,
+        mut on_text: impl FnMut(&str) + Send,
+    ) -> (Result<ConversationResponse>, Option<ConversationResponse>) {
         let request_id = crate::types::RequestId::random();
         let length_policy = request.length_policy;
         let result = match self.api_backend() {
@@ -3019,7 +3115,7 @@ impl SamplingClient {
                 };
                 let events =
                     crate::stream::stream_chat_completions(raw, meta, request_id, idle_timeout);
-                crate::stream::collect_response(events).await
+                crate::stream::collect_response_with_text(events, &mut on_text).await
             }
             ApiBackend::Responses => {
                 let (raw, meta, doom_loop) = match self.conversation_stream_responses(request).await
@@ -3029,7 +3125,7 @@ impl SamplingClient {
                 };
                 let events =
                     crate::stream::stream_responses(raw, meta, request_id, idle_timeout, doom_loop);
-                crate::stream::collect_response(events).await
+                crate::stream::collect_response_with_text(events, &mut on_text).await
             }
             ApiBackend::Messages => {
                 let (raw, meta) = match self.conversation_stream_messages(request).await {
@@ -3037,7 +3133,7 @@ impl SamplingClient {
                     Err(error) => return (Err(error), None),
                 };
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
-                crate::stream::collect_response(events).await
+                crate::stream::collect_response_with_text(events, &mut on_text).await
             }
         };
         let response = match result {
@@ -3138,13 +3234,19 @@ mod tests {
         let openrouter = request_for("https://openrouter.ai/api/v1", "session-1");
         assert_eq!(openrouter.headers()["x-session-id"], "session-1");
         assert_eq!(openrouter.headers()["x-grok-session-id"], "session-1");
-        assert!(!request_for("https://api.x.ai/v1", "session-1")
-            .headers()
-            .contains_key("x-session-id"));
-        assert!(!request_for("https://openrouter.ai/api/v1", "")
-            .headers()
-            .contains_key("x-session-id"));
-        assert!(!is_openrouter_base_url("https://openrouter.ai.evil.test/api/v1"));
+        assert!(
+            !request_for("https://api.x.ai/v1", "session-1")
+                .headers()
+                .contains_key("x-session-id")
+        );
+        assert!(
+            !request_for("https://openrouter.ai/api/v1", "")
+                .headers()
+                .contains_key("x-session-id")
+        );
+        assert!(!is_openrouter_base_url(
+            "https://openrouter.ai.evil.test/api/v1"
+        ));
         // A verbatim fork routes with its parent's key, not its own session id: the header must
         // match the body's routing key or the two would pin different providers.
         let fork = request_with_key(
@@ -3321,15 +3423,9 @@ mod tests {
             response,
         );
 
-        assert!(matches!(
-            result,
-            Err(SamplingError::MaxTokensTruncation)
-        ));
+        assert!(matches!(result, Err(SamplingError::MaxTokensTruncation)));
         let rejected = rejected.expect("the rejected response remains available to billing");
-        assert_eq!(
-            rejected.usage.map(|usage| usage.total_tokens),
-            Some(18)
-        );
+        assert_eq!(rejected.usage.map(|usage| usage.total_tokens), Some(18));
         assert_eq!(rejected.cost_usd_ticks, Some(1234));
         assert_eq!(rejected.message_id.as_deref(), Some("msg-paid"));
     }
@@ -3342,6 +3438,36 @@ mod tests {
             context_window: 8192,
             ..Default::default()
         }
+    }
+
+    /// A Claude subscription answers a fast-mode request with a rate-limit error unless the
+    /// account has usage credits, and no retry clears it: the whole turn fails. A request that
+    /// carries the subscription's beta flag therefore never asks for fast mode, and
+    /// `sends_provider_tier` agrees, so nothing treats the field as sent.
+    #[test]
+    fn a_claude_subscription_request_never_asks_for_fast_mode() {
+        use crate::config::ProviderTier;
+        let config = |beta: &str| SamplerConfig {
+            provider_tier: Some(ProviderTier::Fast),
+            api_backend: ApiBackend::Messages,
+            extra_headers: [("anthropic-beta".to_owned(), beta.to_owned())]
+                .into_iter()
+                .collect(),
+            ..minimal_config()
+        };
+        let speed = |config: SamplerConfig| {
+            let client = SamplingClient::new(config).expect("client constructs without I/O");
+            let mut messages = MessagesRequestWrapper::new(messages::MessagesRequest::default());
+            client
+                .apply_message_defaults(&mut messages)
+                .expect("defaults apply");
+            serde_json::to_value(&messages.inner).unwrap().get("speed").cloned()
+        };
+        let subscription = format!("some-flag, {CLAUDE_OAUTH_BETA}");
+        assert_eq!(speed(config(&subscription)), None);
+        assert!(!config(&subscription).sends_provider_tier());
+        assert_eq!(speed(config("some-flag")), Some("fast".into()));
+        assert!(config("some-flag").sends_provider_tier());
     }
 
     /// The routing variant must reach only OpenRouter slugs that carry none, so a user-pinned `:free` is never rewritten.
@@ -3377,6 +3503,92 @@ mod tests {
             .apply_defaults(ChatCompletionRequest::new("a/b", vec![]))
             .expect("defaults apply");
         assert_eq!(payload.model.as_deref(), Some("a/b:floor"));
+    }
+
+    /// A provider may reject an unknown serving-path field, so a body carries one only when the
+    /// session configured a tier, and never on OpenRouter, whose path is the model variant.
+    #[test]
+    fn provider_tier_fields_reach_the_body_only_when_configured() {
+        use crate::config::ProviderTier;
+        let bodies = |base_url: &str, tier: Option<ProviderTier>| {
+            let client = SamplingClient::new(SamplerConfig {
+                base_url: base_url.to_owned(),
+                provider_tier: tier,
+                ..minimal_config()
+            })
+            .expect("client constructs without I/O");
+            let mut responses = CreateResponseWrapper::new(rs::CreateResponse::default());
+            client
+                .apply_response_defaults(&mut responses)
+                .expect("defaults apply");
+            let mut messages = MessagesRequestWrapper::new(messages::MessagesRequest::default());
+            client
+                .apply_message_defaults(&mut messages)
+                .expect("defaults apply");
+            (
+                serde_json::to_value(&responses.inner).unwrap(),
+                serde_json::to_value(&messages.inner).unwrap(),
+            )
+        };
+        let direct = "https://example.test";
+
+        let (responses, messages) = bodies(direct, None);
+        assert!(responses.get("service_tier").is_none(), "{responses}");
+        assert!(messages.get("speed").is_none(), "{messages}");
+
+        let (responses, messages) = bodies(direct, Some(ProviderTier::Fast));
+        assert_eq!(responses["service_tier"], "priority");
+        assert_eq!(messages["speed"], "fast");
+
+        let (responses, messages) = bodies(direct, Some(ProviderTier::Economy));
+        assert_eq!(responses["service_tier"], "flex");
+        assert!(
+            messages.get("speed").is_none(),
+            "the Messages API has no economy speed: {messages}"
+        );
+
+        let (responses, messages) =
+            bodies("https://openrouter.ai/api/v1", Some(ProviderTier::Fast));
+        assert!(responses.get("service_tier").is_none(), "{responses}");
+        assert!(messages.get("speed").is_none(), "{messages}");
+
+        // The ChatGPT Codex backend takes the fast path and refuses the economy one, so the
+        // economy tier is never sent there: a pinned UltraSave session on a subscription model
+        // must not open with a refused request.
+        let codex = "https://chatgpt.com/backend-api/codex";
+        let (responses, _) = bodies(codex, Some(ProviderTier::Fast));
+        assert_eq!(responses["service_tier"], "priority");
+        let (responses, _) = bodies(codex, Some(ProviderTier::Economy));
+        assert!(responses.get("service_tier").is_none(), "{responses}");
+
+        // `sends_provider_tier` names exactly the bodies above that carry a field, so a caller
+        // that drops a refused tier never drops one the endpoint did not see.
+        for base_url in [direct, "https://openrouter.ai/api/v1", codex] {
+            for tier in [None, Some(ProviderTier::Fast), Some(ProviderTier::Economy)] {
+                let (responses, messages) = bodies(base_url, tier);
+                for (backend, carried) in [
+                    (
+                        ApiBackend::Responses,
+                        responses.get("service_tier").is_some(),
+                    ),
+                    (ApiBackend::Messages, messages.get("speed").is_some()),
+                    (ApiBackend::ChatCompletions, false),
+                ] {
+                    let config = SamplerConfig {
+                        base_url: base_url.to_owned(),
+                        provider_tier: tier,
+                        api_backend: backend,
+                        ..minimal_config()
+                    };
+                    assert_eq!(
+                        config.sends_provider_tier(),
+                        carried,
+                        "{base_url} {tier:?} {:?}",
+                        config.api_backend
+                    );
+                }
+            }
+        }
     }
 
     /// The shipped path from a model's configured shape to the wire body: the
@@ -3608,8 +3820,7 @@ mod tests {
                 ..minimal_config()
             })
             .unwrap();
-            client.endpoint =
-                EndpointTemplate::new(&format!("http://{addr}/v1"), &IndexMap::new());
+            client.endpoint = EndpointTemplate::new(&format!("http://{addr}/v1"), &IndexMap::new());
             client
         };
         let affinity = CodexTurnAffinity::default();
@@ -3926,11 +4137,17 @@ mod tests {
         };
         let mut blocks = Some(messages::SystemParam::Blocks(vec![block("agent prompt")]));
         prepend_claude_code_identity(&mut blocks);
-        assert_eq!(system_texts(&blocks), [CLAUDE_CODE_IDENTITY, "agent prompt"]);
+        assert_eq!(
+            system_texts(&blocks),
+            [CLAUDE_CODE_IDENTITY, "agent prompt"]
+        );
 
         // Applying it twice (a retry rebuilds defaults) must not stack the line.
         prepend_claude_code_identity(&mut blocks);
-        assert_eq!(system_texts(&blocks), [CLAUDE_CODE_IDENTITY, "agent prompt"]);
+        assert_eq!(
+            system_texts(&blocks),
+            [CLAUDE_CODE_IDENTITY, "agent prompt"]
+        );
     }
 
     #[test]
@@ -3955,9 +4172,11 @@ mod tests {
         })
         .unwrap();
         assert!(!api_key.uses_claude_subscription_bearer());
-        assert!(!SamplingClient::new(minimal_config())
-            .unwrap()
-            .uses_claude_subscription_bearer());
+        assert!(
+            !SamplingClient::new(minimal_config())
+                .unwrap()
+                .uses_claude_subscription_bearer()
+        );
     }
 
     #[test]
@@ -4047,7 +4266,10 @@ mod tests {
         assert!(with.contains(MID_CONVERSATION_OUTPUT_CONFIG_BETA), "{with}");
         let without = sent_beta(false).await;
         assert!(without.contains("oauth-2025-04-20"), "{without}");
-        assert!(!without.contains(MID_CONVERSATION_OUTPUT_CONFIG_BETA), "{without}");
+        assert!(
+            !without.contains(MID_CONVERSATION_OUTPUT_CONFIG_BETA),
+            "{without}"
+        );
     }
 
     async fn capture_response_body(streaming: bool) -> serde_json::Value {
@@ -5613,12 +5835,22 @@ mod cache_ttl_tests {
             minutes(30)
         );
         assert_eq!(
-            cache_lifetime_for("https://api.x.ai/v1", &ApiBackend::Responses, "grok-4.5", false),
+            cache_lifetime_for(
+                "https://api.x.ai/v1",
+                &ApiBackend::Responses,
+                "grok-4.5",
+                false
+            ),
             minutes(10)
         );
         let openrouter = "https://openrouter.ai/api/v1";
         assert_eq!(
-            cache_lifetime_for(openrouter, &ApiBackend::ChatCompletions, "moonshotai/kimi-k3", false),
+            cache_lifetime_for(
+                openrouter,
+                &ApiBackend::ChatCompletions,
+                "moonshotai/kimi-k3",
+                false
+            ),
             minutes(10)
         );
         assert_eq!(
@@ -5631,7 +5863,12 @@ mod cache_ttl_tests {
             minutes(5)
         );
         assert_eq!(
-            cache_lifetime_for("https://llm.internal/v1", &ApiBackend::ChatCompletions, "m", false),
+            cache_lifetime_for(
+                "https://llm.internal/v1",
+                &ApiBackend::ChatCompletions,
+                "m",
+                false
+            ),
             None
         );
     }

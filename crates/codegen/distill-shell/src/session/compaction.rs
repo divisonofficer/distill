@@ -21,8 +21,7 @@ use crate::session::helpers::session_compact::{
 };
 use crate::session::persistence::PersistenceMsg;
 use crate::session::two_pass::{
-    TWO_PASS_DEFAULT_SPLIT_FRACTION, build_two_pass_pass1_history, build_two_pass_pass2_history,
-    note_for_two_pass_pass2, split_conversation_for_two_pass,
+    build_two_pass_pass1_history, build_two_pass_pass2_history, note_for_two_pass_pass2,
 };
 use agent_client_protocol as acp;
 use distill_chat_state::compaction_utils::{
@@ -102,14 +101,19 @@ mod compaction_timing_gate_tests {
     /// the middle of an edit.
     #[test]
     fn timing_state_shows_whether_a_subtask_just_ended() {
-        let long = format!("{}All tests pass; next I will start on the parser.", "x".repeat(2_000));
+        let long = format!(
+            "{}All tests pass; next I will start on the parser.",
+            "x".repeat(2_000)
+        );
         let todos = vec![
             ("wire the parser".to_owned(), "in_progress"),
             ("write docs".to_owned(), "pending"),
             ("fix tests".to_owned(), "completed"),
         ];
         let state = compaction_timing_state("build it", 60, 200_000, Some(&long), &todos);
-        let last = state["last_assistant_message"].as_str().expect("last message");
+        let last = state["last_assistant_message"]
+            .as_str()
+            .expect("last message");
         assert!(last.ends_with("start on the parser."), "{last}");
         assert!(last.chars().count() <= 600, "bounded: {}", last.len());
         assert_eq!(state["todos"]["completed"], 1);
@@ -334,10 +338,7 @@ fn labelled_number(rest: &str) -> Option<u64> {
         });
         break;
     }
-    let digits: String = rest
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
     (!digits.is_empty())
         .then(|| digits.parse::<u64>().ok())
         .flatten()
@@ -375,7 +376,9 @@ fn prefire_lead_percent() -> u64 {
 /// The cached NOTE₁ then no longer summarizes the current prefix and must be dropped.
 /// A tool result counts by its call id: its content is only ever shortened in
 /// place (hard clear, history eviction), and a NOTE₁ written from the fuller
-/// copy still summarizes it.
+/// copy still summarizes it. A system item counts by its kind: a prompt
+/// refresh (worker, label, memory section) rewrites its text in place, and the
+/// history NOTE₁ summarizes is the same.
 fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -392,11 +395,17 @@ fn fingerprint_prefix(items: &[ConversationItem]) -> u64 {
         tag.hash(&mut h);
         match it {
             ConversationItem::ToolResult(tr) => tr.tool_call_id.hash(&mut h),
+            ConversationItem::System(_) => {}
             _ => it.text_content().hash(&mut h),
         }
     }
     h.finish()
 }
+/// `usage.json` source for prefire pass-1 outcomes, so pass-1 requests per
+/// applied compaction can be read. Labels are fixed identifiers: `sent` per
+/// pass-1 request, `used` per compaction that applied its NOTE₁, and
+/// `discard:<reason>` per NOTE₁ that no compaction will use.
+const PASS1_OUTCOME_SOURCE: &str = "compaction_pass1";
 /// Outcome of a background prefire pass-1 run, recorded on the `session.prefire_pass1` span as `compaction_prefire_outcome`.
 /// [`PrefireOutcome::as_str`] values are stable telemetry keys (telemetry/dashboards key off them); don't rename the strings.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, strum::AsRefStr, strum::IntoStaticStr)]
@@ -464,7 +473,10 @@ mod output_cap_tests {
 
     #[test]
     fn unparseable_message_yields_none() {
-        assert_eq!(provider_overflow_requested_and_limit("context length exceeded"), None);
+        assert_eq!(
+            provider_overflow_requested_and_limit("context length exceeded"),
+            None
+        );
         assert_eq!(provider_overflow_requested_and_limit(""), None);
     }
 
@@ -479,9 +491,18 @@ mod output_cap_tests {
 
     #[test]
     fn shrink_halves_when_unparseable_and_stops_at_floor() {
-        assert_eq!(output_cap_after_context_overflow("context length exceeded", 8_000), Some(4_000));
-        assert_eq!(output_cap_after_context_overflow("context length exceeded", 1_500), Some(1_024));
-        assert_eq!(output_cap_after_context_overflow("context length exceeded", 1_024), None);
+        assert_eq!(
+            output_cap_after_context_overflow("context length exceeded", 8_000),
+            Some(4_000)
+        );
+        assert_eq!(
+            output_cap_after_context_overflow("context length exceeded", 1_500),
+            Some(1_024)
+        );
+        assert_eq!(
+            output_cap_after_context_overflow("context length exceeded", 1_024),
+            None
+        );
     }
 
     #[test]
@@ -507,6 +528,9 @@ mod output_cap_tests {
     }
 }
 #[cfg(test)]
+#[path = "compaction_prefire_prefix_tests.rs"]
+mod prefire_prefix_tests;
+#[cfg(test)]
 #[path = "compaction_two_pass_prefire_helper_tests.rs"]
 mod two_pass_prefire_helper_tests;
 #[cfg(test)]
@@ -518,11 +542,16 @@ impl SessionActor {
         let agent = self.agent.borrow();
         agent.compaction_policy().two_pass_enabled
     }
+    /// Counts one prefire pass-1 outcome under [`PASS1_OUTCOME_SOURCE`].
+    pub(crate) fn record_pass1_outcome(&self, label: &str) {
+        self.chat_state_handle
+            .record_utility_outcome(PASS1_OUTCOME_SOURCE, label, 0, 0, 0);
+    }
     /// The prompt is already embedded, so this bypasses the single-pass sampler and calls `generate_session_compact` directly.
     /// Agent `RefCell` borrows are only taken for synchronous snapshots (never held across `.await`).
     /// A long-lived borrow would race with turn/compact/cancel and panic on double-borrow.
     /// With `fit_cold`, a history that cannot fit beside the tools and the summary is digested and fitted first: it would fail whole, so its cache is no loss.
-    /// `one_shot` marks a history no later request repeats (pass2): it writes no conversation cache entry, but keeps the system breakpoint that reads the main system prompt and tools.
+    /// `one_shot` marks a history no later request repeats (pass2, or a cold pass1): it writes no conversation cache entry, but keeps the system breakpoint that reads the main system prompt and tools.
     /// `cache_key` is the main key for pass1, which replays the main prefix, and a purpose key for pass2, whose prompt is its own.
     async fn two_pass_sample(
         &self,
@@ -661,7 +690,7 @@ impl SessionActor {
         let start_pct = threshold.saturating_sub(prefire_lead_percent());
         distill_token_estimation::exceeds_threshold(estimated_total, cw, start_pct as u8)
     }
-    /// Background pass-1: summarize the ~95% prefix into NOTE₁ and cache it for a later pass-2 apply.
+    /// Background pass-1: summarize the history so far into NOTE₁ and cache it for a later pass-2 apply.
     /// Always releases the in-flight guard.
     /// Spawned via `spawn_local` from the turn loop; reads a conversation snapshot and does not mutate session state.
     #[tracing::instrument(
@@ -717,10 +746,16 @@ impl SessionActor {
         if conversation.len() < 4 {
             return PrefireOutcome::TooSmall.into();
         }
-        let split = split_conversation_for_two_pass(&conversation, TWO_PASS_DEFAULT_SPLIT_FRACTION);
-        if split.prefix.is_empty() || split.tail.is_empty() {
+        // The whole history the main request sends (less a trailing call still
+        // waiting for its result): only the instruction follows it, so the
+        // request ends where the last main request wrote its cache entry. A
+        // breakpoint cache keeps entries only at request tips, and a prefix that
+        // stops earlier finds none alive there and is written again in full.
+        let split_idx =
+            prepare_conversation_for_verbatim_summarization(conversation.clone(), false).len();
+        let Some(prefix) = conversation.get(..split_idx).filter(|p| !p.is_empty()) else {
             return PrefireOutcome::EmptySplit.into();
-        }
+        };
         let sampling_cfg = self.chat_state_handle.get_sampling_config().await;
         let model_slug = sampling_cfg
             .as_ref()
@@ -735,7 +770,7 @@ impl SessionActor {
         });
         let prefix_prepared = apply_turn_image_budget_and_prune(
             &self.chat_state_handle,
-            prepare_conversation_for_verbatim_summarization(split.prefix.to_vec(), strips),
+            prepare_conversation_for_verbatim_summarization(prefix.to_vec(), strips),
         )
         .await;
         let prefix_est_tokens = prefix_prepared
@@ -746,13 +781,16 @@ impl SessionActor {
         let pass1_history = build_two_pass_pass1_history(&prefix_prepared, &prompt);
         let started = std::time::Instant::now();
         let cache_key = self.main_cache_key().await;
+        // A cold history reads nothing, and no later request repeats this one.
+        let cold = self.chat_state_handle.history_is_cold().await;
+        self.record_pass1_outcome("sent");
         let out = self
-            .two_pass_sample(pass1_history, true, false, cache_key)
+            .two_pass_sample(pass1_history, true, cold, cache_key)
             .await;
         let pass1_latency_ms = started.elapsed().as_millis() as u64;
         let attempted = |outcome: PrefireOutcome, note1_chars: Option<usize>| PrefirePass1Run {
             outcome,
-            prefix_len: Some(split.split_idx),
+            prefix_len: Some(split_idx),
             prefix_est_tokens: Some(prefix_est_tokens),
             pass1_latency_ms: Some(pass1_latency_ms),
             note1_chars,
@@ -762,21 +800,20 @@ impl SessionActor {
         // waits for one (or a model switch).
         let Some(out) = out else {
             self.compaction.prefire.record_failure();
+            self.record_pass1_outcome("discard:failed");
             return attempted(PrefireOutcome::SampleFailed, None);
         };
         let note1 = note_for_two_pass_pass2(&out.content);
         if note1.trim().is_empty() {
             self.compaction.prefire.record_failure();
+            self.record_pass1_outcome("discard:empty");
             return attempted(PrefireOutcome::EmptyNote1, None);
         }
         self.compaction.prefire.unblock();
         let note1_chars = note1.chars().count();
-        let Some(prefix) = conversation.get(..split.split_idx) else {
-            return attempted(PrefireOutcome::SampleFailed, None);
-        };
         let cache = AsyncCompactionCache {
             note1,
-            prefix_len: split.split_idx,
+            prefix_len: split_idx,
             fingerprint: fingerprint_prefix(prefix),
             model_slug,
             pass1_latency_ms,
@@ -828,6 +865,7 @@ impl SessionActor {
             .map(|c| c.model.to_string())
             .unwrap_or_default();
         let Some((prefix, tail)) = live.split_at_checked(cache.prefix_len) else {
+            self.record_pass1_outcome("discard:stale");
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
                 target: "two_pass",
@@ -839,6 +877,11 @@ impl SessionActor {
             || cache.model_slug != model_slug
             || fingerprint_prefix(prefix) != cache.fingerprint
         {
+            self.record_pass1_outcome(if cache.model_slug != model_slug {
+                "discard:model"
+            } else {
+                "discard:stale"
+            });
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
                 target: "two_pass",
@@ -855,10 +898,15 @@ impl SessionActor {
         // NOTE1 plus the tail is a prompt only this pass2 sends, so it keeps its own route off the main one.
         let cache_key =
             crate::sampling::purpose_cache_key(&self.session_info.id.to_string(), "compact-pass2");
-        let mut out = self
+        let Some(mut out) = self
             .two_pass_sample(pass2_history, false, true, cache_key)
-            .await?;
+            .await
+        else {
+            self.record_pass1_outcome("discard:pass2_failed");
+            return None;
+        };
         if is_degenerate_summary(&out.content) {
+            self.record_pass1_outcome("discard:degenerate");
             tracing::Span::current().record("compaction_prefire_stale", true);
             tracing::info!(
                 target: "two_pass",
@@ -870,6 +918,7 @@ impl SessionActor {
         if prefire_waited_ms > 0 {
             out.ttft_ms = Some(out.ttft_ms.unwrap_or(0).saturating_add(prefire_waited_ms));
         }
+        self.record_pass1_outcome("used");
         let span = tracing::Span::current();
         span.record("compaction_two_pass_used", true);
         span.record("compaction_prefire_hit", true);
@@ -1134,6 +1183,16 @@ impl SessionActor {
             .as_ref()
             .map(|c| c.context_window.get())
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
+        let percentage = distill_token_estimation::usage_percentage_u8(total_tokens, context_window);
+        self.send_xai_notification(XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: total_tokens,
+            context_window,
+            percentage,
+            reason: "Manual /compact".to_string(),
+        })
+        .await;
+        let compact_start = std::time::Instant::now();
         self.maybe_pre_compaction_flush(total_tokens, context_window, "pre_compaction")
             .await;
         if let Err(e) = self
@@ -1149,6 +1208,24 @@ impl SessionActor {
             let span = tracing::Span::current();
             span.record("success", false);
             span.record("error", e.to_string().as_str());
+            let cancelled = self.compaction.cancel.is_cancelled()
+                || matches!(
+                    crate::session::helpers::session_compact::compact_error_kind(&e),
+                    Some(crate::session::helpers::session_compact::CompactErrorKind::Cancelled)
+                );
+            if cancelled {
+                self.send_xai_notification(XaiSessionUpdate::AutoCompactCancelled {
+                    reason: crate::extensions::notification::AutoCompactCancelReason::UserCancelled,
+                })
+                .await;
+            } else {
+                let detail =
+                    Self::user_facing_compact_error(&crate::sampling::error::acp_error_message(&e));
+                self.send_xai_notification(XaiSessionUpdate::AutoCompactFailed {
+                    error: detail.clone(),
+                })
+                .await;
+            }
             let kind = crate::session::helpers::session_compact::compact_error_kind(&e)
                 .unwrap_or(crate::session::helpers::session_compact::CompactErrorKind::Failed);
             let detail =
@@ -1157,7 +1234,6 @@ impl SessionActor {
                 crate::session::helpers::session_compact::compact_error_data(kind, &detail),
             ));
         }
-        use crate::extensions::notification::SessionUpdate as XaiSessionUpdate;
         let tokens_after = self.chat_state_handle.get_total_tokens().await;
         let span = tracing::Span::current();
         span.record("post_tokens", tokens_after as i64);
@@ -1165,7 +1241,7 @@ impl SessionActor {
         self.send_xai_notification(XaiSessionUpdate::AutoCompactCompleted {
             tokens_before: Some(total_tokens),
             tokens_after,
-            elapsed_ms: None,
+            elapsed_ms: Some(compact_start.elapsed().as_millis() as i64),
             summary_preview: None,
         })
         .await;
@@ -1756,6 +1832,9 @@ impl SessionActor {
             .borrow()
             .compaction_policy()
             .wall_clock_budget_secs;
+        // A cold input reads nothing from the cache, and the compacted history that follows never
+        // repeats it, so its conversation entry would be written for no reader.
+        let input_cold = self.chat_state_handle.history_is_cold().await;
         let sampler = crate::session::helpers::full_replace_compaction::ShellCompactionSampler::new(
             use_short_prompt,
             user_context.clone(),
@@ -1771,6 +1850,7 @@ impl SessionActor {
             self.compaction.tool_choice,
             cancel.clone(),
             self.chat_state_handle.clone(),
+            input_cold,
         );
         let observer =
             crate::session::helpers::full_replace_compaction::ShellFullReplaceObserver::new(
@@ -1982,6 +2062,7 @@ impl SessionActor {
                     self.compaction.tool_choice,
                     cancel.clone(),
                     self.chat_state_handle.clone(),
+                    false,
                 );
             let fallback_fr_config = distill_compaction::FullReplaceConfig {
                 max_attempts: 2,
@@ -2165,6 +2246,7 @@ impl SessionActor {
                         let _ =
                             event_tx.send(SubagentEvent::ListRunning(SubagentListRunningRequest {
                                 parent_session_id: self.session_id_string(),
+                                include_completed: false,
                                 respond_to: tx,
                             }));
                         rx.await
@@ -2898,12 +2980,8 @@ impl SessionActor {
         if self.compaction.is_suppressed() {
             return false;
         }
-        self.estimate_exceeds_error_context_window_for_route(
-            err,
-            route,
-            requested_output_tokens,
-        )
-        .await
+        self.estimate_exceeds_error_context_window_for_route(err, route, requested_output_tokens)
+            .await
     }
 
     /// The request's effective input plus its reserved output and a small

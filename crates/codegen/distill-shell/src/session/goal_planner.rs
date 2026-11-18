@@ -142,18 +142,61 @@ const GOAL_PLANNER_PROMPT_TEMPLATE: &str = include_str!("templates/goal_planner_
 
 /// Browser and game guidance, sent only when the objective reads as visual or
 /// interactive; other goals keep the generic launch check.
-const GOAL_PLANNER_VISUAL_APPENDIX: &str = include_str!("templates/goal_planner_visual_appendix.md");
+const GOAL_PLANNER_VISUAL_APPENDIX: &str =
+    include_str!("templates/goal_planner_visual_appendix.md");
 
 /// Words that mark a visual or interactive deliverable, in English and
 /// Portuguese. A miss only drops the browser specifics from the planner (the
 /// verifier's code-change lens still enforces them), so the list errs wide.
 const VISUAL_OBJECTIVE_TERMS: &[&str] = &[
-    "game", "games", "jogo", "jogos", "canvas", "browser", "navegador", "page", "pages",
-    "pagina", "página", "html", "css", "frontend", "front-end", "ui", "ux", "interface",
-    "screen", "tela", "telas", "layout", "webgl", "threejs", "three.js", "svg", "animation",
-    "animação", "animacao", "react", "vue", "svelte", "nextjs", "next.js", "site", "website",
-    "landing", "dashboard", "button", "botão", "botao", "visual", "sprite", "platformer",
-    "playable", "jogável", "jogavel", "web",
+    "game",
+    "games",
+    "jogo",
+    "jogos",
+    "canvas",
+    "browser",
+    "navegador",
+    "page",
+    "pages",
+    "pagina",
+    "página",
+    "html",
+    "css",
+    "frontend",
+    "front-end",
+    "ui",
+    "ux",
+    "interface",
+    "screen",
+    "tela",
+    "telas",
+    "layout",
+    "webgl",
+    "threejs",
+    "three.js",
+    "svg",
+    "animation",
+    "animação",
+    "animacao",
+    "react",
+    "vue",
+    "svelte",
+    "nextjs",
+    "next.js",
+    "site",
+    "website",
+    "landing",
+    "dashboard",
+    "button",
+    "botão",
+    "botao",
+    "visual",
+    "sprite",
+    "platformer",
+    "playable",
+    "jogável",
+    "jogavel",
+    "web",
 ];
 
 /// Whether the objective reads as a visual or interactive deliverable.
@@ -320,6 +363,7 @@ impl ChannelSpawner {
         let fork_context = model.is_none();
         let request = SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: id.to_string(),
             prompt,
             description: GOAL_PLANNER_SUBAGENT_DESCRIPTION.to_string(),
@@ -540,10 +584,17 @@ mod tests {
             assert!(rendered.contains("## Entry-point launch check"));
             assert!(!rendered.contains("{VISUAL_APPENDIX}"));
             assert!(!rendered.contains("{AUTONOMY}"));
-            assert!(!rendered.contains("<!--"), "the license notice must not reach the model");
+            assert!(
+                !rendered.contains("<!--"),
+                "the license notice must not reach the model"
+            );
         }
-        assert!(!objective_looks_visual("build the guide for the uint parser"));
-        assert!(objective_looks_visual("Make the settings UI match the design"));
+        assert!(!objective_looks_visual(
+            "build the guide for the uint parser"
+        ));
+        assert!(objective_looks_visual(
+            "Make the settings UI match the design"
+        ));
     }
 
     /// A planner that explored first and never wrote the file paused goals; the

@@ -661,7 +661,9 @@ impl MvpAgent {
             .as_ref()
             .filter(|route| route.option_id.is_some() && !route.pinned)
         {
-            session_sampling.extra_headers.shift_remove("x-distill-worker-pin");
+            session_sampling
+                .extra_headers
+                .shift_remove("x-distill-worker-pin");
             *worker_override.write() = Some(crate::session::handle::SessionWorker {
                 model_id: Some(route.worker_model.clone()),
                 effort: None,
@@ -1072,6 +1074,12 @@ impl MvpAgent {
         }
         let session_exists = self.is_resident(&session_id);
         let no_replay = policy.no_replay;
+        let postudio_history_paging = request_meta
+            .as_ref()
+            .and_then(|meta| meta.get("postudioHistoryPaging"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let metadata_only_history = session_exists && no_replay && postudio_history_paging;
         if session_exists {
             tracing::info!(
                 session_id = %session_id.0,
@@ -1103,10 +1111,8 @@ impl MvpAgent {
             .filter(|model| *model != "auto")
             .map(acp::ModelId::new)
             .unwrap_or_else(|| self.models_manager.current_model_id());
-        let mut load_session_sampling = self.resolve_sampling_config_for_model(
-            &initial_model_id,
-            origin_client.clone(),
-        );
+        let mut load_session_sampling =
+            self.resolve_sampling_config_for_model(&initial_model_id, origin_client.clone());
         self.models_manager.apply_supported_effort(
             &mut load_session_sampling,
             initial_reasoning_effort,
@@ -1118,15 +1124,39 @@ impl MvpAgent {
         );
         let requested = main_meta.model_id.as_deref();
         load_session_sampling = if requested == Some("auto") {
-            crate::agent::account_routing::explicit_auto_config(&load_session_sampling, &self.models_manager.models()).await
+            crate::agent::account_routing::explicit_auto_config(
+                &load_session_sampling,
+                &self.models_manager.models(),
+            )
+            .await
         } else if requested.is_none() {
-            match crate::agent::account_routing::restore_session_config(&session_info, &load_session_sampling, &self.models_manager.models()).await {
-                Ok(Some(restored)) => Ok(restored), Ok(None) => crate::agent::account_routing::select_startup_config(&load_session_sampling, &self.models_manager.models(), false).await,
+            match crate::agent::account_routing::restore_session_config(
+                &session_info,
+                &load_session_sampling,
+                &self.models_manager.models(),
+            )
+            .await
+            {
+                Ok(Some(restored)) => Ok(restored),
+                Ok(None) => {
+                    crate::agent::account_routing::select_startup_config(
+                        &load_session_sampling,
+                        &self.models_manager.models(),
+                        false,
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             }
         } else {
-            crate::agent::account_routing::select_startup_config(&load_session_sampling, &self.models_manager.models(), true).await
-        }.map_err(|_| acp::Error::auth_required().data("Saved account route is unavailable"))?;
+            crate::agent::account_routing::select_startup_config(
+                &load_session_sampling,
+                &self.models_manager.models(),
+                true,
+            )
+            .await
+        }
+        .map_err(|_| acp::Error::auth_required().data("Saved account route is unavailable"))?;
         let (summary_client, summary_model) = self.build_summary_client(&load_session_sampling)?;
         let title_utility_lane =
             self.build_title_utility_lane(&load_session_sampling, &summary_model);
@@ -1144,6 +1174,7 @@ impl MvpAgent {
             &session_info,
             backend.as_ref(),
             false,
+            metadata_only_history,
             crate::session::persistence::SessionDeps {
                 sampling_client: summary_client,
                 utility_lane: title_utility_lane,
@@ -1259,6 +1290,11 @@ impl MvpAgent {
                 .emit_local_background_tasks
                 .store(false, std::sync::atomic::Ordering::Release);
         }
+        let postudio_history_paging = request_meta
+            .as_ref()
+            .and_then(|meta| meta.get("postudioHistoryPaging"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let (initial_total_tokens, unfinished_subagents) = self
             .replay_transcript_gate(
                 &session_id,
@@ -1271,6 +1307,7 @@ impl MvpAgent {
                 },
                 no_replay,
                 gateway_backed,
+                postudio_history_paging,
             )
             .await?;
         self.attach_status_line(&session_id, request_meta.as_ref(), init);
@@ -1288,6 +1325,9 @@ impl MvpAgent {
             .map(|s| s.to_string())
             .or_else(|| summary.prompt_display_cwd.clone());
         let restored_from_disk = if !self.is_resident(&session_id) {
+            if metadata_only_history {
+                return Err(acp::Error::internal_error().data("Session stopped during attach; reconnect to restore history"));
+            }
             tracing::info!(
                 session_id = %session_id.0,
                 "load_session: spawning new session actor (session not in memory)"
@@ -1470,13 +1510,8 @@ impl MvpAgent {
         );
         self.heal_orphaned_subagents(&session_id, &unfinished_subagents)
             .await;
-        self.restore_persisted_model(
-            &session_id,
-            &summary,
-            initial_reasoning_effort,
-            &main_meta,
-        )
-        .await;
+        self.restore_persisted_model(&session_id, &summary, initial_reasoning_effort, &main_meta)
+            .await;
         if let Some(handle) = self.resident_handle(&session_id)
             && let Some(mut sampling) = handle.chat_state_handle.get_sampling_config().await
         {
@@ -1633,6 +1668,7 @@ impl MvpAgent {
         routing: ReplayRouting<'_>,
         no_replay: bool,
         skip_local_background_tasks_replay: bool,
+        postudio_history_paging: bool,
     ) -> Result<(u64, Vec<crate::session::storage::UnfinishedSubagent>), acp::Error> {
         let session_id = session_id.clone();
         let cwd = cwd.clone();
@@ -1695,7 +1731,11 @@ impl MvpAgent {
         }
         let reconcile_completions = {
             let _timer = crate::instrumentation_timer!("session.reconcile_stale_tasks");
-            self.reconcile_stale_background_tasks(&session_id, &updates_file_path)
+            self.reconcile_stale_background_tasks(
+                &session_id,
+                &updates_file_path,
+                postudio_history_paging,
+            )
         };
         for rx in reconcile_completions {
             let _ = rx.await;
@@ -1824,7 +1864,9 @@ impl MvpAgent {
             && main_meta.auto.is_none()
             && let Some(handle) = self.resident_handle(&session_id)
             && let Some(sampling) = handle.chat_state_handle.get_sampling_config().await
-            && sampling.extra_headers.contains_key(crate::agent::account_routing::ROUTE_HEADER)
+            && sampling
+                .extra_headers
+                .contains_key(crate::agent::account_routing::ROUTE_HEADER)
         {
             return;
         }

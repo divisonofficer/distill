@@ -57,6 +57,20 @@ pub struct KillTaskResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ScopedKillTaskRequest {
+    session_id: String,
+    task_id: String,
+    source: ScopedKillSource,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ScopedKillSource {
+    ClientUi,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListTasksRequest {
     session_id: String,
 }
@@ -65,6 +79,7 @@ struct ListTasksRequest {
 #[serde(rename_all = "camelCase")]
 struct ListTasksResponse {
     tasks: Vec<TaskSnapshot>,
+    scoped_kill_supported: bool,
 }
 
 /// Wire DTO for the `x.ai/subagent/cancel` ext request.
@@ -130,71 +145,14 @@ pub struct CancelSubagentResponse {
 #[serde(rename_all = "camelCase")]
 struct ListRunningSubagentsRequest {
     session_id: String,
+    #[serde(default)]
+    include_completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ListRunningSubagentsResponse {
-    subagents: Vec<SubagentLiveSnapshotDto>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SubagentLiveSnapshotDto {
-    subagent_id: String,
-    parent_session_id: String,
-    child_session_id: String,
-    subagent_type: String,
-    description: String,
-    started_at_epoch_ms: u64,
-    duration_ms: u64,
-    turn_count: u32,
-    tool_call_count: u32,
-    tokens_used: u64,
-    context_window_tokens: u64,
-    context_usage_pct: u8,
-    tools_used: Vec<String>,
-    error_count: u32,
-}
-
-impl From<SubagentInspection> for SubagentLiveSnapshotDto {
-    fn from(inspection: SubagentInspection) -> Self {
-        let SubagentInspection {
-            snapshot,
-            parent_session_id,
-            child_session_id,
-            ..
-        } = inspection;
-        let SubagentSnapshotStatus::Running {
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_pct,
-            tools_used,
-            recent_activity: _,
-            error_count,
-        } = snapshot.status
-        else {
-            unreachable!("list_running returns only active children");
-        };
-        Self {
-            subagent_id: snapshot.subagent_id,
-            parent_session_id,
-            child_session_id,
-            subagent_type: snapshot.subagent_type,
-            description: snapshot.description,
-            started_at_epoch_ms: snapshot.started_at_epoch_ms,
-            duration_ms: snapshot.duration_ms,
-            turn_count,
-            tool_call_count,
-            tokens_used,
-            context_window_tokens,
-            context_usage_pct,
-            tools_used,
-            error_count,
-        }
-    }
+    subagents: Vec<SubagentSnapshotDto>,
 }
 
 // ── Subagent get DTOs ────────────────────────────────────────────────────
@@ -217,13 +175,15 @@ struct GetSubagentResponse {
 
 /// ACP DTO for a single subagent snapshot (any status).
 ///
-/// Extends the identity fields from `SubagentLiveSnapshotDto` with status-dependent fields for completed/failed/cancelled states.
+/// Status-specific fields for registry entries in any lifecycle state.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SubagentSnapshotDto {
     subagent_id: String,
     parent_session_id: String,
     child_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
     subagent_type: String,
     description: String,
     started_at_epoch_ms: u64,
@@ -268,17 +228,40 @@ struct SubagentSnapshotDto {
 }
 
 impl SubagentSnapshotDto {
+    fn from_inspection(inspection: SubagentInspection) -> Self {
+        let SubagentInspection {
+            snapshot,
+            parent_session_id,
+            child_session_id,
+            tool_call_id,
+            fork_parent_prompt_id,
+            resumed_from,
+        } = inspection;
+        Self::from_snapshot(
+            snapshot,
+            parent_session_id,
+            child_session_id,
+            SubagentProvenance {
+                fork_parent_prompt_id,
+                resumed_from,
+            },
+            tool_call_id,
+        )
+    }
+
     /// Build a DTO from a resolved snapshot and its session identity.
     fn from_snapshot(
         snap: SubagentSnapshot,
         parent_session_id: String,
         child_session_id: String,
         provenance: SubagentProvenance,
+        tool_call_id: Option<String>,
     ) -> Self {
         let mut dto = SubagentSnapshotDto {
             subagent_id: snap.subagent_id,
             parent_session_id,
             child_session_id,
+            tool_call_id,
             subagent_type: snap.subagent_type,
             description: snap.description,
             started_at_epoch_ms: snap.started_at_epoch_ms,
@@ -376,13 +359,28 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
                 });
             respond(result)
         }
+        "x.ai/task/kill_scoped" => {
+            let req: ScopedKillTaskRequest = parse(args)?;
+            let ScopedKillSource::ClientUi = req.source;
+            let outcome = agent
+                .kill_background_task_scoped(&req.session_id, &req.task_id)
+                .await;
+            respond(Ok::<_, String>(KillTaskResponse {
+                task_id: req.task_id,
+                outcome,
+            }))
+        }
         "x.ai/task/list" => {
             let req: ListTasksRequest = parse(args)?;
+            let scoped_kill_supported = agent.scoped_kill_supported(&req.session_id).await;
             let result = agent
                 .list_tasks(&req.session_id)
                 .await
                 .ok_or_else(|| "session not found or no terminal backend".to_string())
-                .map(|tasks| ListTasksResponse { tasks });
+                .map(|tasks| ListTasksResponse {
+                    tasks,
+                    scoped_kill_supported,
+                });
             respond(result)
         }
         _ => Err(acp::Error::method_not_found()),
@@ -447,7 +445,7 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                 .query_subagent(&req.subagent_id, block, Some(timeout_ms))
                 .await;
             let inspection = agent.inspect_subagent(&req.subagent_id).await;
-            let (parent_session_id, child_session_id, provenance) = inspection
+            let (parent_session_id, child_session_id, provenance, tool_call_id) = inspection
                 .map(|inspection| {
                     (
                         inspection.parent_session_id,
@@ -456,6 +454,7 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                             fork_parent_prompt_id: inspection.fork_parent_prompt_id,
                             resumed_from: inspection.resumed_from,
                         },
+                        inspection.tool_call_id,
                     )
                 })
                 .unwrap_or_default();
@@ -466,6 +465,7 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
                         parent_session_id,
                         child_session_id,
                         provenance,
+                        tool_call_id,
                     )
                 }),
             }))
@@ -473,10 +473,10 @@ pub(crate) async fn handle_subagent(agent: &MvpAgent, args: &acp::ExtRequest) ->
         "x.ai/subagent/list_running" => {
             let req: ListRunningSubagentsRequest = parse(args)?;
             let subagents = agent
-                .list_running_subagents(&req.session_id)
+                .list_subagents(&req.session_id, req.include_completed)
                 .await
                 .into_iter()
-                .map(SubagentLiveSnapshotDto::from)
+                .map(SubagentSnapshotDto::from_inspection)
                 .collect();
             respond(Ok::<_, String>(ListRunningSubagentsResponse { subagents }))
         }
@@ -494,6 +494,38 @@ mod tests {
         let req: DeleteScheduledTaskRequest = serde_json::from_str(json).expect("should parse");
         assert_eq!(req.session_id, "sess-1");
         assert_eq!(req.task_id, "task-42");
+    }
+
+    #[test]
+    fn scoped_kill_wire_contract() {
+        let req: ScopedKillTaskRequest =
+            serde_json::from_str(r#"{"sessionId":"s","taskId":"t","source":"clientUi"}"#).unwrap();
+        assert_eq!(req.session_id, "s");
+        assert_eq!(req.task_id, "t");
+        assert!(
+            serde_json::from_str::<ScopedKillTaskRequest>(r#"{"sessionId":"s","taskId":"t"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ScopedKillTaskRequest>(
+                r#"{"sessionId":"s","taskId":"t","source":"teardown"}"#
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(KillTaskResponse {
+                task_id: "t".into(),
+                outcome: KillOutcome::NotFound
+            })
+            .unwrap(),
+            serde_json::json!({"taskId":"t","outcome":"not_found"})
+        );
+        let list = serde_json::to_value(ListTasksResponse {
+            tasks: vec![],
+            scoped_kill_supported: true,
+        })
+        .unwrap();
+        assert_eq!(list["scopedKillSupported"], true);
     }
 
     #[test]
@@ -519,60 +551,8 @@ mod tests {
     }
 
     #[test]
-    fn subagent_live_snapshot_dto_serializes_camel_case() {
-        let dto = SubagentLiveSnapshotDto {
-            subagent_id: "sub-1".into(),
-            parent_session_id: "parent-1".into(),
-            child_session_id: "child-1".into(),
-            subagent_type: "explore".into(),
-            description: "find files".into(),
-            started_at_epoch_ms: 1_700_000_000_000,
-            duration_ms: 5000,
-            turn_count: 2,
-            tool_call_count: 7,
-            tokens_used: 30_000,
-            context_window_tokens: 256_000,
-            context_usage_pct: 23,
-            tools_used: vec!["bash".into(), "grep".into()],
-            error_count: 1,
-        };
-        let json = serde_json::to_value(&dto).expect("should serialize");
-        assert_eq!(json.get("subagentId"), Some(&serde_json::json!("sub-1")));
-        assert_eq!(
-            json.get("parentSessionId"),
-            Some(&serde_json::json!("parent-1"))
-        );
-        assert_eq!(
-            json.get("childSessionId"),
-            Some(&serde_json::json!("child-1"))
-        );
-        assert_eq!(
-            json.get("subagentType"),
-            Some(&serde_json::json!("explore"))
-        );
-        assert_eq!(
-            json.get("startedAtEpochMs"),
-            Some(&serde_json::json!(1_700_000_000_000_u64))
-        );
-        assert_eq!(json.get("durationMs"), Some(&serde_json::json!(5000)));
-        assert_eq!(json.get("turnCount"), Some(&serde_json::json!(2)));
-        assert_eq!(json.get("toolCallCount"), Some(&serde_json::json!(7)));
-        assert_eq!(json.get("tokensUsed"), Some(&serde_json::json!(30_000)));
-        assert_eq!(
-            json.get("contextWindowTokens"),
-            Some(&serde_json::json!(256_000))
-        );
-        assert_eq!(json.get("contextUsagePct"), Some(&serde_json::json!(23)));
-        assert_eq!(
-            json.get("toolsUsed"),
-            Some(&serde_json::json!(["bash", "grep"]))
-        );
-        assert_eq!(json.get("errorCount"), Some(&serde_json::json!(1)));
-    }
-
-    #[test]
-    fn from_resolved_running_subagent_maps_all_fields() {
-        let resolved = SubagentInspection {
+    fn list_snapshot_dto_preserves_running_status_and_call_id() {
+        let inspection = SubagentInspection {
             snapshot: SubagentSnapshot {
                 subagent_id: "s".into(),
                 subagent_type: "plan".into(),
@@ -593,15 +573,26 @@ mod tests {
             },
             parent_session_id: "p".into(),
             child_session_id: "c".into(),
+            tool_call_id: Some("actual-tool-call".into()),
             fork_parent_prompt_id: None,
             resumed_from: None,
         };
-        let dto = SubagentLiveSnapshotDto::from(resolved);
-        assert_eq!(dto.subagent_id, "s");
-        assert_eq!(dto.parent_session_id, "p");
-        assert_eq!(dto.child_session_id, "c");
-        assert_eq!(dto.context_usage_pct, 50);
-        assert_eq!(dto.tools_used, vec!["read_file"]);
+        let json = serde_json::to_value(SubagentSnapshotDto::from_inspection(inspection)).unwrap();
+        assert_eq!(json["status"], "running");
+        assert_eq!(json["toolCallId"], "actual-tool-call");
+        assert_eq!(json["parentSessionId"], "p");
+        assert_eq!(json["contextUsagePct"], 50);
+        assert_eq!(json["toolsUsed"], serde_json::json!(["read_file"]));
+    }
+
+    #[test]
+    fn list_request_defaults_to_running_only_and_accepts_recent_history() {
+        let default: ListRunningSubagentsRequest =
+            serde_json::from_str(r#"{"sessionId":"s"}"#).unwrap();
+        assert!(!default.include_completed);
+        let recent: ListRunningSubagentsRequest =
+            serde_json::from_str(r#"{"sessionId":"s","includeCompleted":true}"#).unwrap();
+        assert!(recent.include_completed);
     }
 
     #[test]
@@ -638,6 +629,7 @@ mod tests {
             "parent-1".into(),
             "child-1".into(),
             Default::default(),
+            None,
         );
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(
@@ -676,8 +668,13 @@ mod tests {
                 model: None,
             },
         };
-        let dto =
-            SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
+        let dto = SubagentSnapshotDto::from_snapshot(
+            snap,
+            "p".into(),
+            "c".into(),
+            Default::default(),
+            None,
+        );
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(json.get("status"), Some(&serde_json::json!("completed")));
         assert_eq!(
@@ -704,8 +701,13 @@ mod tests {
                 error: "sampling error".into(),
             },
         };
-        let dto =
-            SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
+        let dto = SubagentSnapshotDto::from_snapshot(
+            snap,
+            "p".into(),
+            "c".into(),
+            Default::default(),
+            None,
+        );
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(json.get("status"), Some(&serde_json::json!("failed")));
         assert_eq!(
@@ -727,8 +729,13 @@ mod tests {
                 reason: Some("user cancelled".into()),
             },
         };
-        let dto =
-            SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
+        let dto = SubagentSnapshotDto::from_snapshot(
+            snap,
+            "p".into(),
+            "c".into(),
+            Default::default(),
+            None,
+        );
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(json.get("status"), Some(&serde_json::json!("cancelled")));
         assert_eq!(
@@ -748,8 +755,13 @@ mod tests {
             persona: None,
             status: SubagentSnapshotStatus::Cancelled { reason: None },
         };
-        let dto =
-            SubagentSnapshotDto::from_snapshot(snap, "p".into(), "c".into(), Default::default());
+        let dto = SubagentSnapshotDto::from_snapshot(
+            snap,
+            "p".into(),
+            "c".into(),
+            Default::default(),
+            None,
+        );
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(json.get("status"), Some(&serde_json::json!("cancelled")));
         assert!(json.get("cancelReason").is_none());
@@ -788,6 +800,7 @@ mod tests {
                 "parent-1".into(),
                 "child-1".into(),
                 Default::default(),
+                Some("tool-call-live".into()),
             )),
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
@@ -802,6 +815,10 @@ mod tests {
         );
         assert_eq!(s.get("childSessionId"), Some(&serde_json::json!("child-1")));
         assert_eq!(s.get("turnCount"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            s.get("toolCallId"),
+            Some(&serde_json::json!("tool-call-live"))
+        );
         // Completed-only fields must be absent
         assert!(s.get("output").is_none());
         assert!(s.get("turns").is_none());
@@ -830,6 +847,7 @@ mod tests {
                 "parent-2".into(),
                 "child-2".into(),
                 Default::default(),
+                Some("tool-call-done".into()),
             )),
         };
         let json = serde_json::to_value(&resp).expect("should serialize");
@@ -837,6 +855,10 @@ mod tests {
             panic!("expected snapshot: {json}");
         };
         assert_eq!(s.get("status"), Some(&serde_json::json!("completed")));
+        assert_eq!(
+            s.get("toolCallId"),
+            Some(&serde_json::json!("tool-call-done"))
+        );
         assert_eq!(
             s.get("output"),
             Some(&serde_json::json!("Refactored 3 files."))
@@ -903,6 +925,7 @@ mod tests {
             "parent".into(),
             "child-resumed".into(),
             provenance,
+            None,
         );
         let json = serde_json::to_value(&dto).expect("should serialize");
         assert_eq!(

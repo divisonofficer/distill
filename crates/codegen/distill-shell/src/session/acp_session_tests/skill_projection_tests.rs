@@ -77,6 +77,10 @@ where
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
+            // The test actor is pinned to a mode, where the default shadow pack would put the
+            // mode question on the P6 request; these tests script P6 alone (shadow packs have
+            // their own tests in `jev_shadow_packs`).
+            crate::jev_shadow::set_test_switches(Some(false), None);
             let (gateway_tx, _) =
                 tokio::sync::mpsc::unbounded_channel::<distill_acp_lib::AcpClientMessage>();
             let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
@@ -85,6 +89,7 @@ where
             test(actor).await;
             crate::jev::clear_test_decision_answers();
             crate::jev::clear_test_flags();
+            crate::jev_shadow::set_test_switches(None, None);
         })
         .await;
 }
@@ -485,7 +490,7 @@ fn prelude_answers(parallel: f64) -> distill_workspace::jev::JevAnswerSet {
 }
 
 /// Gives the session a worker model (or none), as a primary session gets one.
-fn set_worker_model(actor: &SessionActor, worker: Option<&str>) {
+pub(super) fn set_worker_model(actor: &SessionActor, worker: Option<&str>) {
     let agent = {
         let base = actor.agent.borrow();
         let mut context = base.prompt_context().clone();
@@ -590,6 +595,87 @@ async fn jev_b6_suggestion_adds_the_hint_exactly_once_with_the_flag_on() {
                 ["<delegation_hint>This request has independent parts: split them into narrow subagent assignments and launch them together in one message.</delegation_hint>"]
             );
             assert_eq!(b6_decisions("b6-flag-on"), ["delegate"]);
+        })
+        .await;
+    })
+    .await;
+}
+
+/// Multi-step work without independent parts still goes to the cheaper
+/// worker: the hint says so in its own words, and one call gets no hint.
+#[tokio::test(flavor = "current_thread")]
+async fn jev_b6_hints_sequential_multi_step_work_but_not_a_single_call() {
+    with_actor(|actor| async move {
+        crate::jev::with_session_scope("b6-sequential", async {
+            crate::jev::set_test_flags(flags_with_b6(true));
+            set_worker_model(&actor, Some("worker-model"));
+            ask_about(&actor, "build a three.js view of the moon surface");
+            crate::jev::set_test_decision_answers([Some(prelude_answers(0.2))]);
+            actor
+                .jev_filter_tool_definitions(optional_family_defs(), false)
+                .await;
+            actor.jev_flush_delegation_hint().await;
+            let hints = delegation_hints(&actor).await;
+            assert_eq!(hints.len(), 1, "{hints:?}");
+            assert!(
+                hints[0].contains("hand the reading, editing and command work to a subagent")
+                    && !hints[0].contains("independent parts"),
+                "{hints:?}"
+            );
+
+            ask_about(&actor, "what does this flag do?");
+            let mut one_call = prelude_answers(0.2);
+            one_call.answers.insert(
+                "2:fits_single_call".to_owned(),
+                distill_workspace::jev::Answer::Noul { noul: 0.9 },
+            );
+            crate::jev::set_test_decision_answers([Some(one_call)]);
+            actor
+                .jev_filter_tool_definitions(optional_family_defs(), false)
+                .await;
+            actor.jev_flush_delegation_hint().await;
+            assert!(delegation_hints(&actor).await.is_empty());
+            assert_eq!(b6_decisions("b6-sequential"), ["delegate", "single"]);
+        })
+        .await;
+    })
+    .await;
+}
+
+/// The mid-turn reminder only reaches a session that can act on it: one
+/// whose prompt names a worker, in a mode that allows subagents, with the
+/// lever on. Anywhere else it would tell the model to use a tool it lacks.
+#[tokio::test(flavor = "current_thread")]
+async fn hands_on_reminder_reaches_only_a_session_that_can_delegate() {
+    use distill_tool_types::{ExecutionMode, V2Modes};
+    with_actor(|actor| async move {
+        crate::jev::with_session_scope("b6-hands-on", async {
+            super::mode_policy::set_v2_modes_for_tests(Some(
+                V2Modes::default().with(ExecutionMode::Ultrafast),
+            ));
+            for (flag, worker, mode, reminded) in [
+                (true, Some("worker-model"), ExecutionMode::Normal, true),
+                (true, Some("worker-model"), ExecutionMode::Ultracode, true),
+                (true, None, ExecutionMode::Normal, false),
+                (true, Some("worker-model"), ExecutionMode::Ultrafast, false),
+                (false, Some("worker-model"), ExecutionMode::Normal, false),
+            ] {
+                crate::jev::set_test_flags(flags_with_b6(flag));
+                set_worker_model(&actor, worker);
+                actor.execution_mode.store(mode);
+                ask_about(&actor, "fix the renderer");
+                actor.flush_hands_on_reminder();
+                assert_eq!(
+                    delegation_hints(&actor).await.len(),
+                    usize::from(reminded),
+                    "flag={flag} worker={worker:?} {mode:?}"
+                );
+            }
+            assert_eq!(
+                b6_decisions("b6-hands-on"),
+                ["hands_on_reminder", "hands_on_reminder"]
+            );
+            super::mode_policy::set_v2_modes_for_tests(None);
         })
         .await;
     })
@@ -733,4 +819,200 @@ async fn ultrasave_narrows_descriptors_but_preserves_pins_and_catalog_recovery()
             assert!(pinned.rows.contains(&format!("/skills/{name}/SKILL.md")));
         }
     }).await;
+}
+
+/// A skill name the events must never carry.
+const SENTINEL_SKILL: &str = "sentinel-skill-9d2e";
+
+fn read_of(path: &str) -> distill_tools::types::output::ToolOutput {
+    use distill_tools::types::output::{FileContent, ReadFileOutput, ToolOutput};
+    ToolOutput::ReadFile(ReadFileOutput::FileContent(FileContent {
+        content: String::new(),
+        content_concise: None,
+        absolute_path: path.into(),
+        offset: None,
+        limit: None,
+        raw_output: String::new(),
+        total_lines: 0,
+        extracted_images: Vec::new(),
+    }))
+}
+
+fn skill_call(name: &str, success: bool) -> distill_tools::types::output::ToolOutput {
+    distill_tools::types::output::ToolOutput::Skill(
+        distill_tools::implementations::skills::skill::SkillOutput {
+            success,
+            tool_result: String::new(),
+            skill_name: name.to_owned(),
+            skill_message: None,
+            error: None,
+        },
+    )
+}
+
+/// Whether a skill hint is followed can only be measured against the base
+/// rate if the hint and every skill read are facts. A read counts when it is
+/// a catalog skill's path or a Skill call; the user's own named skill is not
+/// a ranking hint; and the skill name itself never reaches the events.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn ranked_hints_and_skill_reads_are_name_hashed_facts() {
+    with_actor(|actor| async move {
+        let skills = SKILLS
+            .iter()
+            .chain([&SENTINEL_SKILL])
+            .map(
+                |name| distill_tools::implementations::skills::types::SkillInfo {
+                    name: name.to_string(),
+                    description: format!("Does {name} things."),
+                    path: format!("/skills/{name}/SKILL.md"),
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .collect();
+        actor
+            .tool_bridge_handle()
+            .seed_skill_discovery(None, None, skills, None, None, None, Default::default())
+            .await;
+        crate::jev::set_test_decision_answers([
+            Some(ranking(SENTINEL_SKILL, 0.85, [0.9, 0.9, 0.1])),
+            Some(ranking("slides", 0.85, [0.1, 0.1, 0.9])),
+        ]);
+        let session_id = actor.session_info.id.0.to_string();
+        let text = crate::jev::session_events_text_for_test(&session_id, async {
+            let hint = actor
+                .jev_skill_relevance_hint("build the thing")
+                .await
+                .expect("hint");
+            assert!(hint.contains(SENTINEL_SKILL), "{hint}");
+            let none = actor
+                .jev_skill_relevance_hint("explain what a monad is")
+                .await
+                .expect("hint");
+            assert!(none.contains("No skill"), "{none}");
+            let named = actor
+                .jev_skill_relevance_hint("run /graphify on the docs folder")
+                .await
+                .expect("hint");
+            assert!(named.contains("The user named"), "{named}");
+            let path = format!("/skills/{SENTINEL_SKILL}/SKILL.md");
+            actor
+                .note_tool_outcome_facts("read_file", &read_of(&path))
+                .await;
+            actor
+                .note_tool_outcome_facts("read_file", &read_of("/docs/notes/SKILL.md"))
+                .await;
+            actor
+                .note_tool_outcome_facts("read_file", &read_of("/repo/src/main.rs"))
+                .await;
+            actor
+                .note_tool_outcome_facts("skill", &skill_call("pdf", true))
+                .await;
+            actor
+                .note_tool_outcome_facts("skill", &skill_call("brand", false))
+                .await;
+        })
+        .await;
+        let facts = |kind: &str| -> Vec<serde_json::Value> {
+            text.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["type"] == kind)
+                .collect()
+        };
+        let suggested = facts("skill_suggested");
+        assert_eq!(suggested.len(), 1, "only the ranked hint: {text}");
+        assert_eq!(
+            suggested[0]["name_hash"],
+            crate::jev::outcome_hash(SENTINEL_SKILL)
+        );
+        let read: Vec<_> = facts("skill_read")
+            .into_iter()
+            .map(|event| event["name_hash"].clone())
+            .collect();
+        assert_eq!(
+            read,
+            [
+                crate::jev::outcome_hash(SENTINEL_SKILL),
+                crate::jev::outcome_hash("pdf")
+            ],
+            "the catalog path and the successful Skill call only: {text}"
+        );
+        // The P6 `jev_decision` line names its options (skill names) by id;
+        // the facts themselves never carry the name.
+        for line in text
+            .lines()
+            .filter(|line| !line.contains("\"type\":\"jev_decision\""))
+        {
+            assert!(!line.contains(SENTINEL_SKILL), "{line}");
+        }
+    })
+    .await;
+}
+
+fn flags_with_f1(on: bool) -> distill_workspace::jev::JevFlags {
+    distill_workspace::jev::JevFlags {
+        f1_followup_label: on,
+        ..distill_workspace::jev::JevFlags::harness_default()
+    }
+}
+
+/// The question ids of the one turn-start request a pass over `request` sent.
+async fn turn_start_ids(actor: &SessionActor, request: &str, followup: f64) -> Vec<String> {
+    use distill_workspace::jev::Answer;
+    let mut answers = family_answers(0.02, 0.01);
+    answers.answers.insert(
+        "3:reports_previous_result_wrong".to_owned(),
+        Answer::Noul { noul: followup },
+    );
+    ask_about(actor, request);
+    crate::jev::set_test_decision_answers([Some(answers)]);
+    let _ = crate::jev::take_test_asked_questions();
+    actor
+        .jev_filter_tool_definitions(optional_family_defs(), false)
+        .await;
+    let mut asked = crate::jev::take_test_asked_questions();
+    assert_eq!(asked.len(), 1, "one turn-start request: {asked:?}");
+    asked.remove(0)
+}
+
+/// With `f1_followup_label` off a message right after a turn sends the
+/// turn-start request without the lever's question; with it on (the
+/// default), that request also asks whether the message reports the previous
+/// result as wrong, and only the label is recorded. A message with no recent
+/// turn end is never asked.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn the_followup_question_rides_the_turn_start_request_only_when_on() {
+    with_actor(|actor| async move {
+        crate::jev::with_session_scope("f1-followup", async {
+            crate::jev::set_test_flags(flags_with_f1(false));
+            let today = turn_start_ids(&actor, "fix the parser", 0.9).await;
+            actor.jev_ledger.borrow_mut().last_request_end = Some(std::time::Instant::now());
+            let off = turn_start_ids(&actor, "that is still broken", 0.9).await;
+            assert_eq!(off, today, "lever off: the request is unchanged");
+            assert!(!off.iter().any(|id| id.starts_with("3:")), "{off:?}");
+
+            crate::jev::set_test_flags(distill_workspace::jev::JevFlags::harness_default());
+            let on = turn_start_ids(&actor, "the parser still fails", 0.9).await;
+            let expected: Vec<String> = today
+                .iter()
+                .cloned()
+                .chain(["3:reports_previous_result_wrong".to_owned()])
+                .collect();
+            assert_eq!(on, expected);
+
+            actor.jev_ledger.borrow_mut().last_request_end = None;
+            let cold = turn_start_ids(&actor, "now add a feature", 0.9).await;
+            assert_eq!(cold, today, "no recent turn end, no question");
+            let labels: Vec<String> = crate::jev::recorded_decisions_for_test("f1-followup")
+                .into_iter()
+                .filter(|(lever, _)| lever == "f1_followup_label")
+                .map(|(_, decision)| decision)
+                .collect();
+            assert_eq!(labels, ["reports_problem"]);
+        })
+        .await;
+    })
+    .await;
 }

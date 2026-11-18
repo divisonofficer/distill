@@ -1,3 +1,9 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Postudio: real host names, tailnet name, logins and fleet secrets stay local
+plan/research-base/LOCAL.md
+*.local.md
+.postudio/
+target-node/

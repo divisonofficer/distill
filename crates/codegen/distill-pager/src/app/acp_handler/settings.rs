@@ -438,6 +438,36 @@ pub(super) fn notify_sessions_leave_auto(app: &AppView, session_ids: &[acp::Sess
     let _ = app.acp_tx.send(args.into());
 }
 
+/// Handle an agent→client `x.ai/yolo_mode_changed` echo for one session (`sessionId` set).
+/// Applies the shell's resulting state to that session only: no outbound notification, no `[ui] permission_mode` write, no global mirror change.
+/// Messages without `sessionId`, or for a session this client does not hold, are ignored.
+pub(super) fn handle_session_mode_changed(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    let Ok(params) = serde_json::from_str::<serde_json::Value>(notif.params.get()) else {
+        tracing::warn!("Failed to parse x.ai/yolo_mode_changed");
+        return false;
+    };
+    let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let sid = acp::SessionId::new(session_id.to_owned());
+    let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+        return false;
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return false;
+    };
+    let yolo = params.get("yolo_mode").and_then(|v| v.as_bool());
+    let auto = params.get("auto_mode").and_then(|v| v.as_bool());
+    if let Some(yolo) = yolo {
+        agent.session.yolo_mode = yolo;
+    }
+    if let Some(auto) = auto {
+        agent.session.auto_mode =
+            crate::app::dispatch::effective_auto(agent.session.is_yolo(), auto);
+    }
+    yolo.is_some() || auto.is_some()
+}
+
 /// Handle `x.ai/sessions/changed`: the leader broadcasts roster upserts/removals to all clients (FleetView dashboard).
 pub(super) fn handle_sessions_changed(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     let Ok(changed) = serde_json::from_str::<crate::app::roster::RosterChanged>(notif.params.get())

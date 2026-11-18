@@ -217,6 +217,23 @@ pub(crate) fn resolve_dock_enabled(remote: Option<bool>) -> bool {
     sources.remote = remote;
     Feature::Dock.resolve(sources).value
 }
+/// Shown at the top of a session that starts with Code Mode on.
+pub(crate) const CODE_MODE_NOTICE: &str = "Code Mode (experimental) is on · turn it off with `[features] code_mode = false`";
+/// Whether a session this process starts gets Code Mode. Registry precedence: pin, `GROK_CODE_MODE`, config, default on.
+/// Read when a session starts, from the sources the session itself resolves the feature from.
+pub(crate) fn code_mode_enabled() -> bool {
+    use distill_shell::agent::config::{Feature, FeatureSources};
+    let flag_in = |layer: &toml::Value| layer.get("features")?.get(Feature::CodeMode.key())?.as_bool();
+    let mut sources = FeatureSources::from_process_env(Feature::CodeMode);
+    sources.pin = distill_config::load_merged_requirements()
+        .as_ref()
+        .and_then(flag_in);
+    sources.config = distill_shell::config::load_effective_config()
+        .ok()
+        .as_ref()
+        .and_then(flag_in);
+    Feature::CodeMode.resolve(sources).value
+}
 fn terminal_theme_flag_in(layer: &toml::Value) -> Option<bool> {
     layer
         .get("features")?
@@ -1253,10 +1270,11 @@ fn print_exit_resume_hint(info: &ExitInfo, max_width: usize, w: &mut impl Write)
         let _ = writeln!(w);
     }
     let _ = writeln!(w, "Resume this session with:");
+    let cli = cli::CLI_COMMAND;
     if info.minimal {
-        let _ = writeln!(w, "  grok --minimal --resume {}", info.session_id);
+        let _ = writeln!(w, "  {cli} --minimal --resume {}", info.session_id);
     } else {
-        let _ = writeln!(w, "  grok --resume {}", info.session_id);
+        let _ = writeln!(w, "  {cli} --resume {}", info.session_id);
     }
 }
 /// Screen-mode relaunch failure fallback (same quit tail as plain resume).
@@ -2304,7 +2322,7 @@ mod tests {
         print_exit_resume_hint(&bare_exit_info("sess-abc", false), 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\nResume this session with:\n  grok --resume sess-abc\n"
+            "\nResume this session with:\n  distill --resume sess-abc\n"
         );
     }
     #[test]
@@ -2313,7 +2331,7 @@ mod tests {
         print_exit_resume_hint(&bare_exit_info("sess-abc", true), 80, &mut buf);
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\nResume this session with:\n  grok --minimal --resume sess-abc\n"
+            "\nResume this session with:\n  distill --minimal --resume sess-abc\n"
         );
     }
     #[test]
@@ -2338,7 +2356,7 @@ mod tests {
                 "  Pinned the seed; 200 consecutive green runs.\n",
                 "\n",
                 "Resume this session with:\n",
-                "  grok --resume sess-abc\n",
+                "  distill --resume sess-abc\n",
             )
         );
     }
@@ -2359,7 +2377,7 @@ mod tests {
         assert!(out.contains(&format!("\n{}…\n", "t".repeat(19))));
         assert!(out.contains(&format!("\n> {}…\n", "p".repeat(17))));
         assert!(out.contains(&format!("\n  {}…\n", "r".repeat(17))));
-        assert!(out.contains("  grok --resume sess-abc\n"));
+        assert!(out.contains("  distill --resume sess-abc\n"));
     }
     #[test]
     fn print_relaunch_failure_hint_writes_expected_lines() {

@@ -329,6 +329,38 @@ impl SessionHandle {
         }
         rx.await.unwrap_or(Err("session actor died".to_string()))
     }
+    pub(crate) async fn kill_background_task_scoped(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> distill_tools::types::KillOutcome {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SessionCommand::KillBackgroundTaskScoped {
+                session_id: session_id.to_string(),
+                task_id: task_id.to_string(),
+                respond_to: tx,
+            })
+            .is_err()
+        {
+            return distill_tools::types::KillOutcome::NotFound;
+        }
+        rx.await
+            .unwrap_or(distill_tools::types::KillOutcome::NotFound)
+    }
+
+    pub(crate) async fn scoped_kill_supported(&self) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(SessionCommand::ScopedKillSupported { respond_to: tx })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
     pub(crate) async fn persist_resume_status(&self) {
         let (tx, rx) = oneshot::channel();
         if self

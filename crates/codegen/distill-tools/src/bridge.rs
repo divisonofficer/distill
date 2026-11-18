@@ -632,6 +632,23 @@ impl ToolBridge {
         }
     }
 
+    pub async fn kill_background_task_scoped(
+        &self,
+        session_id: &str,
+        task_id: &str,
+    ) -> KillOutcome {
+        match &self.terminal {
+            Some(terminal) => terminal.kill_task_scoped(session_id, task_id).await,
+            None => KillOutcome::NotFound,
+        }
+    }
+
+    pub fn scoped_kill_supported(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.scoped_kill_supported())
+    }
+
     /// Gives the output of all terminal tasks which are managed by the tool bridge
     pub async fn list_tasks(&self) -> Option<Vec<TaskSnapshot>> {
         if let Some(terminal) = &self.terminal {

@@ -21,7 +21,7 @@ use crate::app::agent::{AgentCommand, AgentId, AgentState};
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::app::cancel_latency::TurnEnd;
-use crate::notifications::{NotificationEvent, NotificationEventKind};
+use crate::notifications::{NotificationEvent, NotificationEventKind, TurnOutcome};
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{MemoryCommandKind, SessionEvent};
 use crate::slash::command::DoctorRequest;
@@ -1631,6 +1631,19 @@ pub(super) fn handle_prompt_response(
             }
             _ => None,
         };
+
+        // OSC 7501: record how the turn ended; the next at-rest update reports done/error/idle to the terminal host
+        let turn_outcome = match (&result, was_cancelling) {
+            (_, true) => TurnOutcome::Cancelled,
+            (Ok(_), false) => TurnOutcome::Completed,
+            (Err(_), false) => TurnOutcome::Failed,
+        };
+        let outcome_msg = match turn_outcome {
+            TurnOutcome::Cancelled => None,
+            _ => notification.as_ref().map(|(_, body)| body.as_str()),
+        };
+        app.notification_service
+            .note_turn_finished(turn_outcome, outcome_msg);
 
         let was_bash_turn = agent.bash_turn;
         finish_turn_view(agent, TurnEnd::Completed);

@@ -79,6 +79,7 @@ fn spawn_ctx(parent_cwd: PathBuf) -> SubagentSpawnContext {
         video_gen_config: Default::default(),
         app_builder_deployer_config: Default::default(),
         write_file_enabled: true,
+        code_mode_enabled: false,
         active_agent_messages_enabled: false,
         goal_enabled: false,
         background_workflows_enabled: false,
@@ -245,6 +246,7 @@ pub async fn spawn_isolated_subagent_for_e2e(
     let id = uuid::Uuid::now_v7().to_string();
     let mut request = SubagentRequest {
         jev_worker_ok: false,
+        tool_call_id: None,
         id: id.clone(),
         prompt: String::new(),
         description: "grove-e2e isolated".into(),

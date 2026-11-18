@@ -1,6 +1,8 @@
 // Modified for Distill by Samuel Fajreldines, 2026.
 use serde::{Deserialize, Serialize};
 
+use super::program_status::DEFAULT_PROGRAM_STATUS_APP;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
@@ -18,6 +20,11 @@ pub struct NotificationConfig {
     /// This is a short debounce against quick tab blips.
     /// The authoritative timing (at least 3 minutes since the last completed turn) is enforced agent-side.
     pub session_recap_threshold_secs: u64,
+    /// Report agent state (idle/working/blocked/done/error) to the terminal via the Program Status
+    /// Protocol (OSC 7501), so hosts like Orca keep the pane recognized as an agent between turns.
+    pub program_status: bool,
+    /// `app` id sent with OSC 7501 reports. `grok-build` makes Orca show Distill as a Grok agent.
+    pub program_status_app: String,
     pub title: TitleConfig,
     pub hooks: Vec<NotificationHook>,
 }
@@ -36,6 +43,8 @@ impl Default for NotificationConfig {
             progress_bar: true,
             session_recap: true,
             session_recap_threshold_secs: 30,
+            program_status: true,
+            program_status_app: DEFAULT_PROGRAM_STATUS_APP.to_owned(),
             title: TitleConfig::default(),
             hooks: Vec::new(),
         }
@@ -164,6 +173,11 @@ session_recap = true
 # debounce against quick tab blips. The \"3 min since the last turn\" timing is
 # enforced agent-side.
 session_recap_threshold_secs = 30
+# Report agent state to the terminal via OSC 7501 (Program Status Protocol) so
+# hosts such as Orca keep this pane recognized as an agent while it is idle too.
+program_status = true
+# `app` id sent with those reports. \"grok-build\" maps to Orca's Grok agent.
+program_status_app = \"grok-build\"
 
 [ui.notifications.title]
 # Set the terminal/tab title to reflect agent state.
@@ -200,6 +214,8 @@ mod tests {
             progress_bar: false,
             session_recap: false,
             session_recap_threshold_secs: 90,
+            program_status: false,
+            program_status_app: "distill".into(),
             title: TitleConfig {
                 enabled: false,
                 items: vec![TitleItem::Distill, TitleItem::Cwd],
@@ -236,6 +252,8 @@ mod tests {
         assert!(parsed.progress_bar);
         assert!(parsed.session_recap);
         assert_eq!(parsed.session_recap_threshold_secs, 30);
+        assert!(parsed.program_status);
+        assert_eq!(parsed.program_status_app, "grok-build");
         assert!(parsed.title.enabled);
         assert!(parsed.hooks.is_empty());
     }

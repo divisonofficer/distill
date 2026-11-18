@@ -1814,6 +1814,174 @@ async fn yolo_toggle_can_disable_session_started_with_yolo_enabled() {
         "other client's session must keep its previous yolo state"
     );
 }
+/// Drain every command currently queued on a test session mailbox.
+fn drain_session_commands(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::session::SessionCommand>,
+) -> Vec<crate::session::SessionCommand> {
+    let mut cmds = Vec::new();
+    while let Ok(cmd) = rx.try_recv() {
+        cmds.push(cmd);
+    }
+    cmds
+}
+fn yolo_mode_changed(params: serde_json::Value) -> acp::ExtNotification {
+    let raw = serde_json::value::to_raw_value(&params).expect("serialize yolo_mode_changed params");
+    acp::ExtNotification::new("x.ai/yolo_mode_changed", raw.into())
+}
+/// Postudio: a `sessionId` in `x.ai/yolo_mode_changed` scopes the YOLO change to that session.
+/// A multiplexing client owns every session on one connection, so the client-wide scope would flip them all.
+#[tokio::test(flavor = "current_thread")]
+async fn yolo_mode_changed_with_session_id_updates_only_that_session() {
+    use acp::Agent as _;
+    let agent = build_minimal_agent_for_tests();
+    let sid_a = acp::SessionId::new("sess-scope-a");
+    let sid_b = acp::SessionId::new("sess-scope-b");
+    let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    agent
+        .ext_notification(yolo_mode_changed(
+            serde_json::json!({ "yolo_mode": true, "sessionId": "sess-scope-a" }),
+        ))
+        .await
+        .expect("session-scoped yolo notification must be handled");
+    let a = drain_session_commands(&mut rx_a);
+    assert!(
+        matches!(
+            a.as_slice(),
+            [crate::session::SessionCommand::SetYoloMode { enabled: true }]
+        ),
+        "target session must get exactly SetYoloMode(true)"
+    );
+    assert!(
+        drain_session_commands(&mut rx_b).is_empty(),
+        "a session outside the sessionId scope must not be touched"
+    );
+}
+/// Postudio: the auto permission mode (on and back off) honours the same `sessionId` scope.
+#[tokio::test(flavor = "current_thread")]
+async fn auto_mode_changed_with_session_id_updates_only_that_session() {
+    use acp::Agent as _;
+    let agent = build_minimal_agent_for_tests();
+    let sid_a = acp::SessionId::new("sess-auto-a");
+    let sid_b = acp::SessionId::new("sess-auto-b");
+    let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    for (mode, enabled) in [("auto", true), ("ask", false)] {
+        agent
+            .ext_notification(yolo_mode_changed(
+                serde_json::json!({ "permission_mode": mode, "sessionId": "sess-auto-a" }),
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("permission_mode={mode} notification failed: {e}"));
+        let a = drain_session_commands(&mut rx_a);
+        assert!(
+            matches!(
+                a.as_slice(),
+                [crate::session::SessionCommand::SetAutoMode { enabled: got }] if *got == enabled
+            ),
+            "permission_mode={mode}: target session must get exactly SetAutoMode({enabled})"
+        );
+        assert!(
+            drain_session_commands(&mut rx_b).is_empty(),
+            "permission_mode={mode}: a session outside the sessionId scope must not be touched"
+        );
+    }
+}
+/// Without `sessionId` the notification keeps its previous client-wide reach.
+#[tokio::test(flavor = "current_thread")]
+async fn yolo_mode_changed_without_session_id_keeps_client_wide_scope() {
+    use acp::Agent as _;
+    let agent = build_minimal_agent_for_tests();
+    let sid_a = acp::SessionId::new("sess-wide-a");
+    let sid_b = acp::SessionId::new("sess-wide-b");
+    let (handle_a, _tx_a, mut rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, mut rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    agent
+        .ext_notification(yolo_mode_changed(serde_json::json!({ "yolo_mode": false })))
+        .await
+        .expect("client-wide yolo notification must be handled");
+    for (label, rx) in [("a", &mut rx_a), ("b", &mut rx_b)] {
+        assert!(
+            matches!(
+                drain_session_commands(rx).as_slice(),
+                [crate::session::SessionCommand::SetYoloMode { enabled: false }]
+            ),
+            "session {label} must still be updated when no sessionId is given"
+        );
+    }
+}
+/// Collects the params of each `x.ai/yolo_mode_changed` notification forwarded to the gateway.
+fn drain_yolo_mode_changed(
+    gw_rx: &mut tokio::sync::mpsc::UnboundedReceiver<distill_acp_lib::AcpClientMessage>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    while let Ok(msg) = gw_rx.try_recv() {
+        if let distill_acp_lib::AcpClientMessage::ExtNotification(args) = msg
+            && args.request.method.as_ref() == "x.ai/yolo_mode_changed"
+        {
+            out.push(serde_json::from_str(args.request.params.get()).expect("json params"));
+        }
+    }
+    out
+}
+/// Postudio: a session-scoped change echoes the resulting state to that session's subscribers.
+#[tokio::test(flavor = "current_thread")]
+async fn session_scoped_mode_change_emits_notification_for_that_session() {
+    use acp::Agent as _;
+    let (agent, mut gw_rx) = build_agent_with_gateway_rx();
+    let sid_a = acp::SessionId::new("sess-emit-a");
+    let sid_b = acp::SessionId::new("sess-emit-b");
+    let (handle_a, _tx_a, _rx_a) = make_live_session_handle(&sid_a, None);
+    let (handle_b, _tx_b, _rx_b) = make_live_session_handle(&sid_b, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent.insert_resident(&sid_b, handle_b);
+    agent
+        .ext_notification(yolo_mode_changed(
+            serde_json::json!({ "yolo_mode": true, "sessionId": "sess-emit-a" }),
+        ))
+        .await
+        .expect("session-scoped yolo notification must be handled");
+    let emitted = drain_yolo_mode_changed(&mut gw_rx);
+    assert_eq!(emitted.len(), 1, "exactly one echo for the target session; got {emitted:?}");
+    assert_eq!(emitted[0].get("sessionId").and_then(|v| v.as_str()), Some("sess-emit-a"));
+    assert_eq!(emitted[0].get("yolo_mode"), Some(&serde_json::json!(true)));
+    assert!(emitted[0].get("auto_mode").is_none(), "yolo-only change must not carry auto_mode");
+    agent
+        .ext_notification(yolo_mode_changed(
+            serde_json::json!({ "permission_mode": "auto", "sessionId": "sess-emit-a" }),
+        ))
+        .await
+        .expect("session-scoped auto notification must be handled");
+    let emitted = drain_yolo_mode_changed(&mut gw_rx);
+    assert_eq!(emitted.len(), 1, "exactly one echo for the auto change; got {emitted:?}");
+    assert_eq!(emitted[0].get("sessionId").and_then(|v| v.as_str()), Some("sess-emit-a"));
+    assert_eq!(emitted[0].get("yolo_mode"), Some(&serde_json::json!(false)));
+    assert_eq!(emitted[0].get("auto_mode"), Some(&serde_json::json!(true)));
+    assert_eq!(emitted[0].get("permission_mode"), Some(&serde_json::json!("auto")));
+}
+/// The client-wide scope (no `sessionId`) emits no per-session echo.
+#[tokio::test(flavor = "current_thread")]
+async fn client_wide_mode_change_emits_no_session_notification() {
+    use acp::Agent as _;
+    let (agent, mut gw_rx) = build_agent_with_gateway_rx();
+    let sid_a = acp::SessionId::new("sess-wide-emit-a");
+    let (handle_a, _tx_a, _rx_a) = make_live_session_handle(&sid_a, None);
+    agent.insert_resident(&sid_a, handle_a);
+    agent
+        .ext_notification(yolo_mode_changed(serde_json::json!({ "yolo_mode": true })))
+        .await
+        .expect("client-wide yolo notification must be handled");
+    assert!(
+        drain_yolo_mode_changed(&mut gw_rx).is_empty(),
+        "client-wide change must not emit a session echo"
+    );
+}
 /// `drain_old_session_thread` returns immediately when the thread has already finished.
 #[tokio::test]
 async fn drain_finished_thread_returns_immediately() {
@@ -3358,6 +3526,43 @@ async fn resident_activity_reports_needs_input_when_pending() {
     assert_eq!(entry.activity, RosterActivity::NeedsInput);
     pending.lock().unwrap().clear();
     assert_eq!(agent.resident_activity(&sid), RosterActivity::Working);
+}
+#[tokio::test]
+async fn resident_roster_reads_live_permission_modes() {
+    tokio::task::LocalSet::new().run_until(async {
+    use distill_workspace::permission::{ClientType, spawn_permission_manager};
+    use distill_workspace::permission::types::PermissionConfig;
+
+    let agent = build_minimal_agent_for_tests();
+    let sid = acp::SessionId::new("sess-live-permission-modes");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let cwd = distill_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp"))
+        .expect("absolute cwd");
+    let (permission_handle, _events_rx) = spawn_permission_manager(
+        sid.clone(),
+        GatewaySender::new(tx),
+        cwd,
+        ClientType::Generic,
+        Some(PermissionConfig::new(Vec::new())),
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+    );
+    let mut handle = make_test_handle("grok-3", false, None);
+    handle.permission_handle = permission_handle.clone();
+    agent.insert_resident(&sid, handle);
+
+    permission_handle.set_auto_mode(true);
+    let entry = agent.resident_roster_entry(&sid).expect("resident entry");
+    assert!(!entry.yolo);
+    assert!(entry.auto_mode);
+
+    permission_handle.set_yolo_mode(true);
+    let entry = agent.resident_roster_entry(&sid).expect("resident entry");
+    assert!(entry.yolo);
+    assert!(!entry.auto_mode);
+    }).await;
 }
 /// Drain the agent gateway, returning the first `x.ai/sessions/changed` payload that carries an upserted entry.
 /// Unrelated notifications parse into an empty `RosterChanged` and are ignored.

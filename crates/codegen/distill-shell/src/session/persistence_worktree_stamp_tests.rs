@@ -3,9 +3,7 @@ use agent_client_protocol as acp;
 use distill_test_support::EnvGuard;
 use serial_test::serial;
 
-use super::{
-    ExplicitSessionIdentity, Summary, default_model_id, new_with_explicit_dir,
-};
+use super::{ExplicitSessionIdentity, Summary, default_model_id, new_with_explicit_dir};
 use crate::session::info::Info;
 
 fn worktree_cwd_under(home: &std::path::Path) -> String {
@@ -168,7 +166,10 @@ async fn a_subagent_session_is_titled_by_its_description_without_a_model() {
     .await
     .unwrap();
     let summary = flushed_summary(&persistence, &target_dir).await;
-    assert_eq!(summary.generated_title.as_deref(), Some("Audit the recap path"));
+    assert_eq!(
+        summary.generated_title.as_deref(),
+        Some("Audit the recap path")
+    );
     assert!(!summary.title_is_manual);
     drop(persistence);
 
@@ -182,5 +183,57 @@ async fn a_subagent_session_is_titled_by_its_description_without_a_model() {
     .await
     .unwrap();
     let summary = flushed_summary(&woken, &target_dir).await;
-    assert_eq!(summary.generated_title.as_deref(), Some("Audit the recap path"));
+    assert_eq!(
+        summary.generated_title.as_deref(),
+        Some("Audit the recap path")
+    );
+}
+
+#[tokio::test]
+async fn explicit_subagent_parent_is_persisted_and_preserved_on_wake() {
+    let home = tempfile::TempDir::new().unwrap();
+    let target_dir = home.path().join("child-session");
+    let info = Info {
+        id: acp::SessionId::new("subagent-parent-metadata"),
+        cwd: home.path().to_string_lossy().into_owned(),
+    };
+    let persistence = super::new_with_explicit_dir_with_parent(
+        &info,
+        target_dir.clone(),
+        default_model_id(),
+        "test subagent".to_owned(),
+        crate::session::persistence::ExplicitSessionOpen::New {
+            identity: None,
+            next_trace_turn: None,
+        },
+        Some("parent-session"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        flushed_summary(&persistence, &target_dir)
+            .await
+            .parent_session_id
+            .as_deref(),
+        Some("parent-session")
+    );
+    drop(persistence);
+
+    let woken = super::new_with_explicit_dir_with_parent(
+        &info,
+        target_dir.clone(),
+        default_model_id(),
+        "test subagent".to_owned(),
+        crate::session::persistence::ExplicitSessionOpen::Wake,
+        Some("different-parent"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        flushed_summary(&woken, &target_dir)
+            .await
+            .parent_session_id
+            .as_deref(),
+        Some("parent-session")
+    );
 }

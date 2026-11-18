@@ -312,8 +312,7 @@ struct SoakRunner {
 
 impl ChildRunner for SoakRunner {
     type Control = SoakControl;
-    type RootControl =
-        distill_tools::implementations::distill::task::root_control::NoRootControl;
+    type RootControl = distill_tools::implementations::distill::task::root_control::NoRootControl;
     type CompletionData = ();
     type RunFuture = LocalBoxFuture<ChildRunOutput<()>>;
     type ValidateFuture = LocalBoxFuture<SubagentValidateTypeOutcome>;
@@ -412,6 +411,7 @@ impl ChildRunner for SoakRunner {
 fn soak_request(id: String, background: bool) -> SubagentRequest {
     SubagentRequest {
         jev_worker_ok: false,
+        tool_call_id: None,
         id,
         prompt: "soak work".to_owned(),
         description: "soak child".to_owned(),

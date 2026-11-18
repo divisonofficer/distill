@@ -863,6 +863,7 @@ fn child_completion_settlement_preserves_output_and_parent_usage() {
                                     traceparent: None,
                                     json_schema: None,
                                     send_now: false,
+                                    strict_queue: false,
                                     admission: None,
                                     tool_overrides_update: None,
                                     respond_to: wake_reply,
@@ -2208,11 +2209,14 @@ async fn ultracode_nested_shell_inherits_distinct_shared_cwd_without_reparenting
             });
             ctx.fs = Arc::new(distill_workspace::file_system::LocalFs::new(root.clone()));
             let root_fs = ctx.fs.clone();
-            let enabled = Arc::new(distill_tool_types::AtomicExecutionMode::new(distill_tool_types::ExecutionMode::Ultracode));
+            let enabled = Arc::new(distill_tool_types::AtomicExecutionMode::new(
+                distill_tool_types::ExecutionMode::Ultracode,
+            ));
             let policy = ExecutionPolicy {
                 mode: enabled.clone(),
                 max_depth: 2,
                 off_max_depth: 3,
+                v2: Default::default(),
                 capability_ceiling: None,
                 allowed_subagent_types: None,
             };
@@ -2284,13 +2288,22 @@ async fn ultracode_nested_shell_inherits_distinct_shared_cwd_without_reparenting
             assert_eq!(root_fs.root(), root.as_path());
             assert_eq!(child.fs.read_file("marker").await.unwrap(), b"ordinary");
             let inherited = child.execution_mode.as_ref().expect("inherited mode");
-            assert!(Arc::ptr_eq(inherited, &child.execution_policy.as_ref().unwrap().mode));
+            assert!(Arc::ptr_eq(
+                inherited,
+                &child.execution_policy.as_ref().unwrap().mode
+            ));
             enabled.store_auto(distill_tool_types::ExecutionMode::Ultracode);
             assert!(inherited.pick_auto(distill_tool_types::ExecutionMode::Ultrafast));
             assert_eq!(enabled.load(), distill_tool_types::ExecutionMode::Ultracode);
-            assert_eq!(inherited.load(), distill_tool_types::ExecutionMode::Ultrafast);
+            assert_eq!(
+                inherited.load(),
+                distill_tool_types::ExecutionMode::Ultrafast
+            );
             enabled.store(distill_tool_types::ExecutionMode::Ultrasave);
-            assert_eq!(inherited.load(), distill_tool_types::ExecutionMode::Ultrasave);
+            assert_eq!(
+                inherited.load(),
+                distill_tool_types::ExecutionMode::Ultrasave
+            );
             child
                 .fs
                 .write_file("descendant.txt", b"verified")
@@ -2413,17 +2426,24 @@ async fn ultracode_durable_isolated_resume_is_a_leaf_with_mode_on_or_off() {
                 .await
                 .unwrap();
             server.set_response("isolated leaf completed");
-            let enabled = Arc::new(distill_tool_types::AtomicExecutionMode::new(distill_tool_types::ExecutionMode::Ultracode));
+            let enabled = Arc::new(distill_tool_types::AtomicExecutionMode::new(
+                distill_tool_types::ExecutionMode::Ultracode,
+            ));
             for (mode, resumed_source) in [
                 (true, &source_info),
                 (false, &source_info),
                 (true, &shared_source_info),
             ] {
-                enabled.store(if mode { distill_tool_types::ExecutionMode::Ultracode } else { distill_tool_types::ExecutionMode::Normal });
+                enabled.store(if mode {
+                    distill_tool_types::ExecutionMode::Ultracode
+                } else {
+                    distill_tool_types::ExecutionMode::Normal
+                });
                 let policy = ExecutionPolicy {
                     mode: enabled.clone(),
                     max_depth: 2,
                     off_max_depth: 3,
+                    v2: Default::default(),
                     capability_ceiling: None,
                     allowed_subagent_types: None,
                 };

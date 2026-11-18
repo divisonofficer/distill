@@ -447,7 +447,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 let _ = request.respond_to.send(summaries);
             }
             SubagentEvent::ListRunning(request) => {
-                self.handle_list_running(request.parent_session_id, request.respond_to);
+                self.handle_list_running(
+                    request.parent_session_id,
+                    request.include_completed,
+                    request.respond_to,
+                );
             }
             SubagentEvent::Completions(request) => {
                 // Suppressed owned completions stay buffered for the requester's next unsuppressed request

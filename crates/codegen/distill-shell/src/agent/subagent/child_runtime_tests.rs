@@ -138,6 +138,7 @@ impl ChildRunner for SnapshotProbeRunner {
 fn request() -> SubagentRequest {
     SubagentRequest {
         jev_worker_ok: false,
+        tool_call_id: None,
         id: "child".to_owned(),
         prompt: String::new(),
         description: String::new(),

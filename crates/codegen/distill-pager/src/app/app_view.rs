@@ -4628,6 +4628,11 @@ impl AppView {
     fn draw_inner(&mut self, terminal: &mut PagerTerminal) {
         self.resync_announcement_slash_gate_on_divergence();
         if self.screen_mode.is_minimal() {
+            // The minimal renderer never drains the notification queue: hand it to the shared, frame-ordered escape
+            // writer so the title, OSC 9;4 and OSC 7501 still reach the terminal and the queue cannot grow unbounded
+            if let Some(esc) = self.pending_notification_escapes.take() {
+                self.escape_writer.emit(esc);
+            }
             if let Some(hooks) = crate::minimal_hook::hooks() {
                 (hooks.draw)(self, terminal);
             }
@@ -5074,7 +5079,9 @@ impl AppView {
                                 }
                             }
                             self.welcome_on_auth_url = on_url;
-                            return (cursor, post_flush);
+                            // Title / OSC 9;4 / OSC 7501 escapes were already taken from the queue above; dropping them here
+                            // would lose them for good (each emitter dedupes against what it believes it sent)
+                            return (cursor, Self::merge_escapes(notif_escapes, post_flush));
                         }
                         ActiveView::Agent(id) => {
                             let overlay_focused = false;

@@ -1,0 +1,42 @@
+[package]
+license = "Apache-2.0"
+name = "distill-node"
+version = "0.1.0"
+edition.workspace = true
+description = "Postudio node: per-host gateway that serves the Postudio web app and multiplexes the local Distill agent (ACP) to web and TUI clients over the tailnet"
+
+# Standalone binary for now. It moves under `distill node` once the CLI seam in
+# distill-pager is free to edit (see plan/research-base/PLAN.md §4).
+[[bin]]
+name = "postudio-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+dunce = { workspace = true }
+futures-util = { workspace = true }
+gethostname = { workspace = true }
+reqwest = { workspace = true }
+ring = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "signal", "process", "io-util", "sync", "time", "fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+url = { workspace = true }
+urlencoding = { workspace = true }
+distill-version = { workspace = true }
+distill-extra-ca = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tower = { workspace = true }
+
+[lints]
+workspace = true

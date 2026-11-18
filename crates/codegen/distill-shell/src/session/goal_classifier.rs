@@ -10,6 +10,8 @@
 #![allow(dead_code)]
 
 pub(crate) mod evidence;
+pub(crate) mod turn_review;
+pub(crate) mod turn_snapshot;
 
 use crate::session::events::{Event, GoalClassifierFailOpenReason};
 use crate::session::goal_planner::{
@@ -72,6 +74,11 @@ const GOAL_CLASSIFIER_SUBAGENT_TYPE: &str = GOAL_ROLE_SUBAGENT_TYPE;
 const GOAL_CLASSIFIER_SUBAGENT_DESCRIPTION: &str = "goal achievement skeptic";
 
 const GOAL_VERIFIER_PROMPT_TEMPLATE: &str = include_str!("templates/goal_verifier_prompt.md");
+
+/// The UltraCode turn lens: one turn's patch judged against the user's request,
+/// refuting only for a defect, an unmet explicit requirement or a bad check.
+const TURN_REVIEW_PROMPT_TEMPLATE: &str =
+    include_str!("templates/ultracode_turn_review_prompt.md");
 
 /// Override via `GROK_GOAL_VERIFIER_N` (clamped 1..=5) or the remote `goal_verifier_count` setting.
 /// A lone outlier in either direction (one rubber-stamp or one false refute) cannot decide the outcome.
@@ -489,6 +496,7 @@ impl ChannelSpawner {
     ) -> Result<String, SpawnError> {
         let request = SubagentRequest {
             jev_worker_ok: false,
+            tool_call_id: None,
             id: id.to_string(),
             prompt,
             description: GOAL_CLASSIFIER_SUBAGENT_DESCRIPTION.to_string(),
@@ -711,7 +719,10 @@ impl Finding {
     /// A demonstrable defect in shipped behavior or a stub left in, as opposed
     /// to a missing test or piece of evidence (`gap`).
     fn is_defect(&self) -> bool {
-        matches!(self.kind.trim().to_ascii_lowercase().as_str(), "bug" | "todo")
+        matches!(
+            self.kind.trim().to_ascii_lowercase().as_str(),
+            "bug" | "todo"
+        )
     }
 
     fn is_empty(&self) -> bool {
@@ -1167,7 +1178,7 @@ const HARNESS_CHECK_EXCERPT_CHARS: usize = 800;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HarnessCheck {
     pub command: String,
-    pub passed: bool,
+    pub outcome: crate::session::acp_session::turn_facts::CheckOutcome,
     pub excerpt: String,
     pub finished_at: std::time::SystemTime,
 }
@@ -1180,6 +1191,7 @@ pub(crate) fn render_harness_checks(
     checks: &[HarnessCheck],
     last_change: Option<std::time::SystemTime>,
 ) -> String {
+    use crate::session::acp_session::turn_facts::CheckOutcome;
     if checks.is_empty() {
         return "(none recorded)\n".to_owned();
     }
@@ -1191,7 +1203,15 @@ pub(crate) fn render_harness_checks(
             Some(changed) if check.finished_at < changed => "stale",
             _ => "current",
         };
-        let outcome = if check.passed { "passed" } else { "failed" };
+        let outcome = match check.outcome {
+            CheckOutcome::Passed => "passed",
+            CheckOutcome::Failed => "failed",
+            // Neither a pass nor a failure: the verifier must not count it as
+            // either.
+            CheckOutcome::Unknown => {
+                "outcome unknown (a later stage owns the exit code and the output shows no runner verdict)"
+            }
+        };
         let skip = check
             .excerpt
             .chars()
@@ -1200,7 +1220,9 @@ pub(crate) fn render_harness_checks(
         let tail: String = check.excerpt.chars().skip(skip).collect();
         let command = evidence::sanitize_final_response(&check.command).replace('\n', " ");
         let tail = evidence::sanitize_final_response(tail.trim());
-        out.push_str(&format!("- `{command}` {outcome} ({freshness}); end of output:\n"));
+        out.push_str(&format!(
+            "- `{command}` {outcome} ({freshness}); end of output:\n"
+        ));
         for line in tail.lines() {
             out.push_str("    ");
             out.push_str(line);
@@ -1212,7 +1234,10 @@ pub(crate) fn render_harness_checks(
 
 /// Latest modification time among the delivered files, the reference point
 /// for whether a recorded check ran on the current code.
-async fn last_change_of(workspace_root: &Path, changed_files: &[String]) -> Option<std::time::SystemTime> {
+async fn last_change_of(
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Option<std::time::SystemTime> {
     let mut latest = None;
     for path in changed_files.iter().take(CHANGED_FILES_MTIME_MAX) {
         if let Ok(modified) = tokio::fs::metadata(workspace_root.join(path))
@@ -1547,7 +1572,8 @@ async fn run_one_skeptic(
 
     // Cold spawn: attempt 1, every idx >= 1, or a resume fallback.
     let render = |tn: &RoleToolNames| {
-        render_skeptic_prompt(
+        render_verifier_prompt(
+            inputs.template,
             inputs.objective,
             inputs.changes_ref,
             inputs.changed_files,
@@ -1614,6 +1640,8 @@ struct SkepticInputs<'a> {
     prior_gaps: Option<&'a str>,
     /// Rendered `HARNESS_CHECKS` section, shared by the panel.
     harness_checks: &'a str,
+    /// The cold skeptic prompt: the goal verifier or the turn lens.
+    template: &'static str,
 }
 
 /// Stage-level inputs threaded into [`run_verification_stage`].
@@ -1658,6 +1686,10 @@ pub(crate) struct VerificationStageInputs<'a> {
     pub inherit_tool_names: &'a RoleToolNames,
     /// Build, test and lint commands the harness recorded during the goal.
     pub harness_checks: &'a [HarnessCheck],
+    /// An UltraCode turn review: the turn's own patch, captured by the
+    /// caller, replaces the baseline capture and the turn lens replaces the
+    /// goal verifier prompt. `None` for a goal.
+    pub turn_changes: Option<&'a evidence::CapturedChanges>,
 }
 
 /// Outcome of [`run_verification_stage`] plus skeptic 0's child session id when an N > 1 panel ran, so the next attempt can resume it.
@@ -1669,6 +1701,9 @@ pub(crate) struct VerificationStageResult {
     /// The apply path overwrites the stored `skeptic0_session_id` only when this is set.
     /// A fail-open early-exit thus cannot sever the gatekeeper resume chain (an N == 1 run still clears the id deliberately).
     pub panel_ran: bool,
+    /// The rejection rests only on skeptics that failed to run or returned no
+    /// parsed verdict, so it names no gap anyone could fix.
+    pub refuted_by_failures_only: bool,
 }
 
 impl From<GoalClassifierOutcome> for VerificationStageResult {
@@ -1678,6 +1713,7 @@ impl From<GoalClassifierOutcome> for VerificationStageResult {
             outcome,
             skeptic0_session_id: None,
             panel_ran: false,
+            refuted_by_failures_only: false,
         }
     }
 }
@@ -1760,13 +1796,18 @@ pub(crate) async fn run_verification_stage(
     // `changed_files` comes from the FULL diff before truncation (plus untracked files)
     // The list stays complete even when the patch body is byte-capped
     let mut changed_files: Vec<String> = Vec::new();
-    let changes_written = match evidence::capture_changes_diff(
-        inputs.baseline_commit,
-        inputs.workspace_root,
-        inputs.goal_created_at,
-    )
-    .await
-    {
+    let captured = match inputs.turn_changes {
+        Some(changes) => Ok(changes.clone()),
+        None => {
+            evidence::capture_changes_diff(
+                inputs.baseline_commit,
+                inputs.workspace_root,
+                inputs.goal_created_at,
+            )
+            .await
+        }
+    };
+    let changes_written = match captured {
         Ok(captured) => {
             changed_files = captured.changed_files;
             match write_patch_file_atomic(&changes_path, &captured.diff).await {
@@ -1855,6 +1896,11 @@ pub(crate) async fn run_verification_stage(
         scratch_dir_ready: inputs.scratch_dir_ready,
         prior_gaps: inputs.prior_gaps,
         harness_checks: &harness_checks,
+        template: if inputs.turn_changes.is_some() {
+            TURN_REVIEW_PROMPT_TEMPLATE
+        } else {
+            GOAL_VERIFIER_PROMPT_TEMPLATE
+        },
     };
 
     // When N > 1, run skeptic 0 first: a high-confidence refute is decisive and can never yield Achieved.
@@ -1965,6 +2011,7 @@ pub(crate) async fn run_verification_stage(
             },
             skeptic0_session_id,
             panel_ran: true,
+            refuted_by_failures_only: false,
         };
     }
 
@@ -1995,10 +2042,14 @@ pub(crate) async fn run_verification_stage(
             gap_fingerprint,
         }
     };
+    let refuted_by_failures_only = results.iter().filter(|r| r.refuted).all(|r| {
+        r.fallback_note.is_some() && r.evidence.trim().is_empty() && r.findings.is_empty()
+    });
     VerificationStageResult {
         outcome,
         skeptic0_session_id,
         panel_ran: true,
+        refuted_by_failures_only,
     }
 }
 
