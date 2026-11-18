@@ -48,6 +48,7 @@ const drafts = new Map<string, Writable<string>>();
 const textDrafts = new Map<string, Writable<TextFileIn[]>>();
 const draftRevisions = new Map<string, number>();
 const selectedParents = new Map<string, string | null>();
+const automaticParents = new Set<string>();
 const composerModes = writable<Record<string, ChatComposerMode>>({});
 let nextDraftRevision = 0;
 let nextComposerModeToken = 0;
@@ -271,20 +272,44 @@ return true;
 
 export function setChatParent(chatId: string, parentId: string | null): void {
 selectedParents.set(chatId, parentId);
+automaticParents.delete(chatId);
 }
 
 export function advanceChatParentIfUnchanged(chatId: string, previousParentId: string | null, nextParentId: string): boolean {
-if (!selectedParents.has(chatId) || selectedParents.get(chatId) !== previousParentId) return false;
+if ((selectedParents.get(chatId) ?? null) !== previousParentId) return false;
 selectedParents.set(chatId, nextParentId);
+automaticParents.add(chatId);
 return true;
 }
 
 export function restoreChatParent(chatId: string, messages: ChatMessage[]): string {
 const selected = selectedParents.get(chatId);
 if (selected === null) return '';
-if (selected !== undefined) return selected;
+if (selected !== undefined) {
+if (!automaticParents.has(chatId)) return selected;
+const children = new Map<string, string[]>();
+for (const message of messages) {
+if (message.parentId === null) continue;
+const siblings = children.get(message.parentId) ?? [];
+siblings.push(message.messageId);
+children.set(message.parentId, siblings);
+}
+const visited = new Set<string>([selected]);
+let current = selected;
+while (true) {
+const next = children.get(current);
+if (!next || next.length !== 1 || visited.has(next[0])) break;
+current = next[0];
+visited.add(current);
+}
+selectedParents.set(chatId, current);
+return current;
+}
 const latest = latestChatLeaf(messages) ?? '';
-setChatParent(chatId, latest || null);
+if (latest) {
+selectedParents.set(chatId, latest);
+automaticParents.add(chatId);
+}
 return latest;
 }
 

@@ -96,6 +96,49 @@ assert.equal(chats.chatDisplayTitle({ ...chat, title: '' }, [{ ...messages[0], t
 assert.equal(chats.chatDisplayTitle(chat, [{ ...messages[0], text: 'a'.repeat(80) }]).length, 64);
 });
 
+test('empty chat follows its first synced message without overriding explicit root choice', () => {
+const messages = [{ messageId: 'remote-first', parentId: null, role: 'user', text: 'synced', model: null, author: 'peer', seq: 1 }];
+assert.equal(chats.restoreChatParent('empty-sync', []), '');
+assert.equal(chats.restoreChatParent('empty-sync', messages), 'remote-first');
+chats.setChatParent('explicit-empty-sync', null);
+assert.equal(chats.restoreChatParent('explicit-empty-sync', messages), '');
+assert.equal(chats.restoreChatParent('empty-first-save', []), '');
+assert.equal(chats.advanceChatParentIfUnchanged('empty-first-save', null, 'remote-first'), true);
+assert.equal(chats.restoreChatParent('empty-first-save', messages), 'remote-first');
+});
+
+test('automatic parent follows unique remote descendants but stops at branches and cycles', () => {
+const message = (messageId, parentId, seq) => ({ messageId, parentId, seq, role: 'user', text: messageId, model: null, author: 'peer' });
+const root = message('root', null, 100);
+const child = message('child', 'root', 2);
+const leaf = message('leaf', 'child', 1);
+const sibling = message('sibling', 'leaf', 200);
+const other = message('other', 'leaf', 300);
+const id = 'auto-remote-chain';
+chats.setChatDraft(id, 'keep draft');
+assert.equal(chats.restoreChatParent(id, [root]), 'root');
+assert.equal(chats.restoreChatParent(id, [root, child, leaf]), 'leaf');
+assert.equal(chats.restoreChatParent(id, [root, child, leaf, sibling, other]), 'leaf');
+assert.equal(chats.getChatDraft(id), 'keep draft');
+assert.equal(chats.restoreChatParent(id, [root, child, leaf, sibling]), 'sibling');
+assert.equal(chats.restoreChatParent(id, [root, child, leaf, sibling, other]), 'sibling');
+const cycleId = 'auto-cycle';
+assert.equal(chats.restoreChatParent(cycleId, [root]), 'root');
+assert.equal(chats.restoreChatParent(cycleId, [message('root', 'child', 100), child]), 'child');
+});
+
+test('explicit parent and root selection never follow remote descendants', () => {
+const root = { messageId: 'root', parentId: null, role: 'user', text: 'root', model: null, author: 'peer', seq: 1 };
+const child = { ...root, messageId: 'child', parentId: 'root', seq: 2 };
+chats.setChatParent('explicit-follow', 'root');
+assert.equal(chats.restoreChatParent('explicit-follow', [root, child]), 'root');
+chats.setChatParent('explicit-follow', null);
+assert.equal(chats.restoreChatParent('explicit-follow', [root, child]), '');
+chats.setChatParent('send-follow', 'root');
+assert.equal(chats.advanceChatParentIfUnchanged('send-follow', 'root', 'child'), true);
+assert.equal(chats.restoreChatParent('send-follow', [root, child, { ...child, messageId: 'remote', parentId: 'child', seq: 0 }]), 'remote');
+});
+
 test('clearing selected parent persists deliberate root branch choice', () => {
 const chatId = 'clear-parent-test';
 const messages = [{ messageId: 'existing-root', parentId: null, role: 'user', text: 'saved', model: null, author: 'me', seq: 1 }];

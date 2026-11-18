@@ -31,9 +31,13 @@ pub async fn guard(State(cfg): State<Arc<GuardConfig>>, req: Request, next: Next
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let origin_ok = origin
-        .as_deref()
-        .is_some_and(|origin| cfg.allowed_origins.iter().any(|allowed| allowed == origin));
+    let origin_ok = origin.as_deref().is_some_and(|origin| {
+        cfg.allowed_origins.iter().any(|allowed| allowed == origin)
+            || req
+                .extensions()
+                .get::<crate::connections::Connections>()
+                .is_some_and(|connections| connections.allows_origin(origin))
+    });
     if (origin.is_some() || is_websocket_upgrade(headers)) && !origin_ok {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }

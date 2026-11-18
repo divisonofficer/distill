@@ -48,6 +48,8 @@ pub enum ChatEvent {
     Title {
         chat_id: String,
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<u64>,
     },
 }
 
@@ -153,9 +155,33 @@ impl Store {
         self.inner.identity.clone()
     }
 
-    pub fn append(&self, event: ChatEvent) -> Result<Envelope> {
+    pub fn append(&self, mut event: ChatEvent) -> Result<Envelope> {
         validate_event(&event)?;
         let mut state = self.lock();
+        if let ChatEvent::Title {
+            chat_id, revision, ..
+        } = &mut event
+        {
+            let max_revision = state
+                .events
+                .values()
+                .flat_map(|chain| chain.values())
+                .filter_map(|envelope| match &envelope.event {
+                    ChatEvent::Title {
+                        chat_id: id,
+                        revision,
+                        ..
+                    } if id == chat_id => Some(revision.unwrap_or(0)),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+            *revision = Some(
+                max_revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("title revision overflow"))?,
+            );
+        }
         let author = &self.inner.identity.node_id;
         let author_events = state.events.get(author);
         let (seq, previous_hash) = match author_events.and_then(|chain| chain.last_key_value()) {
@@ -367,7 +393,7 @@ impl Store {
 
 fn validate_event(event: &ChatEvent) -> Result<()> {
     match event {
-        ChatEvent::Create { chat_id, title } | ChatEvent::Title { chat_id, title } => {
+        ChatEvent::Create { chat_id, title } | ChatEvent::Title { chat_id, title, .. } => {
             validate_id(chat_id, "chat_id")?;
             validate_title(title)
         }
@@ -484,16 +510,27 @@ fn conversation_from_state(state: &State, chat_id: &str) -> Option<Conversation>
         messages: Vec::new(),
     };
     let mut found = false;
-    let mut has_explicit_title = false;
+    let mut title_key = None;
     for envelope in state.events.values().flat_map(|chain| chain.values()) {
         match &envelope.event {
             ChatEvent::Create { chat_id: id, title } if id == chat_id => {
-                conversation.title = Some(title.clone());
+                if title_key.is_none() {
+                    conversation.title = Some(title.clone());
+                }
                 found = true;
             }
-            ChatEvent::Title { chat_id: id, title } if id == chat_id => {
-                conversation.title = Some(title.clone());
-                has_explicit_title = true;
+            ChatEvent::Title {
+                chat_id: id,
+                title,
+                revision,
+            } if id == chat_id => {
+                apply_explicit_title(
+                    &mut conversation,
+                    &mut title_key,
+                    envelope,
+                    title,
+                    *revision,
+                );
                 found = true;
             }
             ChatEvent::Message {
@@ -520,7 +557,7 @@ fn conversation_from_state(state: &State, chat_id: &str) -> Option<Conversation>
             _ => {}
         }
     }
-    if !has_explicit_title {
+    if title_key.is_none() {
         apply_default_title(&mut conversation);
     }
     found.then_some(conversation)
@@ -528,7 +565,7 @@ fn conversation_from_state(state: &State, chat_id: &str) -> Option<Conversation>
 
 fn conversations_from_events(events: &[Envelope]) -> Vec<Conversation> {
     let mut conversations = BTreeMap::<String, Conversation>::new();
-    let mut explicit_title_ids = BTreeSet::new();
+    let mut title_keys = BTreeMap::new();
     for envelope in events {
         let (chat_id, event) = match &envelope.event {
             ChatEvent::Create { chat_id, .. }
@@ -544,11 +581,22 @@ fn conversations_from_events(events: &[Envelope]) -> Vec<Conversation> {
             });
         match event {
             ChatEvent::Create { title, .. } => {
-                conversation.title = Some(title.clone());
+                if !title_keys.contains_key(chat_id) {
+                    conversation.title = Some(title.clone());
+                }
             }
-            ChatEvent::Title { chat_id, title } => {
-                conversation.title = Some(title.clone());
-                explicit_title_ids.insert(chat_id.clone());
+            ChatEvent::Title {
+                chat_id,
+                title,
+                revision,
+            } => {
+                apply_explicit_title(
+                    conversation,
+                    title_keys.entry(chat_id.clone()).or_insert(None),
+                    envelope,
+                    title,
+                    *revision,
+                );
             }
             ChatEvent::Message {
                 message_id,
@@ -571,11 +619,25 @@ fn conversations_from_events(events: &[Envelope]) -> Vec<Conversation> {
         }
     }
     for conversation in conversations.values_mut() {
-        if !explicit_title_ids.contains(&conversation.chat_id) {
+        if !title_keys.contains_key(&conversation.chat_id) {
             apply_default_title(conversation);
         }
     }
     conversations.into_values().collect()
+}
+
+fn apply_explicit_title(
+    conversation: &mut Conversation,
+    current: &mut Option<(u64, String, u64)>,
+    envelope: &Envelope,
+    title: &str,
+    revision: Option<u64>,
+) {
+    let key = (revision.unwrap_or(0), envelope.author.clone(), envelope.seq);
+    if current.as_ref().is_none_or(|previous| key > *previous) {
+        conversation.title = Some(title.to_owned());
+        *current = Some(key);
+    }
 }
 
 fn apply_default_title(conversation: &mut Conversation) {
@@ -918,6 +980,101 @@ mod tests {
         envelope.signature =
             URL_SAFE_NO_PAD.encode(key.sign(&signing_bytes(&envelope).unwrap()).as_ref());
         envelope
+    }
+
+    #[test]
+    fn title_revisions_converge_and_legacy_signatures_roundtrip() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let s1 = Store::open(d1.path()).unwrap();
+        let s2 = Store::open(d2.path()).unwrap();
+        let (a, b) = if s1.identity().node_id > s2.identity().node_id {
+            (&s1, &s2)
+        } else {
+            (&s2, &s1)
+        };
+        let mut keys = trusted(a);
+        keys.extend(trusted(b));
+        let title = |value: &str| ChatEvent::Title {
+            chat_id: "chat".into(),
+            title: value.into(),
+            revision: None,
+        };
+        let legacy = signed_envelope(a, 1, None, title("legacy"));
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(!json.contains("revision"));
+        let decoded: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+        b.import(vec![decoded], &keys).unwrap();
+        a.import(vec![legacy], &keys).unwrap();
+        a.append(create_event("chat")).unwrap();
+        assert_eq!(
+            a.conversation("chat").unwrap().title.as_deref(),
+            Some("legacy")
+        );
+        let first = a.append(title("A")).unwrap();
+        assert!(matches!(
+            first.event,
+            ChatEvent::Title {
+                revision: Some(1),
+                ..
+            }
+        ));
+        b.import(a.export(), &keys).unwrap();
+        b.append(title("B")).unwrap();
+        a.import(b.export(), &keys).unwrap();
+        for store in [a, b] {
+            assert_eq!(
+                store.conversation("chat").unwrap().title.as_deref(),
+                Some("B")
+            );
+            assert_eq!(store.conversations()[0].title.as_deref(), Some("B"));
+        }
+        a.append(title("A again")).unwrap();
+        b.import(a.export(), &keys).unwrap();
+        assert_eq!(
+            b.conversation("chat").unwrap().title.as_deref(),
+            Some("A again")
+        );
+        a.append(title("A concurrent")).unwrap();
+        b.append(title("B concurrent")).unwrap();
+        a.import(b.export(), &keys).unwrap();
+        b.import(a.export(), &keys).unwrap();
+        for store in [a, b] {
+            assert_eq!(
+                store.conversation("chat").unwrap().title.as_deref(),
+                Some("A concurrent")
+            );
+            assert_eq!(
+                store.conversations()[0].title.as_deref(),
+                Some("A concurrent")
+            );
+        }
+        let max = signed_envelope(
+            b,
+            b.export()
+                .iter()
+                .filter(|e| e.author == b.identity().node_id)
+                .count() as u64
+                + 1,
+            Some(
+                envelope_hash(
+                    b.export()
+                        .iter()
+                        .filter(|e| e.author == b.identity().node_id)
+                        .last()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            ChatEvent::Title {
+                chat_id: "chat".into(),
+                title: "max".into(),
+                revision: Some(u64::MAX),
+            },
+        );
+        a.import(vec![max], &keys).unwrap();
+        assert!(a.append(title("overflow")).is_err());
     }
 
     #[test]
