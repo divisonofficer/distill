@@ -1,4 +1,30 @@
+import { safeOrigin } from './fleet';
 import type { BoardRow } from './types';
+
+export type WorkspaceHost = { origin: string; online?: boolean; rows: BoardRow[] };
+
+/** Trust the HTTP destination, never an origin embedded in a session row. */
+export function hostWorkspaceRows(value: unknown, origin: string): BoardRow[] {
+if (!value || typeof value !== 'object' || !('sessions' in value) || !Array.isArray(value.sessions)) throw new Error('Invalid session roster');
+const seen = new Set<string>();
+return value.sessions.flatMap((row) => {
+if (!row || typeof row.sessionId !== 'string' || !row.sessionId || seen.has(row.sessionId)) return [];
+seen.add(row.sessionId);
+return [{ ...row, apiOrigin: origin }];
+});
+}
+
+export function workspaceSessionHref(sessionId: string, owner: string, currentOrigin: string): string | undefined {
+const origin = safeOrigin(owner);
+if (!origin || origin !== owner || !sessionId || sessionId === '.' || sessionId === '..') return undefined;
+const path = `/s/${encodeURIComponent(sessionId)}`;
+return origin === currentOrigin ? path : `${origin}${path}`;
+}
+
+export function workspaceActivity(rows: readonly Pick<BoardRow, 'activity'>[]): string {
+const activities = new Set(rows.map((row) => row.activity));
+return ['needs_input', 'working', 'error', 'dead', 'idle', 'completed', 'dormant'].find((activity) => activities.has(activity)) ?? '';
+}
 
 export interface WorkspaceSession {
 row: BoardRow;

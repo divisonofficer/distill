@@ -7,25 +7,33 @@ import Badge from '$lib/components/Badge.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import AccountSummary from '$lib/components/AccountSummary.svelte';
 import { activityBadge } from '$lib/format';
-import { pairedHostOrigins, sessionHref, sessionOrigin } from '$lib/fleet';
+import { pairedHostOrigins, sessionOrigin } from '$lib/fleet';
 import { board, sortRows } from '$lib/board.svelte';
-import { groupWorkspaceRows, isTemporaryWorkspace, visibleWorkspaceRows, type WorkspaceSession } from '$lib/workspaces';
+import { groupWorkspaceRows, hostWorkspaceRows, isTemporaryWorkspace, visibleWorkspaceRows, workspaceActivity, workspaceSessionHref, type WorkspaceHost, type WorkspaceSession } from '$lib/workspaces';
 import { chatDisplayTitle, chatPreviewTitles, chatTitleOverrides, parseChatList, parseCreatedChat, type ChatSummary } from '$lib/chats';
 import { ui } from '$lib/ui.svelte';
 import type { BoardRow } from '$lib/types';
 
 const chatMode = $derived(page.url.pathname.startsWith('/c'));
-const rows = $derived(sortRows(board.rows));
+let workspaceHosts = $state.raw<WorkspaceHost[]>([]);
+const pairedHosts = $derived(workspaceHosts.filter((host) => host.origin !== page.url.origin));
+const boardRows = $derived(sortRows(board.rows));
+const rows = $derived.by(() => {
+const currentHostAllowed = board.origin === page.url.origin || pairedHosts.some((host) => host.origin === board.origin);
+const liveOrigin = board.connected && currentHostAllowed ? board.origin : '';
+const roster = workspaceHosts.filter((host) => host.origin !== liveOrigin).flatMap((host) => host.rows);
+return sortRows(liveOrigin ? [...roster, ...boardRows] : roster);
+});
 const activeHost = $derived.by(() => {
 try { return page.url.pathname.startsWith('/s/') ? sessionOrigin(page.url.search) ?? page.url.origin : board.origin; }
 catch { return ''; }
 });
 let pinnedRow = $state.raw<BoardRow | undefined>();
 let pinnedHostResponding = $state(false);
-let pairedHosts = $state.raw<{ origin: string; online?: boolean }[]>([]);
 let peerRosterUnavailable = $state(false);
 let refreshingPeers = false;
-const selectedRow = $derived(rows.find((row) => row.sessionId === page.params.id && rowOrigin(row) === activeHost) ?? (pinnedRow && pinnedRow.sessionId === page.params.id && pinnedRow.apiOrigin === activeHost ? pinnedRow : undefined));
+let workspaceRosterLoaded = $state(false);
+const selectedRow = $derived(boardRows.find((row) => row.sessionId === page.params.id && rowOrigin(row) === activeHost) ?? (pinnedRow && pinnedRow.sessionId === page.params.id && pinnedRow.apiOrigin === activeHost ? pinnedRow : undefined));
 const selectedWorkspaceName = $derived(selectedRow?.cwd?.split(/[\\/]/).filter(Boolean).at(-1) || (page.url.pathname === '/new' ? '새 작업' : page.url.pathname.startsWith('/s/') ? '작업공간' : 'Postudio'));
 const selectedHostConnected = $derived(activeHost === board.origin ? board.connected : !!pinnedRow && pinnedRow.apiOrigin === activeHost && pinnedRow.sessionId === page.params.id && pinnedHostResponding);
 $effect(() => {
@@ -102,19 +110,40 @@ creatingChat = false;
 async function refreshPairedHosts() {
 if (chatMode || refreshingPeers) return;
 refreshingPeers = true;
+const local = page.url.origin;
 try {
-const origins = pairedHostOrigins(await getJson<unknown>('/api/connections'), page.url.origin);
-pairedHosts = origins.map((origin) => ({ origin, online: pairedHosts.find((peer) => peer.origin === origin)?.online }));
-peerRosterUnavailable = false;
-pairedHosts = await Promise.all(origins.map(async (origin) => {
-try { await getJson('/api/node', origin); return { origin, online: true }; }
-catch { return { origin, online: false }; }
-}));
-} catch {
-peerRosterUnavailable = true;
+const [roster, localSessions] = await Promise.allSettled([
+getJson<unknown>('/api/connections').then((result) => pairedHostOrigins(result, local)),
+fetchWorkspaceHost(local, local)
+]);
+const origins = roster.status === 'fulfilled' ? roster.value : [];
+peerRosterUnavailable = roster.status === 'rejected';
+const cached = new Map(workspaceHosts.map((host) => [host.origin, host]));
+const peerRows = roster.status === 'fulfilled'
+? await Promise.all(origins.map((origin) => fetchWorkspaceHost(origin, local)))
+: [...cached.values()].filter((host) => host.origin !== local).map((host) => ({ ...host, online: false }));
+workspaceHosts = [localSessions.status === 'fulfilled' ? localSessions.value : { origin: local, online: false, rows: cached.get(local)?.rows ?? [] }, ...peerRows];
+workspaceRosterLoaded = true;
 } finally {
 refreshingPeers = false;
 }
+}
+
+async function fetchWorkspaceHost(origin: string, local: string): Promise<WorkspaceHost> {
+try {
+const rows = hostWorkspaceRows(await getJson<unknown>('/api/sessions', origin === local ? undefined : origin), origin);
+return { origin, online: true, rows };
+} catch {
+return { origin, online: false, rows: workspaceHosts.find((host) => host.origin === origin)?.rows ?? [] };
+}
+}
+
+function isWorkspaceHostOnline(origin: string): boolean {
+return (board.connected && board.origin === origin) || workspaceHosts.find((host) => host.origin === origin)?.online === true;
+}
+
+function workspaceHref(row: BoardRow): string | undefined {
+return workspaceSessionHref(row.sessionId, rowOrigin(row), page.url.origin);
 }
 
 afterNavigate(() => {
@@ -122,11 +151,11 @@ void refreshChatList();
 void refreshPairedHosts();
 });
 onMount(() => {
-const timer = window.setInterval(() => {
-void refreshChatList();
-void refreshPairedHosts();
-}, 15000);
-return () => window.clearInterval(timer);
+const chatTimer = window.setInterval(() => void refreshChatList(), 15000);
+const fleetTimer = window.setInterval(() => {
+if (!document.hidden) void refreshPairedHosts();
+}, 5000);
+return () => { window.clearInterval(chatTimer); window.clearInterval(fleetTimer); };
 });
 
 function setGroupOpen(id: string, event: Event) {
@@ -157,9 +186,9 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 {@const active = page.params.id === row.sessionId && rowOrigin(row) === activeHost}
 {@const badge = activityBadge(row.activity)}
 <div class="flex flex-col gap-0.5">
-<a href={sessionHref(row.sessionId, rowOrigin(row))} onclick={close} aria-current={active ? 'page' : undefined} class={['flex min-h-9 flex-col justify-center gap-1 rounded-lg px-3 py-1.5 text-neutral-800 hover:bg-neutral-200/70 dark:text-neutral-200 dark:hover:bg-neutral-800', active && 'bg-neutral-200 dark:bg-neutral-800']}>
+<a href={workspaceHref(row)} onclick={close} aria-current={active ? 'page' : undefined} class={['flex min-h-9 flex-col justify-center gap-1 rounded-lg px-3 py-1.5 text-neutral-800 hover:bg-neutral-200/70 dark:text-neutral-200 dark:hover:bg-neutral-800', active && 'bg-neutral-200 dark:bg-neutral-800']}>
 <span class="flex items-center gap-2"><span class="min-w-0 flex-1 truncate text-sm">{row.title || '제목 없는 작업'}</span>{#if row.isWorktree}<span class="rounded px-1 text-[10px] text-neutral-600 ring-1 ring-neutral-300 dark:text-neutral-300 dark:ring-neutral-700" title="worktree">WT</span>{/if}</span>
-<span class="flex items-center gap-2"><span title={row.activity === 'dormant' ? '저장된 작업이며 현재 실행 프로세스가 없습니다.' : row.activity === 'idle' ? '상주 프로세스가 있으나 실행 중인 턴이 없습니다.' : row.activity === 'needs_input' ? '권한·질문·계획 응답 대기' : undefined}><Badge label={badge.label} tone={badge.tone} /></span>{#if Number.isFinite(row.lastChangeUnixMs) && row.lastChangeUnixMs > 0}<time class="ml-auto text-[11px] text-neutral-600 dark:text-neutral-300" datetime={new Date(row.lastChangeUnixMs).toISOString()} title={new Date(row.lastChangeUnixMs).toLocaleString('ko-KR')}>{new Date(row.lastChangeUnixMs).toLocaleString('ko-KR', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time>{/if}</span>
+<span class="flex items-center gap-2"><span title={!isWorkspaceHostOnline(rowOrigin(row)) ? '마지막으로 확인된 상태' : row.activity === 'dormant' ? '저장된 작업이며 현재 실행 프로세스가 없습니다.' : row.activity === 'idle' ? '상주 프로세스가 있으나 실행 중인 턴이 없습니다.' : row.activity === 'needs_input' ? '권한·질문·계획 응답 대기' : undefined}><Badge label={badge.label} tone={badge.tone} /></span>{#if Number.isFinite(row.lastChangeUnixMs) && row.lastChangeUnixMs > 0}<time class="ml-auto text-[11px] text-neutral-600 dark:text-neutral-300" datetime={new Date(row.lastChangeUnixMs).toISOString()} title={new Date(row.lastChangeUnixMs).toLocaleString('ko-KR')}>{new Date(row.lastChangeUnixMs).toLocaleString('ko-KR', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time>{/if}</span>
 </a>
 {#if item.children.length}
 <details open={item.children.some(containsActiveSession)} class="ml-3 rounded-lg px-2 text-xs text-neutral-600 dark:text-neutral-300">
@@ -227,7 +256,7 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 {#each pairedHosts as peer (peer.origin)}
 <li>
 <a href={`${peer.origin}/new`} onclick={close} title={peer.origin} class="flex min-h-9 min-w-0 items-center gap-2 rounded-lg px-2 text-xs hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800">
-<Icon name="server" class="size-4 shrink-0 text-neutral-500" /><span class="min-w-0 flex-1 truncate">{new URL(peer.origin).host}</span><span class="shrink-0" class:text-green-700={peer.online}>{peer.origin === activeHost && selectedHostConnected ? '사용 중' : peer.online === true ? '연결 가능' : peer.online === false ? '접속 확인 실패' : '확인 중'}</span>
+<Icon name="server" class="size-4 shrink-0 text-neutral-500" /><span class="min-w-0 flex-1 truncate">{new URL(peer.origin).host}</span><span class="shrink-0" class:text-green-700={isWorkspaceHostOnline(peer.origin)}>{peer.origin === activeHost && selectedHostConnected ? '사용 중' : isWorkspaceHostOnline(peer.origin) ? '연결 가능' : '접속 확인 실패'}</span>
 </a>
 </li>
 {/each}
@@ -237,12 +266,21 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 </section>
 <section aria-labelledby="coding-workspace-heading" class="flex flex-col gap-0.5">
 <div class="flex h-9 items-center justify-between gap-2 px-2"><h2 id="coding-workspace-heading" class="text-xs font-semibold text-neutral-600 dark:text-neutral-300">워크스페이스</h2><a href={portsHref()} onclick={close} class="rounded px-1 py-1 text-xs text-neutral-600 hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:text-neutral-300 dark:hover:bg-neutral-800">포트</a></div>
-{#if !board.connected}<p role="status" class="px-2 text-xs text-neutral-600 dark:text-neutral-300">서버에 연결하는 중입니다.</p>{:else if rows.length === 0}<p class="px-2 text-xs text-neutral-600 dark:text-neutral-300">코딩 작업이 없습니다.</p>{/if}
+{#if !workspaceRosterLoaded && !rows.length}<p role="status" class="px-2 text-xs text-neutral-600 dark:text-neutral-300">호스트별 작업을 불러오는 중입니다.</p>{:else if rows.length === 0 && workspaceHosts.some((host) => isWorkspaceHostOnline(host.origin))}<p class="px-2 text-xs text-neutral-600 dark:text-neutral-300">접속 가능한 호스트에 코딩 작업이 없습니다.</p>{:else if rows.length === 0}<p class="px-2 text-xs text-neutral-600 dark:text-neutral-300">작업 목록에 접속할 수 없습니다.</p>{/if}
 {#if temporaryRows.length}<button type="button" class="min-h-9 rounded-lg px-3 text-left text-xs text-neutral-600 hover:bg-neutral-200/70 dark:text-neutral-300" aria-expanded={showTemporary} onclick={() => (showTemporary = !showTemporary)}>{showTemporary ? '임시 작업 숨기기' : '임시 작업 보기'} · {temporaryRows.length}</button>{/if}
-{#each groups as group (group.id)}<details class="group/workspace" open={openGroups[group.id] ?? !isTemporaryWorkspace(group.cwd ?? '')} ontoggle={(event) => setGroupOpen(group.id, event)}>
-<summary class="flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-lg px-2 text-xs font-medium text-neutral-700 hover:bg-neutral-200/70 dark:text-neutral-300 dark:hover:bg-neutral-800" title={group.title} aria-label={group.title && !isTemporaryWorkspace(group.title) ? `${group.label}. 전체 경로 ${group.title}` : group.label}><Icon name="chevron" class="size-3 shrink-0 transition-transform group-open/workspace:rotate-90" /><span class="min-w-0 flex-1 truncate">{group.label}</span>{#if group.secondary}<span class="max-w-24 truncate font-mono text-[10px] text-neutral-600 dark:text-neutral-300" title={group.title}>{group.secondary}</span>{/if}</summary>
+{#each groups as group (group.id)}
+{@const badge = activityBadge(workspaceActivity(group.rows))}
+{@const groupRow = group.rows.find((row) => row.sessionId === page.params.id && rowOrigin(row) === activeHost) ?? group.rows[0]}
+<div class="mt-1 rounded-lg border border-neutral-200/80 dark:border-neutral-800">
+<a href={groupRow && workspaceHref(groupRow)} onclick={close} class="flex min-h-9 min-w-0 items-center gap-2 rounded-lg px-2 text-xs font-medium hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800" title={group.title}>
+<span class="min-w-0 flex-1 truncate">{group.label}</span>
+{#if isWorkspaceHostOnline(group.host)}<Badge label={badge.label} tone={badge.tone} />{:else}<Badge label="접속 확인 실패" tone="off" />{/if}
+</a>
+<div class="flex min-w-0 items-center gap-1 px-2 text-[10px] text-neutral-500 dark:text-neutral-400"><span class="min-w-0 truncate" title={group.host}>{group.host === page.url.origin ? '현재 호스트' : group.host.replace(/^https?:\/\//, '')}</span>{#if group.secondary && group.secondary !== group.host}<span class="truncate" title={group.title}>· {group.secondary}</span>{/if}</div>
+<details class="group/workspace" open={openGroups[group.id] ?? !isTemporaryWorkspace(group.cwd ?? '')} ontoggle={(event) => setGroupOpen(group.id, event)}>
+<summary class="flex min-h-8 cursor-pointer select-none items-center gap-2 rounded-lg px-2 text-xs text-neutral-600 hover:bg-neutral-200/70 dark:text-neutral-300 dark:hover:bg-neutral-800"><Icon name="chevron" class="size-3 shrink-0 transition-transform group-open/workspace:rotate-90" />작업 {group.rows.length}개{#if !isWorkspaceHostOnline(group.host)} · 마지막 확인 기록{/if}</summary>
 {#if group.cwd && isTemporaryWorkspace(group.cwd)}<details class="mx-2 rounded-lg px-2 text-xs text-neutral-600 dark:text-neutral-300"><summary class="min-h-8 cursor-pointer content-center underline underline-offset-4">임시 작업공간의 실제 경로</summary><code class="block overflow-x-auto py-1 font-mono">{group.cwd}</code></details>{/if}
-{#each group.sessions as item (JSON.stringify([rowOrigin(item.row), item.row.sessionId]))}{@render sessionItem(item)}{/each}</details>{/each}
+{#each group.sessions as item (JSON.stringify([rowOrigin(item.row), item.row.sessionId]))}{@render sessionItem(item)}{/each}</details></div>{/each}
 </section>
 {/if}
 </div>

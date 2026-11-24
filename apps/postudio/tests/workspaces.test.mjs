@@ -11,6 +11,9 @@ let workspaceDisplayName;
 let groupWorkspaceChoices;
 let workspacesForHost;
 let visibleWorkspaceRows;
+let hostWorkspaceRows;
+let workspaceActivity;
+let workspaceSessionHref;
 let sortRows;
 
 before(async () => {
@@ -21,7 +24,7 @@ before(async () => {
 		appType: 'custom',
 		logLevel: 'silent'
 	});
-	({ groupWorkspaceRows, workspaceDisplayName, groupWorkspaceChoices, workspacesForHost, visibleWorkspaceRows } = await vite.ssrLoadModule('/src/lib/workspaces.ts'));
+	({ groupWorkspaceRows, workspaceDisplayName, groupWorkspaceChoices, workspacesForHost, visibleWorkspaceRows, hostWorkspaceRows, workspaceActivity, workspaceSessionHref } = await vite.ssrLoadModule('/src/lib/workspaces.ts'));
 	({ sortRows } = await vite.ssrLoadModule('/src/lib/board.svelte.ts'));
 });
 
@@ -170,4 +173,25 @@ const selected = visibleWorkspaceRows(rows, false, 'selected', 'host-a', 'host-a
 assert.deepEqual(selected.map(({ sessionId }) => sessionId), ['parent', 'child', 'selected']);
 const [group] = groupWorkspaceRows(visible);
 assert.equal(group.sessions[0].children[0].row.sessionId, 'child');
+});
+
+test('fleet groups the same workspace and session IDs per serving host, not embedded provenance', () => {
+const local = 'https://mac.example';
+const peer = 'https://lab.example';
+const rows = [
+...hostWorkspaceRows({ sessions: [{ sessionId: 'same', cwd: '/project', activity: 'idle' }] }, local),
+...hostWorkspaceRows({ sessions: [
+{ sessionId: 'same', cwd: '/project', activity: 'working', apiOrigin: 'https://unpaired.example' },
+{ sessionId: 'same', cwd: '/duplicate', activity: 'idle' },
+{ sessionId: 'child', cwd: '/tmp/child', activity: 'needs_input', parentSessionId: 'same', sessionKind: 'subagent' }
+] }, peer)
+];
+const groups = groupWorkspaceRows(rows);
+assert.deepEqual(groups.map(({ host }) => host), [local, peer]);
+assert.deepEqual(groups.map(({ rows }) => workspaceActivity(rows)), ['idle', 'needs_input']);
+assert.equal(groups[1].rows.length, 2);
+assert.equal(workspaceSessionHref('same', local, local), '/s/same');
+assert.equal(workspaceSessionHref('x/y?', peer, local), 'https://lab.example/s/x%2Fy%3F');
+assert.equal(workspaceSessionHref('same', 'javascript:alert(1)', local), undefined);
+assert.throws(() => hostWorkspaceRows({ error: 'unavailable' }, peer), /Invalid session roster/);
 });
