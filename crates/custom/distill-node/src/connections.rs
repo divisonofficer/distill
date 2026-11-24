@@ -28,6 +28,12 @@ use crate::chat_sync::{PeerConfig, PeerSync};
 const LIMIT: usize = 16 * 1024;
 const MAX_PEERS: usize = 16;
 const LIFETIME: u64 = 600;
+const MAX_CLOCK_SKEW: u64 = 30;
+
+fn plausible_invitation_expiry(now: u64, expiry: u64) -> bool {
+    // The issuer still enforces the actual expiry when consuming the token.
+    expiry > now && expiry <= now.saturating_add(LIFETIME + MAX_CLOCK_SKEW)
+}
 
 #[derive(Clone)]
 pub struct Connections {
@@ -387,8 +393,7 @@ async fn join(State(c): State<Connections>, headers: HeaderMap, body: Bytes) -> 
         return error(StatusCode::BAD_REQUEST, "invalid_invitation");
     };
     if inv.version != 1
-        || inv.expires_at <= now()
-        || inv.expires_at > now().saturating_add(LIFETIME)
+        || !plausible_invitation_expiry(now(), inv.expires_at)
         || !origin(&inv.origin, &c.inner.forbidden)
         || URL_SAFE_NO_PAD.decode(&inv.token).map_or(true, |b| {
             b.len() != 32 || URL_SAFE_NO_PAD.encode(b) != inv.token
@@ -510,6 +515,13 @@ async fn remove(State(c): State<Connections>, body: Bytes) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn invitation_expiry_allows_small_clock_skew() {
+        assert!(plausible_invitation_expiry(1000, 1604));
+        assert!(!plausible_invitation_expiry(1000, 1631));
+        assert!(!plausible_invitation_expiry(1000, 1000));
+    }
+
     #[test]
     fn origins_are_canonical_and_tokens_match() {
         assert!(origin("https://example.com", "https://bad.example"));
