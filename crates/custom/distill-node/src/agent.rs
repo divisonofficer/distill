@@ -273,7 +273,7 @@ impl AgentHandle {
                 "initialize",
                 json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
+                    "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false, "_meta": {"x.ai/userMessageEcho": true}},
                     "_meta": {
                         "startupHints": {"nonInteractive": false, "skipGitStatus": true, "skipProjectLayout": true},
                         "clientType": "postudio-node",

@@ -542,10 +542,58 @@ fn permission_option(option: &Value) -> Option<PermissionOption> {
 }
 
 fn content_of(update: &Value) -> Option<Vec<ToolContent>> {
-    update
+    let content: Option<Vec<_>> = update
         .get("content")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(tool_content).collect())
+        .map(|items| items.iter().filter_map(tool_content).collect());
+    if content.as_ref().is_none_or(Vec::is_empty)
+        && let Some(marker) = update
+            .get("rawOutput")
+            .and_then(|raw| research_output(raw, 0))
+    {
+        return Some(vec![ToolContent::Text {
+            text: marker.to_string(),
+        }]);
+    }
+    content
+}
+
+fn research_output(value: &Value, depth: usize) -> Option<Value> {
+    if depth > 5 {
+        return None;
+    }
+    if value.get("postudioResearch").is_some_and(Value::is_object)
+        && value.to_string().len() <= 8192
+    {
+        return Some(value.clone());
+    }
+    match value {
+        Value::String(text) if text.len() <= 16384 => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| research_output(&parsed, depth + 1)),
+        Value::Array(items) => items
+            .iter()
+            .take(8)
+            .find_map(|item| research_output(item, depth + 1)),
+        Value::Object(object) => [
+            "OkayOutput",
+            "structuredContent",
+            "structured_content",
+            "content",
+            "text",
+            "output",
+            "result",
+            "data",
+            "value",
+        ]
+        .into_iter()
+        .find_map(|key| {
+            object
+                .get(key)
+                .and_then(|value| research_output(value, depth + 1))
+        }),
+        _ => None,
+    }
 }
 
 fn tool_content(item: &Value) -> Option<ToolContent> {
@@ -658,6 +706,28 @@ mod tests {
         Reducer::new(SID.to_owned())
     }
 
+    #[test]
+    fn research_structured_raw_output_reaches_live_and_replay_content() {
+        let marker = serde_json::json!({"postudioResearch":{"projectId":"p","experimentId":"e","kind":"request_run"}});
+        assert!(
+            research_output(
+                &serde_json::json!({"type":"MCP","output":{"OkayOutput":marker.to_string()}}),
+                0
+            )
+            .is_some()
+        );
+        let parsed =
+            content_of(&serde_json::json!({"rawOutput":{"structuredContent":marker}})).unwrap();
+        assert!(matches!(&parsed[0],ToolContent::Text{text} if text.contains("postudioResearch")));
+        assert!(research_output(&Value::String(format!("not JSON {marker}")), 0).is_none());
+        assert!(
+            research_output(
+                &serde_json::json!({"content":[{"type":"text","text":marker.to_string()}]}),
+                0
+            )
+            .is_some()
+        );
+    }
     #[test]
     fn other_session_message_is_dropped() {
         let mut r = reducer();

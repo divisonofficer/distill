@@ -138,12 +138,15 @@ const rows = [
 { sessionId: 'cycle-b', cwd: '/tmp/cycle-b', apiOrigin: 'host-a', parentSessionId: 'cycle-a', sessionKind: 'subagent' }
 ];
 const groups = groupWorkspaceRows(rows);
-assert.equal(groups.find(({ cwd }) => cwd === '/tmp/orphan').sessions[0].row.sessionId, 'orphan');
+const orphan = groups.find(({ cwd }) => cwd === '/tmp/orphan');
+assert.deepEqual(orphan.sessions, []);
+assert.equal(orphan.orphanSessions[0].row.sessionId, 'orphan');
+assert.equal(groupWorkspaceRows([{ sessionId: 'unlinked', sessionKind: 'subagent' }])[0].orphanSessions.length, 1);
 assert.equal(groups.find(({ cwd }) => cwd === '/srv/fork').sessions[0].row.sessionId, 'fork');
 const cycle = groups.filter(({ cwd }) => cwd === '/tmp/cycle-a' || cwd === '/tmp/cycle-b');
 assert.equal(cycle.length, 1);
 const flatten = (items) => items.flatMap((item) => [item.row.sessionId, ...flatten(item.children)]);
-assert.deepEqual(flatten(cycle[0].sessions).sort(), ['cycle-a', 'cycle-b']);
+assert.deepEqual(flatten(cycle[0].orphanSessions).sort(), ['cycle-a', 'cycle-b']);
 });
 
 test('identical session ids stay isolated per host', () => {

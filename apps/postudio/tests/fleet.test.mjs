@@ -43,13 +43,15 @@ test('chat fleet includes connected paired-host accounts when the browser host i
   const peer = 'https://paired.example';
   const model = { modelId: 'chatgpt/gpt-test', name: 'GPT test' };
   const calls = [];
+  // Fake responses expose text() and json() like a real fetch Response.
+  const respond = (data) => ({ ok: true, text: async () => JSON.stringify(data), json: async () => data });
   globalThis.fetch = async (url) => {
     calls.push(String(url));
-    if (url === '/api/connections') return { ok: true, json: async () => ({ peers: [{ origin: peer, nodeId }, { origin: 'https://untrusted.example', nodeId: 'invalid' }] }) };
-    if (String(url).endsWith('/api/models')) return { ok: true, json: async () => ({ currentModelId: model.modelId, availableModels: [model] }) };
-    if (url === '/api/chat-accounts') return { ok: true, json: async () => [] };
+    if (url === '/api/connections') return respond({ peers: [{ origin: peer, nodeId }, { origin: 'https://untrusted.example', nodeId: 'invalid' }] });
+    if (String(url).endsWith('/api/models')) return respond({ currentModelId: model.modelId, availableModels: [model] });
+    if (url === '/api/chat-accounts') return respond([]);
     assert.equal(url, `${peer}/api/chat-accounts`);
-    return { ok: true, json: async () => [{ id: 'legacy-chatgpt', label: 'peer', provider: 'chatgpt', connected: true, email: 'not-projected@example.com' }] };
+    return respond([{ id: 'legacy-chatgpt', label: 'peer', provider: 'chatgpt', connected: true, email: 'not-projected@example.com' }]);
   };
   const result = await loadChatFleet('https://local.example');
   assert.deepEqual(result.models, [model]);
@@ -64,7 +66,7 @@ test('chat fleet includes connected paired-host accounts when the browser host i
 test('ordinary GET stays on current origin while explicit host pins destination', async () => {
   fleet.saveHosts(['https://peer-a.example', 'https://peer-b.example']);
   const calls = [];
-  globalThis.fetch = async (url) => { calls.push(String(url)); return { ok: true, json: async () => ({}) }; };
+  globalThis.fetch = async (url) => { calls.push(String(url)); return { ok: true, text: async () => '{}', json: async () => ({}) }; };
   await api.getJson('/api/node');
   await api.getJson('/api/node', 'https://peer-b.example');
   await api.getJson('/api/chats', 'https://peer-b.example');

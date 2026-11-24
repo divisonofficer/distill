@@ -13,7 +13,7 @@ before(async () => {
  ({ default: Command } = await vite.ssrLoadModule('/src/lib/components/CommandOutputModal.svelte'));
  ({ default: Monitor } = await vite.ssrLoadModule('/src/lib/components/ExecutionMonitor.svelte'));
  ({ default: ToolRow } = await vite.ssrLoadModule('/src/lib/components/ToolRow.svelte'));
- ({ commandStatus } = await vite.ssrLoadModule('/src/lib/command-status.ts'));
+ ({ commandStatus } = await vite.ssrLoadModule('/src/lib/command-status.ts')); 
 });
 after(async () => { await vite?.close(); });
 const agent = { subagentId: 'a', parentSessionId: 'p', childSessionId: 'c', subagentType: 'research', description: '조사', startedAtEpochMs: 1000, durationMs: 3000, status: 'completed', output: '<script>bad</script>' };

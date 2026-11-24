@@ -88,3 +88,10 @@ AARCH64_APPLE_DARWIN_JEMALLOC_SYS_WITH_LG_PAGE = "14"
 AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = "16"
 AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_LG_PAGE = "16"
 AARCH64_UNKNOWN_LINUX_MUSL_JEMALLOC_SYS_WITH_BACKGROUND_THREADS = "0"
+
+# DistillCustom build hygiene (AGENTS.md). Parallel agents grew incremental
+# caches past 50 GB per target dir and filled the disk. Off for every profile;
+# opt back in for one shell with CARGO_INCREMENTAL=1 (toggling rebuilds the
+# workspace crates once).
+[build]
+incremental = false

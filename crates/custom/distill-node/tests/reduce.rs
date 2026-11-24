@@ -60,6 +60,13 @@ fn acp_fixtures_match_sep_expectations() {
         }
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let expected_path = fixtures().join("sep").join(format!("{stem}.json"));
+        if std::env::var_os("UPDATE_SEP_FIXTURES").is_some() {
+            fs::write(
+                &expected_path,
+                serde_json::to_string_pretty(&run(&path)).unwrap() + "\n",
+            )
+            .unwrap();
+        }
         let expected: Vec<Sep> = serde_json::from_str(
             &fs::read_to_string(&expected_path)
                 .unwrap_or_else(|e| panic!("{}: {e}", expected_path.display())),
@@ -104,6 +111,25 @@ fn replayed_tool_call_keeps_status_kind_and_output() {
             content: Some(vec![ToolContent::Text {
                 text: "file output".into()
             }]),
+        }]
+    );
+}
+
+#[test]
+fn correlated_prompt_appears_only_on_live_echo() {
+    let mut reducer = Reducer::new("s1".into());
+    let prompt = json!({"id": 1, "method": "session/prompt", "params": {
+        "sessionId": "s1", "prompt": [{"type": "text", "text": "queued"}],
+        "_meta": {"promptId": "p1"}
+    }});
+    assert!(reducer.on_client(&prompt).is_empty());
+    let echo = json!({"method": "session/update", "params": {"sessionId": "s1", "update": {
+        "sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "queued"}
+    }}});
+    assert_eq!(
+        reducer.on_agent(&echo),
+        vec![Sep::UserMessage {
+            text: "queued".into()
         }]
     );
 }

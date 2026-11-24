@@ -613,10 +613,19 @@ async fn queue_remove_uses_acp_extension_wire_name() {
     let f = start().await;
     let mut ws = connect(f.addr, "/ws/session/s1").await;
     until(&mut ws, "replay.end").await;
-    send_json(&mut ws, json!({"t":"queue.remove","id":"queued-prompt","expected_version":3})).await;
+    send_json(
+        &mut ws,
+        json!({"t":"queue.remove","id":"queued-prompt","expected_version":3}),
+    )
+    .await;
     until(&mut ws, "queue.changed").await;
-    assert!(log_lines(&f.log).iter().any(|m| m["method"] == "_x.ai/queue/remove"
-        && m["params"]["id"] == "queued-prompt" && m["params"]["expectedVersion"] == 3));
+    assert!(
+        log_lines(&f.log)
+            .iter()
+            .any(|m| m["method"] == "_x.ai/queue/remove"
+                && m["params"]["id"] == "queued-prompt"
+                && m["params"]["expectedVersion"] == 3)
+    );
 }
 
 #[tokio::test]
@@ -637,10 +646,15 @@ async fn history_pages_are_requested_from_agent_and_invalid_cursor_can_retry() {
     assert_eq!(older["initial"], false);
     assert_eq!(older["has_more"], false);
     let log = log_lines(&f.log);
-    assert!(log.iter().any(|m| m["method"] == "session/load"
-        && m["params"]["_meta"]["noReplay"] == true));
-    assert!(log.iter().any(|m| m["method"] == "_x.ai/session/load_history"
-        && m["params"]["cursor"] == "older-page"));
+    assert!(
+        log.iter()
+            .any(|m| m["method"] == "session/load" && m["params"]["_meta"]["noReplay"] == true)
+    );
+    assert!(
+        log.iter()
+            .any(|m| m["method"] == "_x.ai/session/load_history"
+                && m["params"]["cursor"] == "older-page")
+    );
 }
 
 #[tokio::test]

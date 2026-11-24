@@ -27,7 +27,7 @@ $effect(() => {
 	if (selected && dialog && !dialog.open) dialog.showModal();
 });
 
-function openPreview(attachment: UserAttachment, trigger: HTMLButtonElement) {
+export function openPreview(attachment: UserAttachment, trigger: HTMLButtonElement) {
 	returnFocus = trigger;
 	selected = attachment;
 }

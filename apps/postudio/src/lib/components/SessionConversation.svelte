@@ -729,7 +729,7 @@ composer?.focus();
 {/if}
 {#each timeline as entry (entry.kind === 'item' ? `item-${entry.item.key}` : `tools-${entry.items[0].key}`)}
 {#if entry.kind === 'tools'}
-<div class="flex flex-col gap-0 rounded-xl border border-neutral-200 dark:border-neutral-800">{#each entry.items as tool (tool.key)}{@const child = subagentForTool(tool)}<ToolRow item={tool} id={toolDomId(tool.id)} childExecution={child?.agent ?? null} childExecutionFresh={child?.fresh ?? false} childNeedsInput={child?.needsInput ?? false} onselect={(tool) => onOpenTool?.(tool)} onoutput={(tool) => onOpenCommandOutput?.(tool)} grouped />{/each}</div>
+<div class="flex flex-col gap-0 rounded-xl border border-neutral-200 dark:border-neutral-800">{#each entry.items as tool (tool.key)}{@const child = subagentForTool(tool)}<ToolRow item={tool} host={sessionHost} id={toolDomId(tool.id)} childExecution={child?.agent ?? null} childExecutionFresh={child?.fresh ?? false} childNeedsInput={child?.needsInput ?? false} onselect={(tool) => onOpenTool?.(tool)} onoutput={(tool) => onOpenCommandOutput?.(tool)} grouped />{/each}</div>
 {:else}
 {@const item = entry.item}
 {#if item.kind === 'attachment'}

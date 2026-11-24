@@ -24,6 +24,17 @@ pub mod models;
 pub mod ports;
 pub mod push;
 pub mod reduce;
+pub mod research;
+pub(crate) mod research_chat;
+pub(crate) mod research_context;
+pub(crate) mod research_gateway;
+pub(crate) mod research_library;
+pub(crate) mod research_literature;
+pub(crate) mod research_mcp;
+pub(crate) mod research_project;
+pub(crate) mod research_refs;
+pub(crate) mod research_sessions;
+pub(crate) mod research_targets;
 pub mod sep;
 pub mod session;
 pub mod untrusted;
@@ -61,6 +72,7 @@ pub struct NodeConfig {
     pub web_dir: Option<PathBuf>,
     pub chat_peer_config: Option<PathBuf>,
     pub untrusted_origin: Option<String>,
+    pub openresearch_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -74,7 +86,23 @@ pub struct NodeInfo {
 /// Start the keeper and push sender, then serve both listeners until one fails.
 pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
     validate_node_config(&cfg)?;
-    let keeper = Keeper::start(cfg.agent.clone()).await?;
+    let bindings = if cfg.openresearch_bin.is_some() {
+        let endpoint = match &cfg.listen {
+            ListenAddr::Tcp(addr) => {
+                research_sessions::NodeEndpoint::Http(format!("http://{addr}"))
+            }
+            #[cfg(unix)]
+            ListenAddr::Unix(path) => research_sessions::NodeEndpoint::Unix(path.clone()),
+        };
+        Some(research_sessions::ResearchBindings::open(
+            &cfg.state_dir,
+            endpoint,
+        )?)
+    } else {
+        None
+    };
+    let keeper =
+        Keeper::start_with_mcp(cfg.agent.clone(), bindings.as_ref().map(|b| b.resolver())).await?;
     let push = Arc::new(Push::load_or_create(&cfg.state_dir)?);
     let chat_store = chat_store::Store::open(&cfg.state_dir.join("chats"))?;
     let sync = match cfg.chat_peer_config.as_deref() {
@@ -102,7 +130,60 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         owner: cfg.owner.clone(),
         allowed_origins: cfg.allowed_origins.clone(),
     });
-    let blocked_ports = listener_ports(&cfg);
+    let blocked_ports = ports::port_policy(listener_ports(&cfg));
+    for port in research::existing_runtime_ports(&cfg.state_dir)
+        .await
+        .map_err(anyhow::Error::msg)?
+    {
+        blocked_ports
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(port);
+    }
+    let research = research::ResearchService::new(
+        cfg.openresearch_bin.clone(),
+        cfg.state_dir.clone(),
+        blocked_ports.clone(),
+    );
+    let gateway = match std::env::var("POSTUDIO_RESEARCH_DASHBOARD_ORIGIN") {
+        Ok(origin) if bindings.is_some() => {
+            let origin = url::Url::parse(&origin)?;
+            let dashboard_host = origin
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("Dashboard hostname required"))?;
+            anyhow::ensure!(
+                !cfg.allowed_origins
+                    .iter()
+                    .chain(cfg.untrusted_origin.iter())
+                    .filter_map(|value| url::Url::parse(value).ok())
+                    .any(|value| value.host_str() == Some(dashboard_host)),
+                "Dashboard must use a different hostname from trusted and untrusted applications; cookies have no port scope"
+            );
+            anyhow::ensure!(
+                origin.scheme() == "https",
+                "Dashboard requires a dedicated HTTPS origin"
+            );
+            let address: ListenAddr = std::env::var("POSTUDIO_RESEARCH_DASHBOARD_LISTEN")
+                .map_err(|_| anyhow::anyhow!("Dashboard listener required"))?
+                .parse()?;
+            if let ListenAddr::Tcp(addr) = &address {
+                anyhow::ensure!(addr.port() != 0, "Choose a fixed private dashboard port");
+                blocked_ports
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(addr.port());
+            }
+            let gw = research_gateway::DashboardGateway::new(origin, research.clone())?;
+            let app = gw.router();
+            background.spawn(async move {
+                if let Err(error) = listen::serve(address, app).await {
+                    tracing::error!(%error,"research dashboard stopped");
+                }
+            });
+            Some(gw)
+        }
+        _ => None,
+    };
     let trusted = trusted_services_router(
         keeper.clone(),
         push,
@@ -113,8 +194,11 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         (Some(completion), peer_sync.clone()),
         WebConfig {
             untrusted_origin: cfg.untrusted_origin.clone(),
-            connections: Some(connections),
             blocked_ports: blocked_ports.clone(),
+            research: Some(research),
+            bindings,
+            gateway,
+            connections: Some(connections),
         },
     );
     let resolver: untrusted::CwdResolver = {
@@ -125,7 +209,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         listen::serve(cfg.listen, trusted),
         listen::serve(
             cfg.untrusted_listen,
-            untrusted::routes_with_prohibited_ports(resolver, blocked_ports)
+            untrusted::routes_with_policy(resolver, blocked_ports)
         ),
     );
     let _ = shutdown_tx.send(true);
@@ -205,7 +289,10 @@ pub fn trusted_router_with_chat_services(
 struct WebConfig {
     connections: Option<connections::Connections>,
     untrusted_origin: Option<String>,
-    blocked_ports: Vec<u16>,
+    blocked_ports: ports::PortPolicy,
+    research: Option<research::ResearchService>,
+    bindings: Option<research_sessions::ResearchBindings>,
+    gateway: Option<research_gateway::DashboardGateway>,
 }
 
 fn trusted_services_router(
@@ -231,7 +318,51 @@ fn trusted_services_router(
         .as_ref()
         .map(|c| c.owner_routes())
         .unwrap_or_default();
+    let research = web.research.unwrap_or_else(|| {
+        research::ResearchService::new(None, PathBuf::new(), web.blocked_ports.clone())
+    });
+    let prompt_context = web
+        .bindings
+        .as_ref()
+        .map(|bindings| research_context::ResearchContext {
+            service: research.clone(),
+            bindings: bindings.clone(),
+        });
+    let private = web
+        .bindings
+        .as_ref()
+        .map(|b| research_mcp::private_routes(research.clone(), b.clone()))
+        .unwrap_or_default();
+    let chat = web
+        .bindings
+        .map(|b| research_chat::routes(research.clone(), b, keeper.clone()))
+        .unwrap_or_default();
+    let dashboard = Router::new().route(
+        "/api/research/projects/{id}/dashboard",
+        axum::routing::post(
+            move |axum::extract::Path(id): axum::extract::Path<String>,
+                  Json(body): Json<serde_json::Value>| async move {
+                let _ = body;
+                let Some(gateway) = web.gateway else {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Configure a dedicated HTTPS dashboard origin and private listener",
+                    )
+                        .into_response();
+                };
+                match gateway.ticket(&id).await {
+                    Ok(url) => Json(json!({"url":url})).into_response(),
+                    Err(response) => response,
+                }
+            },
+        ),
+    );
     let guarded = Router::new()
+        .merge(chat)
+        .merge(dashboard)
+        .merge(research_project::routes(research.clone()))
+        .merge(research_targets::routes(research.clone()))
+        .merge(research_literature::routes(research.clone()))
         .merge(connection_routes)
         .route(
             "/api/node",
@@ -239,7 +370,7 @@ fn trusted_services_router(
         )
         .merge(fleet::routes())
         .merge(artifacts::routes(keeper.clone()))
-        .merge(ports::routes(web.blocked_ports))
+        .merge(ports::routes_with_policy(web.blocked_ports.clone()))
         .merge(chats::routes_with_peers(
             chat_store,
             completion.clone(),
@@ -251,12 +382,17 @@ fn trusted_services_router(
         .merge(board::routes(keeper.clone()))
         .merge(models::routes(keeper.clone()))
         .merge(executions::routes(keeper.clone()))
-        .merge(session::routes(agent, keeper))
+        .merge(research::routes_for_service(research))
+        .merge(match prompt_context {
+            Some(context) => session::routes_with_context(agent, keeper, context),
+            None => session::routes(agent, keeper),
+        })
         .merge(push.routes())
         .layer(middleware::from_fn_with_state(guard, guard::guard));
     let mut app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .merge(guarded);
+        .merge(guarded)
+        .merge(private);
     if let Some(peer_sync) = peer_sync {
         app = app.merge(peer_sync.routes());
         if let Some(completion) = completion {
@@ -341,4 +477,32 @@ fn content_type(path: &Path) -> &'static str {
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
+}
+
+/// Run the stdio transport for a single research conversation.
+pub async fn research_stdio(
+    url: Option<String>,
+    socket: Option<PathBuf>,
+    grant: String,
+) -> anyhow::Result<()> {
+    let endpoint = match (url, socket) {
+        (Some(url), None) => {
+            let u = url::Url::parse(&url)?;
+            anyhow::ensure!(
+                u.scheme() == "http"
+                    && u.host_str()
+                        .is_some_and(|host| matches!(host, "127.0.0.1" | "[::1]"))
+                    && u.path() == "/"
+                    && u.username().is_empty()
+                    && u.password().is_none()
+                    && u.query().is_none()
+                    && u.fragment().is_none(),
+                "Expected loopback endpoint"
+            );
+            research_sessions::NodeEndpoint::Http(url)
+        }
+        (None, Some(path)) if path.is_absolute() => research_sessions::NodeEndpoint::Unix(path),
+        _ => anyhow::bail!("Choose one local endpoint"),
+    };
+    research_mcp::run_stdio(endpoint, grant).await
 }

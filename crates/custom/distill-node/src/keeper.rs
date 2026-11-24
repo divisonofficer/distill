@@ -20,6 +20,8 @@ const EVENT_CAPACITY: usize = 256;
 pub const MAX_CHAT_PROGRESS_BYTES: usize = 1024 * 1024;
 static NULL: Value = Value::Null;
 
+pub type McpServerResolver = Arc<dyn Fn(&str) -> Vec<Value> + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub enum BoardEvent {
     Upsert(Vec<Value>),
@@ -46,6 +48,7 @@ pub struct Keeper {
 
 struct Inner {
     cfg: AgentConfig,
+    mcp_servers: Option<McpServerResolver>,
     conn: Mutex<AgentHandle>,
     state: Mutex<State>,
     attach_gate: tokio::sync::Mutex<()>,
@@ -65,6 +68,13 @@ struct State {
 
 impl Keeper {
     pub async fn start(cfg: AgentConfig) -> anyhow::Result<Self> {
+        Self::start_with_mcp(cfg, None).await
+    }
+
+    pub async fn start_with_mcp(
+        cfg: AgentConfig,
+        mcp_servers: Option<McpServerResolver>,
+    ) -> anyhow::Result<Self> {
         let (handle, rx) = agent::spawn(&cfg).await?;
         handle.initialize().await?;
         let (board, _) = broadcast::channel(EVENT_CAPACITY);
@@ -72,6 +82,7 @@ impl Keeper {
         let (chat_progress, _) = broadcast::channel(EVENT_CAPACITY);
         let inner = Arc::new(Inner {
             cfg,
+            mcp_servers,
             conn: Mutex::new(handle),
             state: Mutex::new(State::default()),
             attach_gate: tokio::sync::Mutex::new(()),
@@ -137,13 +148,27 @@ impl Keeper {
                     .ok_or_else(|| anyhow!("unknown session {session_id}"))?
             }
         };
-        load(&self.handle(), session_id, &cwd).await?;
+        load(
+            &self.handle(),
+            session_id,
+            &cwd,
+            self.inner.mcp_servers.as_ref(),
+        )
+        .await?;
         lock(&self.inner.state).attached.push(session_id.to_owned());
         Ok(())
     }
 
     /// Record a session this keeper created with `session/new`: it is already loaded on this
     /// connection, and the leader lists it only after its first turn, so seed a row with its cwd.
+    pub(crate) fn mcp_servers(&self, session_id: &str) -> Vec<Value> {
+        self.inner
+            .mcp_servers
+            .as_ref()
+            .map(|resolve| resolve(session_id))
+            .unwrap_or_default()
+    }
+
     pub fn adopt(&self, session_id: &str, cwd: &Path, mode: PermissionMode) {
         let mut state = lock(&self.inner.state);
         if !state.attached.iter().any(|s| s == session_id) {
@@ -227,7 +252,7 @@ impl Inner {
                     .flatten()
             });
             match cwd {
-                Some(cwd) => match load(&handle, &sid, &cwd).await {
+                Some(cwd) => match load(&handle, &sid, &cwd, self.mcp_servers.as_ref()).await {
                     Ok(()) => restored.push(sid),
                     Err(e) => tracing::warn!(error = %e, session = %sid, "re-attach failed"),
                 },
@@ -472,14 +497,22 @@ fn roster_rows(res: &Value) -> anyhow::Result<Vec<Value>> {
         .ok_or_else(|| anyhow!("session roster response has no sessions array"))
 }
 
-async fn load(handle: &AgentHandle, session_id: &str, cwd: &Path) -> anyhow::Result<()> {
+async fn load(
+    handle: &AgentHandle,
+    session_id: &str,
+    cwd: &Path,
+    resolver: Option<&McpServerResolver>,
+) -> anyhow::Result<()> {
+    let mcp_servers = resolver
+        .map(|resolve| resolve(session_id))
+        .unwrap_or_default();
     handle
         .request(
             "session/load",
             json!({
                 "sessionId": session_id,
                 "cwd": cwd.to_string_lossy(),
-                "mcpServers": [],
+                "mcpServers": mcp_servers,
                 "_meta": {"yoloMode": false, "autoMode": false, "noReplay": true, "postudioHistoryPaging": true},
             }),
         )

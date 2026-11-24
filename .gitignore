@@ -7,3 +7,9 @@ plan/research-base/LOCAL.md
 *.local.md
 .postudio/
 target-node/
+# Ignore legacy or externally generated build dirs; use target/ for new builds.
+/target-*/
+# Local tool caches created at the repo root
+/.vite/
+/.svelte-kit/
+.playwright-cli/

@@ -92,12 +92,12 @@ impl reqwest::dns::Resolve for TailnetDns {
                 Ok(addresses) => return Ok(Box::new(addresses) as reqwest::dns::Addrs),
                 Err(error) => error,
             };
-            if host.ends_with(".ts.net") {
-                if let Ok(output) = tailscale_status().await {
-                    let addresses = peer_addresses(&output, host)?;
-                    if !addresses.is_empty() {
-                        return Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs);
-                    }
+            if host.ends_with(".ts.net")
+                && let Ok(output) = tailscale_status().await
+            {
+                let addresses = peer_addresses(&output, host)?;
+                if !addresses.is_empty() {
+                    return Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs);
                 }
             }
             Err(system_error.into())

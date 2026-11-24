@@ -3883,6 +3883,7 @@ dependencies = [
  "dunce",
  "futures-util",
  "gethostname",
+ "libc",
  "reqwest 0.12.24",
  "ring",
  "serde",

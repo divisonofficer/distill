@@ -517,8 +517,20 @@ async fn node_restart_reconnects_to_persistent_leader_and_history() {
             .any(|item| item["t"] == "user.message" && item["text"] == "go")),
         "prompt history missing after restart: {page}"
     );
-    let listing: Value = get(&stack, "/api/sessions").send().await.unwrap().json().await.unwrap();
-    assert!(listing["sessions"].as_array().unwrap().iter().any(|row| row["sessionId"] == sid && row["resident"] == true));
+    let listing: Value = get(&stack, "/api/sessions")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["sessionId"] == sid && row["resident"] == true)
+    );
     reopened.close().await;
 }
 

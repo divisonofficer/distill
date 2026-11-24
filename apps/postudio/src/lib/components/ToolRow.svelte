@@ -2,10 +2,12 @@
 import Icon from './Icon.svelte';
 import type { ToolItem } from '$lib/session.svelte';
 import type { ToolContent } from '$lib/types';
+import ResearchResultCard from '$lib/components/ResearchResultCard.svelte';
+import { researchMarker, researchToolName } from '$lib/research-result-marker.js';
 import type { Tone } from '$lib/format';
 import { childExecutionState, type AgentExecution } from '$lib/executions.svelte';
 
-let { item, id, onselect, onoutput, childExecution = null, childExecutionFresh = false, childNeedsInput = false, grouped = false }: { item: ToolItem; id?: string; onselect?: (item: ToolItem) => void; onoutput?: (item: ToolItem) => void; childExecution?: AgentExecution | null; childExecutionFresh?: boolean; childNeedsInput?: boolean; grouped?: boolean } = $props();
+let { item, id, host = '', onselect, onoutput, childExecution = null, childExecutionFresh = false, childNeedsInput = false, grouped = false }: { item: ToolItem; id?: string; host?: string; onselect?: (item: ToolItem) => void; onoutput?: (item: ToolItem) => void; childExecution?: AgentExecution | null; childExecutionFresh?: boolean; childNeedsInput?: boolean; grouped?: boolean } = $props();
 let expanded = $state(false);
 
 type ToolIcon = 'document' | 'terminal' | 'edit' | 'server' | 'stop';
@@ -48,6 +50,7 @@ return { kind: 'other' as const, label: item.title ?? item.name ?? '도구 실�
 });
 
 const texts = $derived((item.content ?? []).filter((content) => content.type === 'text'));
+const researchResult = $derived(researchMarker(researchToolName(item), item.content ?? []));
 const images = $derived(
 (item.content ?? []).flatMap((content) =>
 content.type === 'image' && /^image\/(png|jpeg|gif|webp)$/.test(content.mime) ? [`data:${content.mime};base64,${content.data}`] : []
@@ -155,6 +158,7 @@ return { added, removed };
 {#if failureSummary}<span role="alert" class="min-w-0 flex-1 truncate text-left text-xs text-red-700 dark:text-red-300" title={failureSummary}>{failureSummary}</span>{/if}
 {#if commandStopped}<span class="shrink-0 text-xs text-neutral-500">중지됨</span>{:else if commandSignal}<span class="shrink-0 text-xs text-neutral-500">신호 종료</span>{:else if operation.kind === 'command' && commandExitCode === -1}<span class="shrink-0 text-xs text-neutral-500">상태 확인 중</span>{:else if commandExitCode !== null}<span class="shrink-0 text-xs text-neutral-500">exit {commandExitCode}</span>{:else if operation.kind !== 'subagent' && status && item.status !== 'completed'}<span class="shrink-0 text-xs text-neutral-500">{status.label}</span>{/if}
 </summary>
+{#if researchResult}<ResearchResultCard {host} projectId={researchResult.projectId} marker={researchResult} />{/if}
 <div class="flex max-h-72 flex-col gap-2 overflow-auto border-t border-neutral-200 bg-neutral-950 p-2 dark:border-neutral-800">
 {#if item.status === 'failed' && texts.length === 0}<p role="alert" class="font-mono text-xs text-red-300">도구 실행 실패</p>{/if}
 {#each item.content ?? [] as content, index (index)}

@@ -18,6 +18,15 @@ struct Cli {
 enum Command {
     /// Run the node until a listener fails.
     Serve(Serve),
+    #[command(hide = true)]
+    ResearchMcp {
+        #[arg(long)]
+        node_url: Option<String>,
+        #[arg(long)]
+        node_socket: Option<PathBuf>,
+        #[arg(long)]
+        grant_id: String,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -49,17 +58,28 @@ struct Serve {
     /// Separate public origin for untrusted files and proxied apps.
     #[arg(long)]
     untrusted_origin: Option<String>,
+    /// OpenResearch CLI binary used by the native research workspace.
+    #[arg(long, env = "POSTUDIO_OPENRESEARCH_BIN")]
+    openresearch_bin: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let Command::Serve(args) = Cli::parse().command;
+    let args = match Cli::parse().command {
+        Command::Serve(args) => args,
+        Command::ResearchMcp {
+            node_url,
+            node_socket,
+            grant_id,
+        } => return distill_node::research_stdio(node_url, node_socket, grant_id).await,
+    };
     let state_dir = match args.state_dir {
         Some(dir) => dir,
         None => {
@@ -82,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         web_dir: args.web_dir,
         chat_peer_config: args.chat_peer_config,
         untrusted_origin: args.untrusted_origin,
+        openresearch_bin: args.openresearch_bin,
     })
     .await
 }

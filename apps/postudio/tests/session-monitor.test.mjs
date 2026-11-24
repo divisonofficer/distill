@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { directChildren, scopedChildren } from '../src/lib/session-monitor.ts';
+import { directChildren, scopedChildren, joinChildSessions } from '../src/lib/session-monitor.ts';
 const row = (sessionId, extra = {}) => ({ sessionId, cwd: '/same', title: sessionId, activity: 'working', resident: true, modelId: 'm', isWorktree: false, lastChangeUnixMs: 0, ...extra });
 test('selects only explicit direct subagent children scoped to host', () => {
  const rows = [row('child', { parentSessionId: 'parent', sessionKind: 'subagent', apiOrigin: 'https://one.test' }), row('sibling', { parentSessionId: 'other', sessionKind: 'subagent', apiOrigin: 'https://one.test' }), row('cwd-only', { cwd: '/same', sessionKind: 'subagent', apiOrigin: 'https://one.test' }), row('wrong-host', { parentSessionId: 'parent', sessionKind: 'subagent', apiOrigin: 'https://two.test' }), row('worktree', { parentSessionId: 'parent', sessionKind: 'subagent-worktree', isWorktree: true })];
@@ -24,4 +24,15 @@ test('running footer counts only live command tools and scoped working children'
  assert.match(conversation, /명령 \{runningCommandCount\}/);
  assert.match(conversation, /runningAgentCount > 0.*에이전트 \{runningAgentCount\}/);
  assert.match(workbench, /runningAgentCount=\{childrenFor\(tab\.sessionId\)\.filter\(row => row\.activity === 'working'\)\.length\}/);
+});
+
+test('joins only scoped child IDs and retains unmatched children', () => {
+ const child = row('c', { parentSessionId: 'p', sessionKind: 'subagent' });
+ const unmatched = row('u', { parentSessionId: 'p', sessionKind: 'subagent', title: 'same' });
+ const foreign = row('f', { parentSessionId: 'other', sessionKind: 'subagent' });
+ const agent = { parentSessionId: 'p', childSessionId: 'c', description: 'same' };
+ const joined = joinChildSessions([agent], [child, unmatched, unmatched, foreign], 'p');
+ assert.equal(joined.childFor(agent), child);
+ assert.equal(joined.childFor({ ...agent, parentSessionId: 'other' }), undefined);
+ assert.deepEqual(joined.unmatched, [unmatched]);
 });

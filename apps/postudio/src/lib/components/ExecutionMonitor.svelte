@@ -1,11 +1,12 @@
 <script lang="ts">
 import { childExecutionState, childNeedsInput as hasChildNeedsInput, Executions, type AgentExecution, type CommandExecution } from '$lib/executions.svelte';
+import { joinChildSessions } from '$lib/session-monitor';
 import { commandStatus } from '$lib/command-status';
 import type { BoardRow } from '$lib/types';
 import Icon from './Icon.svelte';
 import AgentDetailModal from './AgentDetailModal.svelte';
 import CommandOutputModal from './CommandOutputModal.svelte';
-let { host, sessionId, client: sharedClient, childSessions = [], blocked = false, active = true }: { host: string; sessionId: string; client?: Executions; childSessions?: BoardRow[]; blocked?: boolean; active?: boolean } = $props();
+let { host, sessionId, client: sharedClient, childSessions = [], blocked = false, active = true, onopen, oncancel, canCancel }: { host: string; sessionId: string; client?: Executions; childSessions?: BoardRow[]; blocked?: boolean; active?: boolean; onopen?: (id: string) => void; oncancel?: (id: string) => void; canCancel?: (id: string) => boolean } = $props();
 let client = $derived(sharedClient ?? new Executions(host, sessionId));
 let selectedAgent = $state<string | null>(null);
 let selectedTask = $state<string | null>(null);
@@ -36,8 +37,9 @@ const commandDuration = (item: CommandExecution, fresh: boolean, timestamp: numb
  return fresh ? Math.max(0, timestamp - item.startedAtUnixMs) : null;
 };
 const durationText = (duration: number) => `${Math.floor(Math.max(0, duration) / 1000)}초`;
+const joined = $derived(joinChildSessions(client.agents, childSessions, sessionId));
 const summary = $derived([
- client.agents.length ? `서브에이전트 ${client.agents.length}개` : '',
+ (client.agents.length + joined.unmatched.length) ? `서브에이전트 ${client.agents.length + joined.unmatched.length}개` : '',
  client.tasks.length ? `명령 ${client.tasks.length}개` : ''
 ].filter(Boolean).join(' · '));
 $effect(() => { host; sessionId; selectedAgent = null; selectedTask = null; expanded = false; });
@@ -56,7 +58,7 @@ $effect(() => {
  return () => clearInterval(timer);
 });
 </script>
-{#if client.agents.length > 0 || client.tasks.length > 0 || !client.agentLoaded || !client.taskLoaded || client.agentUnavailable || client.taskUnavailable || client.agentError || client.taskError}
+{#if client.agents.length > 0 || joined.unmatched.length > 0 || client.tasks.length > 0 || !client.agentLoaded || !client.taskLoaded || client.agentUnavailable || client.taskUnavailable || client.agentError || client.taskError}
 <section class="monitor" aria-label="실행 현황">
  <header>
   <button type="button" aria-expanded={expanded} onclick={() => expanded = !expanded}>실행 현황 {expanded ? '접기' : '펼치기'}</button>
@@ -69,9 +71,10 @@ $effect(() => {
  </header>
  {#if expanded}
   {#if client.agentError || client.taskError}<details class="technical"><summary>오류 정보</summary>{#if client.agentError}<p>{client.agentError}</p>{/if}{#if client.taskError}<p>{client.taskError}</p>{/if}</details>{/if}
-  {#if client.agents.length > 0}
+  {#if client.agents.length > 0 || joined.unmatched.length > 0}
    <section class="category" aria-label="서브에이전트"><h3>서브에이전트</h3>
     <ul>{#each client.agents as item (item.subagentId)}
+     {@const child = joined.childFor(item)}
      {@const fresh = active && !blocked && client.agentFresh[item.subagentId] === true}
      {@const state = agentStatus(item, fresh)}
      {@const duration = agentDuration(item, fresh, now)}
@@ -80,16 +83,26 @@ $effect(() => {
       <div class="identity">
        <div class="identity-head"><strong>{item.subagentType}</strong><span class="state state-{state.tone}">{state.label}</span></div>
        {#if item.description}<p>{item.description}</p>{/if}
+       {#if child}<p>{child.title || child.sessionId} · {child.modelId || '모델 정보 없음'}</p>{/if}
       </div>
       {#if duration !== null}<time aria-label="실행 시간 {durationText(duration)}">{durationText(duration)}</time>{/if}
       <div class="actions">
        <button type="button" onclick={() => selectedAgent = item.subagentId}>상세 보기</button>
+       {#if child && onopen}<button type="button" aria-label={`${child.title || child.sessionId} 보기`} onclick={() => onopen(child.sessionId)}>보기</button>{/if}
        {#if liveStatus(item.status)}<button type="button" disabled={!active || blocked || !fresh || client.pendingAgentStops.includes(item.subagentId)} onclick={() => client.stopAgent(item.subagentId)}>{client.pendingAgentStops.includes(item.subagentId) ? '중지 요청 중…' : '중지'}</button>{/if}
       </div>
       {#if client.agentSnapshotErrors[item.subagentId]}<details class="row-error"><summary>상세 정보를 불러오지 못했어요.</summary><small>{client.agentSnapshotErrors[item.subagentId]}</small></details>{/if}
       {#if client.agentStopErrors[item.subagentId]}<small class="row-error" role="alert">중지 요청 결과: {client.agentStopErrors[item.subagentId]}</small>{/if}
      </li>
-    {/each}</ul>
+    {/each}
+    {#each joined.unmatched as child (child.sessionId)}
+     <li class="execution agent-row">
+      <span class="avatar" aria-hidden="true"><Icon name="server" class="size-4" /></span>
+      <div class="identity"><div class="identity-head"><strong>{child.title || child.sessionId}</strong><span class="state state-unknown">상태 확인 중</span></div><p>{child.modelId || '모델 정보 없음'}</p></div>
+      <div class="actions">{#if canCancel?.(child.sessionId)}<button type="button" aria-label={`${child.title || child.sessionId} 중지`} onclick={() => oncancel?.(child.sessionId)}>중지</button>{/if}{#if onopen}<button type="button" aria-label={`${child.title || child.sessionId} 보기`} onclick={() => onopen(child.sessionId)}>보기</button>{/if}</div>
+     </li>
+    {/each}
+</ul>
    </section>
   {/if}
   {#if client.tasks.length > 0}
