@@ -28,6 +28,7 @@ pub mod research;
 pub(crate) mod research_chat;
 pub(crate) mod research_context;
 pub(crate) mod research_gateway;
+pub(crate) mod research_library;
 pub(crate) mod research_literature;
 pub(crate) mod research_mcp;
 pub(crate) mod research_project;

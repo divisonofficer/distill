@@ -296,7 +296,11 @@ fn tool_definitions() -> Value {
         {"name":"get_run","description":"Get run by id in this project.","inputSchema":{"type":"object","required":["runId"],"properties":{"runId":{"type":"string"}},"additionalProperties":false}},
         {"name":"get_request","description":"Get owner approval request.","inputSchema":{"type":"object","required":["approvalId"],"properties":{"approvalId":{"type":"string"}},"additionalProperties":false}},
         {"name":"metrics","description":"Get actual metrics for a scoped run.","inputSchema":{"type":"object","required":["runId"],"properties":{"runId":{"type":"string"}},"additionalProperties":false}},
-        {"name":"link_references","description":"Link existing literature references to scoped experiment.","inputSchema":{"type":"object","required":["literatureIds"],"properties":{"literatureIds":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}
+        {"name":"link_references","description":"Link existing literature references to scoped experiment.","inputSchema":{"type":"object","required":["literatureIds"],"properties":{"literatureIds":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},
+        {"name":"search_papers","description":"Search scholarly literature: alphaXiv full-text keyword (`keyword`, default) or semantic (`embedding`) retrieval, OpenAlex (`openalex`), bioRxiv (`biorxiv`) or PubMed (`pubmed`). Read the `orx-lit-review` skill first for the retrieval policy, then rank candidates yourself and follow up with get_paper.","inputSchema":{"type":"object","required":["query"],"properties":{"query":{"type":"string","maxLength":512},"strategy":{"type":"string","enum":crate::research_library::STRATEGIES},"limit":{"type":"integer","minimum":1,"maximum":25}},"additionalProperties":false}},
+        {"name":"get_paper","description":"Read one paper: the alphaXiv report (or full extracted text with full=true) for arXiv ids/URLs, or OpenAlex/bioRxiv/PubMed metadata and abstract. The source is detected from the id unless given. Long text is paged: pass the returned nextOffset as offset to continue.","inputSchema":{"type":"object","required":["id"],"properties":{"id":{"type":"string","maxLength":256},"source":{"type":"string","enum":crate::research_library::PAPER_SOURCES},"full":{"type":"boolean"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}},
+        {"name":"list_skills","description":"List OpenResearch skills (research procedures): the overview plus bundled `orx-*` modules with one-line descriptions. Load the matching skill with read_skill before acting in its area.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
+        {"name":"read_skill","description":"Read an OpenResearch skill: `overview`, a module such as `orx-lit-review`, or a module resource such as `orx-compute/hf`.","inputSchema":{"type":"object","required":["name"],"properties":{"name":{"type":"string","maxLength":160}},"additionalProperties":false}}
     ]})["tools"].clone()
 }
 
@@ -313,6 +317,9 @@ async fn call_tool(
         .as_str()
         .ok_or_else(|| tool_error(-32602, "Tool name required"))?;
     let args = &params["arguments"];
+    if let Some(result) = library_tool(service, name, args).await {
+        return result;
+    }
     let marker = |kind: &str, extra: Value| {
         let mut card = json!({"projectId":scope.project_id,"experimentId":extra.pointer("/experiment/id").and_then(Value::as_str).unwrap_or(&scope.experiment_id),"kind":kind});
         if let Some(id) = extra
@@ -497,6 +504,114 @@ async fn call_tool(
     Ok(json!({"content":[{"type":"text","text":text}],"structuredContent":marked,"isError":false}))
 }
 
+/// Literature and skill tools: read-only, not tied to the grant's project, so their
+/// results carry no research card marker.
+async fn library_tool(
+    service: &crate::research::ResearchService,
+    name: &str,
+    args: &Value,
+) -> Option<Result<Value, (i64, &'static str)>> {
+    use crate::research_library::{POSTUDIO_SKILL_NOTE, skill_index};
+    let orx = |error: crate::research::OrxCallError| match error {
+        crate::research::OrxCallError::Invalid => tool_error(-32602, error.message()),
+        _ => tool_error(-32000, error.message()),
+    };
+    let run = async {
+        let data = match name {
+            "search_papers" => {
+                strict_args(args, &["query", "strategy", "limit"])?;
+                let query = args["query"]
+                    .as_str()
+                    .ok_or_else(|| tool_error(-32602, "query required"))?;
+                let strategy = match &args["strategy"] {
+                    Value::Null => "keyword",
+                    value => value
+                        .as_str()
+                        .ok_or_else(|| tool_error(-32602, "strategy must be a string"))?,
+                };
+                let limit = match &args["limit"] {
+                    Value::Null => 10,
+                    value => value
+                        .as_u64()
+                        .and_then(|n| u8::try_from(n).ok())
+                        .ok_or_else(|| tool_error(-32602, "limit must be 1-25"))?,
+                };
+                service
+                    .search_literature(strategy, query, limit)
+                    .await
+                    .map_err(orx)?
+            }
+            "get_paper" => {
+                strict_args(args, &["id", "source", "full", "offset"])?;
+                let id = args["id"]
+                    .as_str()
+                    .ok_or_else(|| tool_error(-32602, "id required"))?;
+                let source = match &args["source"] {
+                    Value::Null => None,
+                    value => Some(
+                        value
+                            .as_str()
+                            .ok_or_else(|| tool_error(-32602, "source must be a string"))?,
+                    ),
+                };
+                let full = match &args["full"] {
+                    Value::Null => false,
+                    value => value
+                        .as_bool()
+                        .ok_or_else(|| tool_error(-32602, "full must be a boolean"))?,
+                };
+                let offset = match &args["offset"] {
+                    Value::Null => 0,
+                    value => value
+                        .as_u64()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .ok_or_else(|| {
+                            tool_error(-32602, "offset must be a non-negative integer")
+                        })?,
+                };
+                let page = service
+                    .paper_page(id, source, full, offset)
+                    .await
+                    .map_err(orx)?;
+                json!({"id":id,"source":source,"full":full,"offset":page.offset,"nextOffset":page.next_offset,"totalChars":page.total_chars,"text":page.text})
+            }
+            "list_skills" => {
+                strict_args(args, &[])?;
+                let overview = service.skill_text(None).await.map_err(orx)?;
+                let mut skills = vec![
+                    json!({"name":"overview","description":"OpenResearch cardinal rules, command map and typical workflow. Read first."}),
+                ];
+                skills.extend(
+                    skill_index(&overview)
+                        .into_iter()
+                        .map(|(name, description)| json!({"name":name,"description":description})),
+                );
+                json!({"skills":skills})
+            }
+            "read_skill" => {
+                strict_args(args, &["name"])?;
+                let skill = args["name"]
+                    .as_str()
+                    .ok_or_else(|| tool_error(-32602, "name required"))?;
+                let text = service.skill_text(Some(skill)).await.map_err(orx)?;
+                json!({"name":skill,"text":format!("{POSTUDIO_SKILL_NOTE}{text}")})
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(data))
+    };
+    match run.await {
+        Ok(Some(data)) => {
+            let text = serde_json::to_string(&data).unwrap_or_else(|_| "{}".into());
+            Some(Ok(
+                json!({"content":[{"type":"text","text":text}],"structuredContent":data,"isError":false}),
+            ))
+        }
+        Ok(None) => None,
+        Err(error) => Some(Err(error)),
+    }
+}
+
 fn strict_args(args: &Value, allowed: &[&str]) -> Result<(), (i64, &'static str)> {
     let object = args
         .as_object()
@@ -517,6 +632,245 @@ mod tests {
         assert_eq!(value["jsonrpc"], "2.0");
         assert_eq!(value["id"], 7);
         assert_eq!(value["error"]["code"], -32601);
+    }
+
+    #[cfg(unix)]
+    const FAKE_ORX: &str = r#"#!/bin/sh
+# Fake `orx` for library tool tests. Args: --no-telemetry <command> ...
+shift
+echo "$1" >> "$HOME/calls.log"
+case "$1" in
+  discover)
+    # discover <strategy> --limit <n> -- <query>
+    printf '[{"source":"alphaxiv","id":"2611.00001","title":"%s|%s|%s","abstract":"A","publicationDate":"2026-01-01","snippets":["s"],"votes":1}]' "$2" "$4" "$6"
+    ;;
+  paper)
+    printf 'ARGS:%s\n' "$*"
+    head -c 30000 /dev/zero | tr '\000' 'x'
+    ;;
+  skill)
+    if [ -z "$2" ]; then
+      printf '# OpenResearch CLI\n\nBundled modules (orx skill <name>):\n  orx-create           Initialize a project.\n  orx-lit-review       Explain concepts with evidence.\n'
+    else
+      printf 'MODULE:%s\n' "$2"
+    fi
+    ;;
+  *) exit 3 ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    fn fake_service() -> (tempfile::TempDir, crate::research::ResearchService) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("orx");
+        std::fs::write(&bin, FAKE_ORX).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service = crate::research::ResearchService::new(
+            Some(bin),
+            dir.path().join("state"),
+            crate::ports::port_policy([]),
+        );
+        (dir, service)
+    }
+
+    fn scope() -> crate::research_sessions::ResearchScope {
+        crate::research_sessions::ResearchScope {
+            project_id: "p".into(),
+            experiment_id: "e".into(),
+            session_id: None,
+            grant_id: "g".into(),
+        }
+    }
+
+    async fn call(
+        service: &crate::research::ResearchService,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, (i64, &'static str)> {
+        call_tool(
+            service,
+            &scope(),
+            &json!({"name":name,"arguments":arguments}),
+        )
+        .await
+    }
+
+    #[test]
+    fn tool_list_includes_library_tools() {
+        let names: Vec<String> = tool_definitions()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        for name in ["search_papers", "get_paper", "list_skills", "read_skill"] {
+            assert!(names.iter().any(|n| n == name), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_papers_passes_strategy_limit_and_query_after_separator() {
+        let (_dir, service) = fake_service();
+        let result = call(
+            &service,
+            "search_papers",
+            json!({"query":"--full gaussian"}),
+        )
+        .await
+        .unwrap();
+        let data = &result["structuredContent"];
+        assert_eq!(data["strategy"], "keyword");
+        assert_eq!(data["count"], 1);
+        assert_eq!(data["papers"][0]["title"], "keyword|10|--full gaussian");
+        assert!(
+            data.get("postudioResearch").is_none(),
+            "library results carry no research card"
+        );
+        let embedding = call(
+            &service,
+            "search_papers",
+            json!({"query":"splats","strategy":"embedding","limit":3}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            embedding["structuredContent"]["papers"][0]["title"],
+            "embedding|3|splats"
+        );
+        for bad in [
+            json!({"query":"q","strategy":"google"}),
+            json!({"query":"q","limit":0}),
+            json!({"query":"q","limit":26}),
+            json!({"query":"  "}),
+            json!({"query":"q","extra":1}),
+        ] {
+            assert_eq!(
+                call(&service, "search_papers", bad.clone())
+                    .await
+                    .unwrap_err()
+                    .0,
+                -32602,
+                "{bad}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_paper_pages_from_one_fetch() {
+        let (dir, service) = fake_service();
+        let first = call(
+            &service,
+            "get_paper",
+            json!({"id":"2611.00001","source":"alphaxiv","full":true}),
+        )
+        .await
+        .unwrap();
+        let first = &first["structuredContent"];
+        let text = first["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("ARGS:paper --source alphaxiv --full -- 2611.00001\n"),
+            "{}",
+            &text[..80]
+        );
+        assert_eq!(
+            text.chars().count(),
+            crate::research_library::PAPER_PAGE_CHARS
+        );
+        let next = first["nextOffset"].as_u64().unwrap();
+        let second = call(
+            &service,
+            "get_paper",
+            json!({"id":"2611.00001","source":"alphaxiv","full":true,"offset":next}),
+        )
+        .await
+        .unwrap();
+        let second = &second["structuredContent"];
+        assert!(second["nextOffset"].is_null());
+        assert_eq!(
+            next + second["text"].as_str().unwrap().chars().count() as u64,
+            first["totalChars"].as_u64().unwrap()
+        );
+        let calls = std::fs::read_to_string(
+            dir.path()
+                .join("state/research/openresearch/home/calls.log"),
+        )
+        .unwrap();
+        assert_eq!(
+            calls.lines().filter(|l| *l == "paper").count(),
+            1,
+            "second page comes from the cache"
+        );
+        for bad in [
+            json!({"id":"-x"}),
+            json!({"id":"a b"}),
+            json!({"id":"1","source":"scholar"}),
+            json!({"id":"1","offset":-1}),
+        ] {
+            assert_eq!(
+                call(&service, "get_paper", bad.clone())
+                    .await
+                    .unwrap_err()
+                    .0,
+                -32602,
+                "{bad}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skills_list_and_read_with_postudio_note() {
+        let (_dir, service) = fake_service();
+        let list = call(&service, "list_skills", json!({})).await.unwrap();
+        let names: Vec<&str> = list["structuredContent"]["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["overview", "orx-create", "orx-lit-review"]);
+        let skill = call(&service, "read_skill", json!({"name":"orx-lit-review"}))
+            .await
+            .unwrap();
+        let text = skill["structuredContent"]["text"].as_str().unwrap();
+        assert!(text.starts_with(crate::research_library::POSTUDIO_SKILL_NOTE));
+        assert!(text.ends_with("MODULE:orx-lit-review\n"));
+        let overview = call(&service, "read_skill", json!({"name":"overview"}))
+            .await
+            .unwrap();
+        assert!(
+            overview["structuredContent"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Bundled modules")
+        );
+        for bad in ["../etc/passwd", "orx-a/../b", "lit-review"] {
+            assert_eq!(
+                call(&service, "read_skill", json!({"name":bad}))
+                    .await
+                    .unwrap_err()
+                    .0,
+                -32602,
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn library_tools_report_missing_openresearch() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = crate::research::ResearchService::new(
+            None,
+            dir.path().to_path_buf(),
+            crate::ports::port_policy([]),
+        );
+        let error = call(&service, "search_papers", json!({"query":"q"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, (-32000, "OpenResearch not configured"));
     }
 
     #[test]

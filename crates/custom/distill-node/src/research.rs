@@ -33,8 +33,35 @@ pub(crate) struct ResearchState {
     client: reqwest::Client,
     blocked_ports: crate::ports::PortPolicy,
     refs: crate::research_refs::RefsStore,
+    papers: crate::research_library::PaperCache,
 }
 pub(crate) type ResearchService = ResearchState;
+
+/// Why a read-only `orx` call produced no usable output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrxCallError {
+    NotConfigured,
+    Invalid,
+    Launch,
+    Read,
+    TooLarge,
+    Failed,
+    Timeout,
+}
+
+impl OrxCallError {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "OpenResearch not configured",
+            Self::Invalid => "Invalid arguments",
+            Self::Launch => "Could not launch OpenResearch",
+            Self::Read => "Could not read OpenResearch output",
+            Self::TooLarge => "OpenResearch output too large",
+            Self::Failed => "OpenResearch provider unavailable or disabled",
+            Self::Timeout => "OpenResearch provider timed out",
+        }
+    }
+}
 #[derive(Clone, Deserialize)]
 struct Descriptor {
     #[serde(default)]
@@ -949,7 +976,61 @@ impl ResearchState {
             blocked_ports,
             refs: crate::research_refs::RefsStore::new(state_dir.clone()),
             client: loopback_client(),
+            papers: crate::research_library::PaperCache::default(),
         }
+    }
+    pub(crate) fn papers(&self) -> &crate::research_library::PaperCache {
+        &self.papers
+    }
+    /// One read-only `orx` call in the isolated research home. Stdout is capped at `limit`
+    /// bytes; a timeout drops the child, which `kill_on_drop` reaps.
+    pub(crate) async fn orx_output(
+        &self,
+        args: &[&str],
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, OrxCallError> {
+        use tokio::io::AsyncReadExt;
+        let bin = self.bin.as_ref().ok_or(OrxCallError::NotConfigured)?;
+        let home = self.root.join("home");
+        tokio::fs::create_dir_all(&home)
+            .await
+            .map_err(|_| OrxCallError::Launch)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "bounded read-only orx call with kill_on_drop; the timeout reaps it"
+        )]
+        let mut child = isolated_command(bin)
+            .args(args)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("ORX_DATA_DIR", self.root.join("data"))
+            .env("ORX_CACHE_DIR", self.root.join("cache"))
+            .env("ORX_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| OrxCallError::Launch)?;
+        let stdout = child.stdout.take().ok_or(OrxCallError::Launch)?;
+        tokio::time::timeout(timeout, async {
+            let mut bytes = Vec::new();
+            stdout
+                .take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| OrxCallError::Read)?;
+            if bytes.len() > limit {
+                return Err(OrxCallError::TooLarge);
+            }
+            if !child.wait().await.is_ok_and(|s| s.success()) {
+                return Err(OrxCallError::Failed);
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|_| OrxCallError::Timeout)?
     }
     pub(crate) fn state_dir(&self) -> PathBuf {
         self.root
@@ -1049,7 +1130,6 @@ impl ResearchState {
         source: &str,
         query: &str,
     ) -> Result<Value, Response> {
-        use tokio::io::AsyncReadExt;
         let strategy = match source {
             "alphaXiv" => "keyword",
             "openAlex" => "openalex",
@@ -1060,69 +1140,47 @@ impl ResearchState {
         if query.trim().is_empty() || query.len() > 512 {
             return Err(err(StatusCode::BAD_REQUEST, "Invalid search terms"));
         }
-        let bin = self.bin.as_ref().ok_or_else(|| {
-            err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "OpenResearch not configured",
+        let bytes = self
+            .orx_output(
+                &[
+                    "--no-telemetry",
+                    "discover",
+                    strategy,
+                    "--limit",
+                    "15",
+                    "--",
+                    query,
+                ],
+                BODY_LIMIT,
+                Duration::from_secs(16),
             )
-        })?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "bounded orx discover call with kill_on_drop; the 16 s timeout reaps it"
-        )]
-        let mut child = isolated_command(bin)
-            .args([
-                "--no-telemetry",
-                "discover",
-                strategy,
-                "--limit",
-                "15",
-                "--",
-                query,
-            ])
-            .env("HOME", self.root.join("home"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("ORX_DATA_DIR", self.root.join("data"))
-            .env("ORX_CACHE_DIR", self.root.join("cache"))
-            .env("ORX_NO_UPDATE_CHECK", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| {
-                err(
+            .await
+            .map_err(|error| match error {
+                OrxCallError::NotConfigured => err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "OpenResearch not configured",
+                ),
+                OrxCallError::Launch => err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Could not launch literature search",
-                )
-            })?;
-        tokio::time::timeout(Duration::from_secs(16), async {
-            let mut bytes = Vec::new();
-            child
-                .stdout
-                .take()
-                .expect("piped stdout")
-                .take(BODY_LIMIT as u64 + 1)
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|_| err(StatusCode::BAD_GATEWAY, "Could not read literature results"))?;
-            if bytes.len() > BODY_LIMIT {
-                return Err(err(
+                ),
+                OrxCallError::Read => {
+                    err(StatusCode::BAD_GATEWAY, "Could not read literature results")
+                }
+                OrxCallError::TooLarge => err(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "Literature response too large",
-                ));
-            }
-            if !child.wait().await.is_ok_and(|s| s.success()) {
-                return Err(err(
+                ),
+                OrxCallError::Invalid | OrxCallError::Failed => err(
                     StatusCode::BAD_GATEWAY,
                     "Literature provider unavailable or disabled",
-                ));
-            }
-            serde_json::from_slice(&bytes)
-                .map_err(|_| err(StatusCode::BAD_GATEWAY, "Invalid literature results"))
-        })
-        .await
-        .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Literature provider timed out"))?
+                ),
+                OrxCallError::Timeout => {
+                    err(StatusCode::GATEWAY_TIMEOUT, "Literature provider timed out")
+                }
+            })?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| err(StatusCode::BAD_GATEWAY, "Invalid literature results"))
     }
     pub(crate) async fn metrics(&self, p: &str, r: &str) -> Result<Value, Response> {
         self.owned_run(p, r).await?;
@@ -1456,6 +1514,7 @@ mod tests {
             client: loopback_client(),
             blocked_ports: crate::ports::port_policy([]),
             refs: crate::research_refs::RefsStore::new(PathBuf::from("/tmp/unneeded")),
+            papers: crate::research_library::PaperCache::default(),
         };
         let st = inspect(&s).await;
         assert!(!st.available);
