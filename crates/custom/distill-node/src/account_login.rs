@@ -364,6 +364,10 @@ async fn relay_callback(
             "Could not deliver the login callback.",
         )
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "delivers the callback_target-validated OAuth callback to a loopback http URL; proxies and redirects are disabled"
+    )]
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
