@@ -80,7 +80,7 @@ T0.4는 비용이 들지 않는다. 레포의 테스트용 가짜 모델 서버(
 | D push | §6 | `src/push.rs`(필요하면 `src/push/`), `tests/push.rs` | `cargo test -p distill-node push` (RFC 8291 벡터) |
 | E 업스트림 | 패치 #2: 세션 단위 모드 변경을 그 세션 구독자에게 알림(L4 관찰) | `distill-shell` 해당 파일, `PATCHES.md` | `RUST_MIN_STACK=16777216 cargo test -p distill-shell --lib -- agent::mvp_agent::tests leader::server`, `postudio-probe` l4 확장 |
 
-트랙 A·B·D는 `CARGO_TARGET_DIR=target-node`를 쓴다. 트랙 E와 `postudio-probe` 실행만 `target/`(전체 빌드)를 쓴다. **`distill-node`에 Distill 내부 크레이트 의존을 추가하지 않는다**(`distill-version` 제외). 트랙 C는 A가 끝나기 전에는 `tests/fixtures/sep/*.json`으로 화면을 만든다.
+빌드 출력은 트랙별로 나누지 않고 체크아웃의 기본 `target/`을 재사용한다. 일회성 검증·배포 빌드에는 `CARGO_INCREMENTAL=0`을 사용한다. 자세한 현행 규칙은 [AGENTS.md](../../AGENTS.md)를 따른다. **`distill-node`에 Distill 내부 크레이트 의존을 추가하지 않는다**(`distill-version` 제외). 트랙 C는 A가 끝나기 전에는 `tests/fixtures/sep/*.json`으로 화면을 만든다.
 
 ### 2단계 — 통합 (트랙 E 완료 후)
 
