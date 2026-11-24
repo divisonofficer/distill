@@ -7,3 +7,9 @@ plan/research-base/LOCAL.md
 *.local.md
 .postudio/
 target-node/
+# Build dirs other than /target (see AGENTS.md: only target/ and target-node/ are sanctioned)
+/target-*/
+# Local tool caches created at the repo root
+/.vite/
+/.svelte-kit/
+.playwright-cli/

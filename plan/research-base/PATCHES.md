@@ -8,6 +8,16 @@ rebase할 때 이 목록만 확인하면 되도록 한다.
 | 1 | 세션별 권한 모드 전환 (S10) | `distill-shell/src/agent/mvp_agent/acp_agent.rs`, `distill-shell/src/leader/server.rs` | ✅ `sessionId` 없으면 기존 동작 | `mvp_agent/tests.rs` 3개, `leader/server_tests.rs` 1개 |
 | 2 | 세션별 모드 변경을 그 세션 구독자 전체에 알림 (L4) | `distill-shell/src/agent/mvp_agent/acp_agent.rs`, `distill-pager/src/app/acp_handler/mod.rs`, `distill-pager/src/app/acp_handler/settings.rs` | ✅ `sessionId` 없으면 알림 없음 (기존 동작) | `mvp_agent/tests.rs` 2개, `acp_handler/tests/settings.rs` 1개, `postudio-probe` `l4_session_scoped_mode_change` |
 
+
+### 빌드 설정 (업스트림 파일, 코드 동작 변화 없음)
+
+| 파일 | 변경 | 이유 |
+|---|---|---|
+| `.cargo/config.toml` | `[build] incremental = false` (모든 프로필) | 병렬 에이전트로 incremental 캐시가 target 디렉터리마다 50GB 넘게 쌓여 디스크 98% 도달. 한 셸에서만 켜려면 `CARGO_INCREMENTAL=1` |
+| `.gitignore` | `/target-*/` | 허용된 `target/`, `target-node/` 외 빌드 디렉터리 무시 |
+| `AGENTS.md` (신규) | 빌드 디렉터리·디스크 규칙 | 에이전트가 세션마다 읽음 |
+| `scripts/clean-build-cache.sh` (신규) | 사용 중이 아닌 incremental·비허용 target·worktree 빌드 디렉터리 정리 (기본 dry-run) | 재발 시 정리 |
+
 ---
 
 ## #1 `x.ai/yolo_mode_changed`에 `sessionId` 범위 추가
