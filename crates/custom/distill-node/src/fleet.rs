@@ -1,7 +1,12 @@
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use serde_json::Value;
-use std::{process::Stdio, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 const MAX_STATUS_BYTES: usize = 1024 * 1024;
@@ -26,17 +31,23 @@ async fn discover() -> Result<Json<Vec<PeerHost>>, (axum::http::StatusCode, Json
 }
 
 async fn discover_peers() -> anyhow::Result<Vec<PeerHost>> {
+    parse_peers(&tailscale_status().await?)
+}
+
+async fn tailscale_status() -> anyhow::Result<Vec<u8>> {
     #[expect(
         clippy::disallowed_methods,
         reason = "node-owned probe has a bounded timeout and kill_on_drop"
     )]
-    let mut child = Command::new("tailscale")
-        .args(["status", "--json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut child = Command::new(
+        std::env::var_os("POSTUDIO_TAILSCALE_BIN").unwrap_or_else(|| "tailscale".into()),
+    )
+    .args(["status", "--json"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true)
+    .spawn()?;
     let stdout = child
         .stdout
         .take()
@@ -58,7 +69,71 @@ async fn discover_peers() -> anyhow::Result<Vec<PeerHost>> {
     if !status.success() {
         anyhow::bail!("tailscale status failed");
     }
-    parse_peers(&output)
+    Ok(output)
+}
+
+/// For WSL hosts using the Windows Tailscale daemon, preserve the HTTPS name
+/// while resolving known MagicDNS peers through the local daemon if DNS fails.
+pub(crate) fn with_tailnet_dns(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    if std::env::var_os("POSTUDIO_TAILSCALE_BIN").is_some() {
+        builder.dns_resolver(Arc::new(TailnetDns))
+    } else {
+        builder
+    }
+}
+
+struct TailnetDns;
+
+impl reqwest::dns::Resolve for TailnetDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str();
+            let system_error = match tokio::net::lookup_host((host.to_owned(), 0)).await {
+                Ok(addresses) => return Ok(Box::new(addresses) as reqwest::dns::Addrs),
+                Err(error) => error,
+            };
+            if host.ends_with(".ts.net") {
+                if let Ok(output) = tailscale_status().await {
+                    let addresses = peer_addresses(&output, host)?;
+                    if !addresses.is_empty() {
+                        return Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs);
+                    }
+                }
+            }
+            Err(system_error.into())
+        })
+    }
+}
+
+fn peer_addresses(output: &[u8], host: &str) -> anyhow::Result<Vec<SocketAddr>> {
+    let status: Value = serde_json::from_slice(output)?;
+    let mut addresses = Vec::new();
+    if let Some(peers) = status.get("Peer").and_then(Value::as_object) {
+        for peer in peers.values() {
+            if !peer
+                .get("DNSName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.trim_end_matches('.').eq_ignore_ascii_case(host))
+            {
+                continue;
+            }
+            if let Some(ips) = peer.get("TailscaleIPs").and_then(Value::as_array) {
+                addresses.extend(
+                    ips.iter()
+                        .filter_map(Value::as_str)
+                        .filter_map(|ip| ip.parse::<IpAddr>().ok())
+                        .filter(|ip| match ip {
+                            IpAddr::V4(ip) => {
+                                ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+                            }
+                            IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+                        })
+                        .map(|ip| SocketAddr::new(ip, 0)),
+                );
+            }
+        }
+    }
+    Ok(addresses)
 }
 
 fn parse_peers(output: &[u8]) -> anyhow::Result<Vec<PeerHost>> {
@@ -89,6 +164,24 @@ fn parse_peers(output: &[u8]) -> anyhow::Result<Vec<PeerHost>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_resolves_only_matching_tailnet_addresses() {
+        let output = br#"{"Peer":{"a":{"DNSName":"Peer.tailnet.ts.net.","TailscaleIPs":["100.64.1.2","fd7a:115c:a1e0::2","127.0.0.1","garbage"]},"b":{"DNSName":"other.tailnet.ts.net.","TailscaleIPs":["100.64.1.3"]}}}"#;
+        let found = peer_addresses(output, "peer.tailnet.ts.net").unwrap();
+        assert_eq!(
+            found,
+            vec![
+                "100.64.1.2:0".parse().unwrap(),
+                "[fd7a:115c:a1e0::2]:0".parse().unwrap()
+            ]
+        );
+        assert!(
+            peer_addresses(output, "unknown.tailnet.ts.net")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn exposes_only_dns_url_and_online_state() {

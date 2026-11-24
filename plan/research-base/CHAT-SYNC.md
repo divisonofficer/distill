@@ -10,6 +10,10 @@ Peer credentials are written atomically to `state-dir/managed-chat-peers.json`, 
 
 Tailscale installation, HTTPS exposure, initial owner/allowed-origin configuration, and service startup remain deployment prerequisites. Pairing does not install or start a server on another device.
 
+### WSL with Tailscale running on Windows
+
+From WSL, check that the Windows executable can run `status --json`. Start `postudio-node` with `POSTUDIO_TAILSCALE_BIN='/mnt/c/Program Files/Tailscale/tailscale.exe'` (adjust to your installation). Discovery uses that executable. For pairing and synchronization, if normal name resolution fails for a `.ts.net` name, the node looks up the exact peer name and its Tailscale IPs in that local status output. HTTPS keeps the original name and certificate checks. This does not change browser DNS or Windows/WSL networking.
+
 ## Legacy configuration
 
 Manual configurations remain supported with `postudio-node serve --chat-peer-config <path>`. The managed configuration becomes authoritative once it exists; the legacy file is used only when there is no managed configuration. Use a local file with mode `0600` on Unix. Never commit configs or put real URLs, bearer tokens, invitations, or private keys in this repository.

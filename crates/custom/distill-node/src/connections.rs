@@ -199,7 +199,8 @@ impl Connections {
             sync.replace_peers(file.peers)?;
         }
         let client = distill_extra_ca::build_reqwest_client(|b| {
-            b.timeout(Duration::from_secs(10))
+            crate::fleet::with_tailnet_dns(b)
+                .timeout(Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
         })?;
         Ok(Self {

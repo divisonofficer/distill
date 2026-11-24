@@ -189,7 +189,7 @@ impl PeerSync {
             trusted_keys: BTreeMap::from([(identity.node_id, identity.public_key)]),
         };
         let client = distill_extra_ca::build_reqwest_client(|builder| {
-            builder
+            crate::fleet::with_tailnet_dns(builder)
                 .timeout(PEER_TIMEOUT)
                 .redirect(reqwest::redirect::Policy::none())
         })
