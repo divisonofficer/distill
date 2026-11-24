@@ -10,6 +10,12 @@ Peer credentials are written atomically to `state-dir/managed-chat-peers.json`, 
 
 Tailscale installation, HTTPS exposure, initial owner/allowed-origin configuration, and service startup remain deployment prerequisites. Pairing does not install or start a server on another device.
 
+### General chat account routing
+
+The chat composer combines models and connected account nicknames from the current node and directly paired nodes. It displays the credential host beside the account. `/api/chat-accounts` is owner/Origin guarded and returns only connected account IDs, providers, and labels, not emails, usage details, or credentials. Coding sessions and account administration remain host-local.
+
+The chat's receiving node retains ownership of the message and claims its completion before sending a bounded copy of the selected branch's prompt to the credential host. The gateway uses the existing peer bearer credentials over TLS and only the configured peer identified by its node ID. The worker uses the selected Distill account with no cross-account or cross-host fallback. The receiving node persists the reply and replicates the signed chat events to peers. A lost completion response is ambiguous and is never automatically retried; this is not a distributed exactly-once protocol. Remote completions show a pending state rather than incremental text streaming. Both nodes and their Distill leaders must be upgraded together.
+
 ### WSL with Tailscale running on Windows
 
 From WSL, check that the Windows executable can run `status --json`. Start `postudio-node` with `POSTUDIO_TAILSCALE_BIN='/mnt/c/Program Files/Tailscale/tailscale.exe'` (adjust to your installation). Discovery uses that executable. For pairing and synchronization, if normal name resolution fails for a `.ts.net` name, the node looks up the exact peer name and its Tailscale IPs in that local status output. HTTPS keeps the original name and certificate checks. This does not change browser DNS or Windows/WSL networking.

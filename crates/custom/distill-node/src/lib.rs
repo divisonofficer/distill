@@ -14,10 +14,10 @@ pub mod chat_sync;
 pub mod chats;
 pub mod configuration;
 pub mod connections;
+pub mod executions;
 pub mod fleet;
 pub mod guard;
 pub mod interaction;
-pub mod executions;
 pub mod keeper;
 pub mod listen;
 pub mod models;
@@ -240,10 +240,11 @@ fn trusted_services_router(
         .merge(fleet::routes())
         .merge(artifacts::routes(keeper.clone()))
         .merge(ports::routes(web.blocked_ports))
-        .merge(chats::routes_with_services(
+        .merge(chats::routes_with_peers(
             chat_store,
-            completion,
+            completion.clone(),
             sync_status,
+            peer_sync.clone(),
         ))
         .merge(accounts::routes(agent.clone()))
         .merge(account_login::routes(agent.clone()))
@@ -258,6 +259,9 @@ fn trusted_services_router(
         .merge(guarded);
     if let Some(peer_sync) = peer_sync {
         app = app.merge(peer_sync.routes());
+        if let Some(completion) = completion {
+            app = app.merge(peer_sync.completion_routes(completion));
+        }
     }
     if let Some(connections) = connections {
         app = app

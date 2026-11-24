@@ -44,7 +44,7 @@ onMount(() => {
  const timer = setInterval(() => void refresh(), 10000);
  return () => { mounted = false; clearInterval(timer); clearInvitation(); pasted = ''; };
 });
-const warning = '연결하면 기존 및 앞으로의 모든 일반 채팅을 공유하고 상대 호스트의 브라우저 웹 주소 접근을 허용해요. 신뢰하는 기기와만 연결하세요.';
+const warning = '연결하면 기존 및 앞으로의 일반 채팅을 공유하고, 서로의 연결된 모델 계정으로 일반 채팅 응답을 요청할 수 있어요. 모델 사용량은 계정이 연결된 호스트에 반영됩니다. 신뢰하는 기기와만 연결하세요.';
 async function generate() {
  error = ''; notice = '';
  const origin = pairingOrigin(location.origin);

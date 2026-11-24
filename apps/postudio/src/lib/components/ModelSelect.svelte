@@ -14,10 +14,12 @@ initialFromCatalog = false,
 disabled = false,
 commitOnSelect = true,
 onselect,
-host
+host,
+modelOptions
 }: {
 id: string;
 host?: string;
+modelOptions?: Model[];
 label?: string;
 compact?: boolean;
 value?: string;
@@ -46,7 +48,7 @@ let root = $state<HTMLDivElement>();
 let repositionCleanup: (() => void) | undefined;
 let input = $state<HTMLInputElement>();
 let selectionFocusPending = $state(false);
-let catalogModels = $derived(authenticatedModels(catalog?.availableModels ?? [], accounts));
+let catalogModels = $derived(modelOptions ?? authenticatedModels(catalog?.availableModels ?? [], accounts));
 let menuGroups = $derived(defaultModelGroups(catalogModels));
 let autoModel = $derived(catalogModels.find(isAutoModel));
 let rootEntries = $derived([
@@ -58,7 +60,7 @@ let searchModels = $derived(searchGroups.flatMap((group) => group.models));
 let submenuModels = $derived(menuGroups.find((group) => group.provider === submenuProvider)?.models ?? []);
 let selectedModel = $derived(catalogModels.find((model) => model.modelId === value));
 let selectedProvider = $derived(selectedModel ? modelProvider(selectedModel.modelId) : null);
-let selectDisabled = $derived(disabled || loading || error !== '' || (catalog !== null && catalog.availableModels.length === 0));
+let selectDisabled = $derived(disabled || loading || error !== '' || (modelOptions !== undefined && !modelOptions.length) || (catalog !== null && catalog.availableModels.length === 0));
 let activeDescendant = $derived.by(() => {
 if (!open) return undefined;
 if (query.trim()) return activeModelIndex >= 0 && activeModelIndex < searchModels.length ? `${id}-option-${activeModelIndex}` : undefined;
@@ -83,6 +85,7 @@ return colors[provider] ?? 'bg-neutral-100 text-neutral-600 dark:bg-neutral-800 
 
 $effect(() => {
 const destination = host;
+if (modelOptions !== undefined) { loading = false; return; }
 selectionFocusPending = false;
 untrack(closeMenu);
 let active = true;

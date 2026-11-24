@@ -1,5 +1,6 @@
 import { get, writable, type Writable } from 'svelte/store';
 import type { TextFileIn } from './types';
+import type { ChatAccountRoute } from './chat-fleet';
 
 export interface ChatSummary {
 chatId: string;
@@ -91,6 +92,7 @@ chatId: string;
 userMessageId: string | null;
 modelId: string;
 status: ChatOperationStatus;
+route?: ChatAccountRoute;
 error?: string;
 progress?: ChatProgress;
 }

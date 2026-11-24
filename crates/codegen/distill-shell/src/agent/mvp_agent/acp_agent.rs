@@ -2037,7 +2037,8 @@ impl acp::Agent for MvpAgent {
             "x.ai/session/load_history" => {
                 crate::extensions::chat_conversation_history::handle(self, &args).await
             }
-            "x.ai/chat/complete" => crate::extensions::chat_complete::handle(self, &args).await,
+            "x.ai/chat/complete" => crate::extensions::chat_complete::handle(self, &args, false).await,
+            "x.ai/chat/complete-account" => crate::extensions::chat_complete::handle(self, &args, true).await,
             "x.ai/session/search" => {
                 crate::extensions::session_search::handle(self, &args).await
             }

@@ -20,7 +20,10 @@ use ring::hmac::{HMAC_SHA256, Key as HmacKey, sign as hmac_sign, verify as hmac_
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::chat_store::{Envelope, Store};
+use crate::chat_store::{Envelope, MAX_TEXT_BYTES, Store};
+use crate::chats::{
+    AccountCompletion, COMPLETION_TIMEOUT, ChatCompleter, CompletionError, CompletionResult,
+};
 
 pub const MAX_SYNC_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -113,6 +116,7 @@ struct PeerSnapshot {
 }
 
 struct Peer {
+    node_id: String,
     incoming_token_tag: [u8; 32],
     outgoing_url: Url,
     outgoing_token: String,
@@ -244,6 +248,7 @@ impl PeerSync {
             let outgoing_url = validate_peer_url(&peer.outgoing_url)?;
             trusted_keys.insert(peer.node_id.clone(), peer.public_key.clone());
             peers.push(Peer {
+                node_id: peer.node_id.clone(),
                 incoming_token_tag: token_tag(&peer.incoming_token),
                 outgoing_url,
                 outgoing_token: peer.outgoing_token.clone(),
@@ -295,6 +300,77 @@ impl PeerSync {
             .route("/api/chat-sync", post(receive_snapshot))
             .layer(DefaultBodyLimit::max(MAX_SYNC_BODY_BYTES))
             .with_state(self.clone())
+    }
+
+    pub(crate) fn has_peer(&self, node_id: &str) -> bool {
+        self.snapshot()
+            .peers
+            .iter()
+            .any(|peer| peer.node_id == node_id)
+    }
+
+    pub(crate) fn completion_routes(&self, completer: Arc<dyn ChatCompleter>) -> Router {
+        Router::new()
+            .route("/api/chat-peer/complete", post(receive_completion))
+            .layer(DefaultBodyLimit::max(MAX_SYNC_BODY_BYTES))
+            .with_state(PeerCompletionState {
+                sync: self.clone(),
+                completer,
+                permits: Arc::new(tokio::sync::Semaphore::new(4)),
+            })
+    }
+
+    pub(crate) async fn complete_on_peer(
+        &self,
+        node_id: &str,
+        request: AccountCompletion,
+    ) -> Result<CompletionResult, CompletionError> {
+        if !request.is_valid() {
+            return Err(CompletionError::Definitive);
+        }
+        let snapshot = self.snapshot();
+        let peer = snapshot
+            .peers
+            .iter()
+            .find(|peer| peer.node_id == node_id)
+            .ok_or(CompletionError::Definitive)?;
+        let mut url = peer.outgoing_url.clone();
+        url.set_path("/api/chat-peer/complete");
+        let response = self
+            .inner
+            .client
+            .post(url)
+            .bearer_auth(&peer.outgoing_token)
+            .timeout(COMPLETION_TIMEOUT + Duration::from_secs(15))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|_| CompletionError::OutcomeUnknown)?;
+        if matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
+                | StatusCode::METHOD_NOT_ALLOWED
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return Err(CompletionError::Definitive);
+        }
+        if !response.status().is_success() {
+            return Err(CompletionError::OutcomeUnknown);
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| CompletionError::OutcomeUnknown)?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_SYNC_BODY_BYTES {
+                return Err(CompletionError::OutcomeUnknown);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| CompletionError::OutcomeUnknown)
     }
 
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
@@ -390,6 +466,45 @@ impl PeerSync {
             );
         }
         matched == 1
+    }
+}
+
+#[derive(Clone)]
+struct PeerCompletionState {
+    sync: PeerSync,
+    completer: Arc<dyn ChatCompleter>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+async fn receive_completion(
+    State(state): State<PeerCompletionState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if headers.contains_key(ORIGIN) {
+        return api_error(StatusCode::FORBIDDEN, "browser_origin_forbidden");
+    }
+    if !PeerSync::authenticate(&state.sync.snapshot(), &headers) {
+        return api_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let Ok(request) = serde_json::from_slice::<AccountCompletion>(&body) else {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_account_completion");
+    };
+    if !request.is_valid() {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_account_completion");
+    }
+    let Ok(_permit) = state.permits.try_acquire() else {
+        return api_error(StatusCode::TOO_MANY_REQUESTS, "peer_busy");
+    };
+    let model_id = request.model_id.clone();
+    match state.completer.complete_for_account(request).await {
+        Ok(result) if result.model_id == model_id && result.text.len() <= MAX_TEXT_BYTES => {
+            axum::Json(result).into_response()
+        }
+        Err(CompletionError::Definitive) => {
+            api_error(StatusCode::UNPROCESSABLE_ENTITY, "completion_failed")
+        }
+        _ => api_error(StatusCode::BAD_GATEWAY, "completion_outcome_unknown"),
     }
 }
 
@@ -548,6 +663,142 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn origin_without_local_credentials_completes_via_paired_account_and_syncs_once() {
+        use crate::chats::{self, CompletionPromptMessage};
+        use serde_json::json;
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+        use tempfile::tempdir;
+
+        struct Completer {
+            calls: AtomicUsize,
+            remote: bool,
+        }
+        type CompletionFuture =
+            Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>>;
+        impl ChatCompleter for Completer {
+            fn complete(&self, _: String, _: Vec<CompletionPromptMessage>) -> CompletionFuture {
+                panic!("general completion must use the selected account")
+            }
+            fn complete_for_account(&self, request: AccountCompletion) -> CompletionFuture {
+                assert!(self.remote, "must run on the credential host");
+                assert_eq!(request.account_id, "remote-account");
+                assert_eq!(request.messages.last().unwrap().text, "hello");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(CompletionResult {
+                        model_id: request.model_id,
+                        text: "remote reply".into(),
+                    })
+                })
+            }
+        }
+        async fn request(
+            app: &Router,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), MAX_SYNC_BODY_BYTES)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+        let a_dir = tempdir().unwrap();
+        let b_dir = tempdir().unwrap();
+        let a = Store::open(a_dir.path()).unwrap();
+        let b = Store::open(b_dir.path()).unwrap();
+        let sync_a = PeerSync::empty(a.clone()).unwrap();
+        let sync_b = PeerSync::empty(b.clone()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_origin = format!("http://{}", listener.local_addr().unwrap());
+        let ta = "origin-token-0123456789012345678901";
+        let tb = "remote-token-0123456789012345678901";
+        let config = |store: &Store, origin: &str, incoming: &str, outgoing: &str| {
+            let identity = store.identity();
+            PeerConfig {
+                node_id: identity.node_id,
+                public_key: identity.public_key,
+                outgoing_url: format!("{origin}/api/chat-sync"),
+                incoming_token: incoming.into(),
+                outgoing_token: outgoing.into(),
+            }
+        };
+        sync_a
+            .replace_peers(vec![config(&b, &b_origin, ta, tb)])
+            .unwrap();
+        sync_b
+            .replace_peers(vec![config(&a, "http://127.0.0.1:1", tb, ta)])
+            .unwrap();
+        let worker = Arc::new(Completer {
+            calls: AtomicUsize::new(0),
+            remote: true,
+        });
+        let peer_app = sync_b
+            .routes()
+            .merge(sync_b.completion_routes(worker.clone()));
+        assert_eq!(
+            request(&peer_app, "/api/chat-peer/complete", json!({}))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, peer_app).await.unwrap() });
+        let app = chats::routes_with_peers(
+            a.clone(),
+            Some(Arc::new(Completer {
+                calls: AtomicUsize::new(0),
+                remote: false,
+            })),
+            sync_a.status(),
+            Some(sync_a.clone()),
+        );
+        let (_, created) = request(&app, "/api/chats", json!({})).await;
+        let chat = created["chatId"].as_str().unwrap();
+        let (_, saved) = request(
+            &app,
+            &format!("/api/chats/{chat}/messages"),
+            json!({"text":"hello"}),
+        )
+        .await;
+        let message = saved["message"]["messageId"].as_str().unwrap();
+        let path = format!("/api/chats/{chat}/messages/{message}/completion");
+        let body = |node_id| json!({"modelId":"chatgpt/test", "accountId":"remote-account", "peerNodeId":node_id});
+        assert_eq!(
+            request(&app, &path, body("not-paired".into())).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(b.conversation(chat).is_none());
+        let (status, result) = request(&app, &path, body(b.identity().node_id)).await;
+        assert!(status.is_success(), "{status}: {result}");
+        assert_eq!(result["message"]["text"], "remote reply");
+        assert_eq!(
+            request(&app, &path, body(b.identity().node_id)).await.1,
+            result
+        );
+        assert_eq!(worker.calls.load(Ordering::SeqCst), 1);
+        sync_a.sync_round().await;
+        assert_eq!(
+            b.conversation(chat).unwrap().messages.last().unwrap().text,
+            "remote reply"
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn replace_peers_updates_trust_atomically() {
