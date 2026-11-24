@@ -14,6 +14,7 @@ title?: string;
 secondary?: string;
 rows: BoardRow[];
 sessions: WorkspaceSession[];
+orphanSessions: WorkspaceSession[];
 }
 
 export interface WorkspaceChoice {
@@ -143,7 +144,8 @@ cwd,
 label: cwd ? (isTemporaryWorkspace(cwd) ? `임시 작업공간 ${++temporaryCount}` : pathBasename(cwd)) : '작업공간 없음',
 title: cwd,
 rows: [],
-sessions: []
+sessions: [],
+orphanSessions: []
 };
 groups.set(id, group);
 }
@@ -151,6 +153,7 @@ group.rows.push(row);
 const parent = parentOf.get(row);
 const parentNode = parent && nodeForRow.get(parent);
 if (parentNode) parentNode.children.push(node);
+else if (row.sessionKind?.startsWith('subagent')) group.orphanSessions.push(node);
 else group.sessions.push(node);
 }
 

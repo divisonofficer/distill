@@ -240,7 +240,13 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 {#each groups as group (group.id)}<details class="group/workspace" open={openGroups[group.id] ?? !isTemporaryWorkspace(group.cwd ?? '')} ontoggle={(event) => setGroupOpen(group.id, event)}>
 <summary class="flex min-h-9 cursor-pointer select-none items-center gap-2 rounded-lg px-2 text-xs font-medium text-neutral-700 hover:bg-neutral-200/70 dark:text-neutral-300 dark:hover:bg-neutral-800" title={group.title} aria-label={group.title && !isTemporaryWorkspace(group.title) ? `${group.label}. 전체 경로 ${group.title}` : group.label}><Icon name="chevron" class="size-3 shrink-0 transition-transform group-open/workspace:rotate-90" /><span class="min-w-0 flex-1 truncate">{group.label}</span>{#if group.secondary}<span class="max-w-24 truncate font-mono text-[10px] text-neutral-600 dark:text-neutral-300" title={group.title}>{group.secondary}</span>{/if}</summary>
 {#if group.cwd && isTemporaryWorkspace(group.cwd)}<details class="mx-2 rounded-lg px-2 text-xs text-neutral-600 dark:text-neutral-300"><summary class="min-h-8 cursor-pointer content-center underline underline-offset-4">임시 작업공간의 실제 경로</summary><code class="block overflow-x-auto py-1 font-mono">{group.cwd}</code></details>{/if}
-{#each group.sessions as item (JSON.stringify([rowOrigin(item.row), item.row.sessionId]))}{@render sessionItem(item)}{/each}</details>{/each}
+{#each group.sessions as item (JSON.stringify([rowOrigin(item.row), item.row.sessionId]))}{@render sessionItem(item)}{/each}
+{#if group.orphanSessions.length}
+<details open={group.orphanSessions.some(containsActiveSession)} class="ml-3 rounded-lg px-2 text-xs text-neutral-600 dark:text-neutral-300">
+<summary class="min-h-8 cursor-pointer content-center">부모 미확인 하위 작업 · {group.orphanSessions.length}</summary>
+{#each group.orphanSessions as item (JSON.stringify([rowOrigin(item.row), item.row.sessionId]))}{@render sessionItem(item)}{/each}
+</details>
+{/if}</details>{/each}
 </section>
 {/if}
 </div>
