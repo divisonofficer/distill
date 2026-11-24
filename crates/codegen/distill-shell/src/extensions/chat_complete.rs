@@ -20,6 +20,8 @@ struct ChatCompleteRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -137,7 +139,7 @@ fn validate(request: &ChatCompleteRequest) -> Result<(), acp::Error> {
     Ok(())
 }
 
-pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
+pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest, scoped: bool) -> ExtResult {
     let request: ChatCompleteRequest = parse_params(args)
         .map_err(|_| acp::Error::invalid_params().data("invalid chat completion params"))?;
     validate(&request)?;
@@ -149,7 +151,34 @@ pub(crate) async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResul
     let model = agent
         .resolve_model_id(&acp::ModelId::new(request.model_id.clone()))
         .map_err(|_| acp::Error::invalid_params().data("unknown model id"))?;
-    let sampling_config = agent.prepare_sampling_config_for_model(&model, None);
+    let mut sampling_config = agent.prepare_sampling_config_for_model(&model, None);
+    match (scoped, request.account_id) {
+        (true, Some(account_id)) => {
+            use crate::agent::account_routing::{AccountRoute, config_for_route};
+            let route = AccountRoute {
+                account_id,
+                option_id: None,
+                main_model: request.model_id.clone(),
+                worker_model: request.model_id.clone(),
+                worker: false,
+                pinned: true,
+                operation_id: None,
+                failed_options: Vec::new(),
+            };
+            sampling_config = config_for_route(
+                &crate::accounts::AccountStore::default(),
+                &agent.models_manager.models(),
+                &sampling_config,
+                &route,
+            )
+            .await
+            .map_err(|_| {
+                acp::Error::invalid_params().data("Selected account is unavailable for this model")
+            })?;
+        }
+        (false, None) => {}
+        _ => return Err(acp::Error::invalid_params().data("Invalid chat account selection")),
+    }
     let output_tokens = sampling_config
         .max_completion_tokens
         .map_or(MAX_OUTPUT_TOKENS, |limit| limit.min(MAX_OUTPUT_TOKENS));
@@ -196,6 +225,7 @@ mod tests {
             model_id: "model".into(),
             messages,
             request_id: None,
+            account_id: None,
         }
     }
 

@@ -411,7 +411,10 @@ fn parse_response_id(json: &mut serde_json::Value) -> Option<(ClientId, String)>
 }
 /// Extract a valid request correlation ID from a general chat completion call.
 fn extract_chat_completion_request_id(json: &serde_json::Value) -> Option<&str> {
-    if method_of(json) != Some("x.ai/chat/complete") {
+    if !matches!(
+        method_of(json),
+        Some("x.ai/chat/complete" | "x.ai/chat/complete-account")
+    ) {
         return None;
     }
     let request_id = interaction_inner_params(json)?.get("requestId")?.as_str()?;
@@ -432,7 +435,7 @@ fn extract_chat_progress_request_id(json: &serde_json::Value) -> Option<&str> {
 fn rewrite_chat_request_id(json: &mut serde_json::Value, request_id: &str) -> bool {
     if !matches!(
         method_of(json),
-        Some("x.ai/chat/complete" | "x.ai/chat/progress")
+        Some("x.ai/chat/complete" | "x.ai/chat/complete-account" | "x.ai/chat/progress")
     ) {
         return false;
     }

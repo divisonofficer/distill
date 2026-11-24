@@ -2,6 +2,7 @@
 import { page } from '$app/state';
 import { afterNavigate } from '$app/navigation';
 import { onMount, tick } from 'svelte';
+import { loadChatFleet, type ChatAccountRoute, type ChatFleet } from '$lib/chat-fleet';
 import { isNearBottom } from '$lib/task-history-scroll';
 import { getJson, postJson } from '$lib/api';
 import {
@@ -68,6 +69,29 @@ let history = $state.raw<ChatHistory | null>(null);
 let selectedLeafId = $state('');
 let draft = $state('');
 let modelId = $state('');
+let fleet = $state.raw<ChatFleet>({ accounts: [], models: [], preferred: '', unreachable: 0 });
+let fleetLoading = $state(true);
+let selectedAccount = $state('');
+let refreshingFleet = false;
+const modelAccounts = $derived(fleet.accounts.filter((account) => account.models.some((model) => model.modelId === modelId)));
+const chatAccount = $derived(selectedAccount ? modelAccounts.find((account) => account.key === selectedAccount) : modelAccounts[0]);
+
+async function refreshChatFleet() {
+if (refreshingFleet) return;
+refreshingFleet = true;
+try {
+const next = await loadChatFleet(window.location.origin);
+fleet = next;
+if (!modelId) modelId = next.preferred;
+} finally {
+refreshingFleet = false;
+fleetLoading = false;
+}
+}
+
+function routeForSend(): ChatAccountRoute | undefined {
+return chatAccount ? { accountId: chatAccount.accountId, ...(chatAccount.peerNodeId ? { peerNodeId: chatAccount.peerNodeId } : {}) } : undefined;
+}
 let capabilities = $state<ChatCapabilities | null>(null);
 let capabilityLoading = $state(true);
 let capabilityError = $state('');
@@ -378,10 +402,13 @@ afterNavigate(afterRouteNavigation);
 onMount(() => {
 watchDraft(activeChatId);
 void refreshCapabilities();
+void refreshChatFleet();
 const timer = window.setInterval(() => void refreshHistory(activeChatId, false), 15000);
+const fleetTimer = window.setInterval(() => void refreshChatFleet(), 30000);
 return () => {
 stopActiveSpeechDictation();
 window.clearInterval(timer);
+window.clearInterval(fleetTimer);
 if (entranceTimer !== undefined) window.clearTimeout(entranceTimer);
 if (activeMenu) closeMenu(activeMenu);
 stopMenuPositionTracking();
@@ -519,11 +546,11 @@ return { error: cause instanceof Error ? cause.message : '알 수 없는 오류'
 return {};
 }
 
-async function requestCompletion(id: string, userMessageId: string, requestedModelId: string) {
-updateChatOperation(id, userMessageId, { status: 'generating', error: undefined, progress: undefined });
+async function requestCompletion(id: string, userMessageId: string, requestedModelId: string, route: ChatAccountRoute | undefined) {
+updateChatOperation(id, userMessageId, { status: 'generating', error: undefined, progress: undefined, route });
 const completionRequest = postJson<unknown>(
 `/api/chats/${encodeURIComponent(id)}/messages/${encodeURIComponent(userMessageId)}/completion`,
-{ modelId: requestedModelId }
+{ modelId: requestedModelId, ...route }
 );
 const stopProgressPolling = startChatProgressPolling(id, userMessageId, requestedModelId, (path) => getJson<unknown>(path));
 try {
@@ -564,6 +591,7 @@ const id = activeChatId;
 const text = draft;
 const submittedFiles = getChatTextFiles(activeChatId);
 const requestedModelId = generate ? modelId : '';
+const route = generate ? routeForSend() : undefined;
 const submittedMode = getChatComposerMode(id);
 if (!history || history.chatId !== id || saving || readingFiles) return;
 const originalFiles = submittedMode?.kind === 'edit' ? (history?.messages.find((m) => m.messageId === submittedMode.messageId)?.textFiles ?? []) : submittedFiles;
@@ -579,7 +607,7 @@ if (selectedParentMissing && submittedMode?.kind !== 'edit') {
 saveError = '선택한 부모 메시지를 불러온 뒤 저장할 수 있습니다. 이전 기록을 불러오세요.';
 return;
 }
-if (generate && (!completionConfigured || !requestedModelId)) return;
+if (generate && (!completionConfigured || !requestedModelId || !route)) return;
 const parentId = submittedMode?.kind === 'edit' ? submittedMode.parentId : selectedLeafId || null;
 const submittedDraft = getChatDraftSnapshot(id);
 if (!beginChatOperation(id, null, requestedModelId, 'saving')) return;
@@ -617,7 +645,7 @@ bindChatOperationMessage(id, requestedModelId, saved.messageId, generate ? 'gene
 appendMessage(id, saved);
 if (id === activeChatId && !generate) ui.notify(submittedMode?.kind === 'edit' ? '메시지를 새 분기로 저장했습니다.' : '메시지를 저장했습니다.');
 if (submittedContextStillCurrent) void scrollToLatest(id, true);
-if (generate) await requestCompletion(id, saved.messageId, requestedModelId);
+if (generate) await requestCompletion(id, saved.messageId, requestedModelId, route);
 else if (id === activeChatId) void refreshHistory(id);
 } finally {
 finishChatOperation(id);
@@ -672,11 +700,12 @@ async function generateForMessage(userMessageId: string) {
 if (getChatComposerMode(activeChatId)?.kind === 'edit') return;
 const id = activeChatId;
 const requestedModelId = modelId;
-if (!completionConfigured || !requestedModelId || saving) return;
+const route = routeForSend();
+if (!completionConfigured || !requestedModelId || !route || saving) return;
 chooseParent(userMessageId);
 if (!beginChatOperation(id, userMessageId, requestedModelId, 'generating')) return;
 try {
-await requestCompletion(id, userMessageId, requestedModelId);
+await requestCompletion(id, userMessageId, requestedModelId, route);
 } finally {
 finishChatOperation(id);
 }
@@ -687,7 +716,7 @@ if (getChatComposerMode(activeChatId)?.kind === 'edit') return;
 if (!operation.userMessageId || !operation.modelId || saving) return;
 if (!beginChatOperation(operation.chatId, operation.userMessageId, operation.modelId, 'generating')) return;
 try {
-await requestCompletion(operation.chatId, operation.userMessageId, operation.modelId);
+await requestCompletion(operation.chatId, operation.userMessageId, operation.modelId, operation.route);
 } finally {
 finishChatOperation(operation.chatId);
 }
@@ -727,7 +756,7 @@ ui.drawerOpen = true;
 <title>{history ? chatDisplayTitle(history, history.messages, {}, $chatTitleOverrides) : '새 채팅'} · Postudio</title>
 </svelte:head>
 
-<svelte:window onfocus={refreshCurrent} onclick={dismissMessageActions} onfocusin={dismissMessageActions} onkeydown={dismissMessageActions} />
+<svelte:window onfocus={() => { refreshCurrent(); void refreshChatFleet(); }} onclick={dismissMessageActions} onfocusin={dismissMessageActions} onkeydown={dismissMessageActions} />
 
 {#snippet branchPicker(messages: ChatMessage[], selectedId: string | undefined, label: string)}
 <div class="branch-picker my-1 flex min-h-11 max-w-full items-center justify-between gap-3 border-l-2 border-[#d0d0d4] pl-2 text-neutral-600 dark:text-neutral-300" aria-label={label + ' 탐색'}>
@@ -883,7 +912,7 @@ ui.drawerOpen = true;
 <button type="button" aria-label="여기서 포크하기" disabled={saving} class="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={() => forkFromMessage(message)}><Icon name="fork" class="size-3.5" /><span>여기서 포크하기</span></button>
 </div>
 {/if}
-{#if composerMode?.kind !== 'edit' && message.role === 'user' && !hasAssistant && completionConfigured && modelId && (!operation || operation.status === 'saved-only')}
+{#if composerMode?.kind !== 'edit' && message.role === 'user' && !hasAssistant && completionConfigured && modelId && chatAccount && (!operation || operation.status === 'saved-only')}
 <details class="message-actions absolute right-0 top-full z-10 w-fit text-neutral-500">
 <summary aria-label="추가 생성 작업" class="flex size-8 cursor-pointer list-none items-center justify-center rounded-md text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800">⋯</summary>
 <div class="absolute right-0 top-8 z-20 w-52 rounded-xl border border-neutral-200 bg-white p-1 shadow-sm dark:border-neutral-700 dark:bg-neutral-900">
@@ -966,7 +995,14 @@ ui.drawerOpen = true;
 <div class="flex min-w-0 flex-1 items-center gap-2">
 <button type="button" aria-label="첨부 및 도구" aria-haspopup="dialog" aria-expanded={composerMenuOpen} bind:this={composerTrigger} popovertarget="chat-composer-menu" onkeydown={(event) => handleMenuKeydown(event, 'composer')} class="flex size-9 shrink-0 items-center justify-center rounded-full border border-neutral-200 text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800">+</button>
 <div id="chat-composer-menu" bind:this={composerMenu} popover="auto" role="dialog" tabindex="-1" aria-label="첨부 및 도구" onkeydown={(event) => handleMenuKeydown(event, 'composer')} ontoggle={(event) => handleMenuToggle('composer', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-72 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-3 text-sm shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" disabled={!capabilities?.textAttachments?.supported || saving || readingFiles} class="min-h-11 w-full text-left disabled:opacity-50" onclick={() => { closeMenu('composer'); fileInput?.click(); }}>파일 첨부</button><button type="button" disabled class="min-h-11 w-full text-left opacity-50">도구</button><p class="text-xs text-neutral-600 dark:text-neutral-300">{#if capabilities?.textAttachments?.supported}일반 채팅은 TXT/MD 파일만 지원합니다. 최대 10개, 전체 1 MiB까지 첨부할 수 있습니다. 이미지는 아직 지원하지 않습니다.{:else}현재 서버는 일반 채팅 첨부를 지원하지 않습니다. 서버 업데이트가 필요합니다.{/if}</p><input bind:this={fileInput} class="sr-only" type="file" accept=".txt,.md,text/plain,text/markdown" multiple disabled={!capabilities?.textAttachments?.supported || saving || readingFiles} onchange={readSelectedFiles} /></div>
-<div class="min-w-0 shrink-0"><ModelSelect id="chat-response-model" bind:value={modelId} label="응답 모델" compact initialFromCatalog disabled={saving} /></div>
+<div class="min-w-0 shrink-0"><ModelSelect id="chat-response-model" bind:value={modelId} label="응답 모델" compact modelOptions={fleet.models} onselect={() => (selectedAccount = '')} disabled={saving || fleetLoading} /></div>
+{#if modelAccounts.length || selectedAccount}
+<select aria-label="채팅 응답 계정" title={chatAccount ? `${chatAccount.label} · ${chatAccount.host}` : '선택한 계정에 접속할 수 없습니다'} class="min-h-9 max-w-[8rem] truncate rounded-lg bg-transparent px-1 text-xs text-neutral-700 dark:text-neutral-200 sm:max-w-44" value={chatAccount?.key ?? ''} disabled={saving} onchange={(event) => (selectedAccount = event.currentTarget.value)}>
+{#if !chatAccount}<option value="" disabled>계정에 연결할 수 없음</option>{/if}
+{#each modelAccounts as account (account.key)}<option value={account.key}>{account.label} · {account.host}</option>{/each}
+</select>
+{/if}
+{#if !fleetLoading && !fleet.models.length}<span class="text-xs text-neutral-500">{fleet.unreachable ? '접속 가능한 호스트에 연결된 계정이 없습니다.' : '설정에서 모델 계정을 연결해 주세요.'}</span>{/if}
 <button type="button" aria-label="메시지 작업" aria-haspopup="menu" aria-expanded={actionMenuOpen} bind:this={actionTrigger} popovertarget="chat-action-menu" class="flex size-9 shrink-0 items-center justify-center rounded-full hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800">⋯</button>
 <div id="chat-action-menu" bind:this={actionMenu} popover="auto" role="menu" tabindex="-1" aria-label="메시지 작업" onkeydown={(event) => handleMenuKeydown(event, 'actions')} ontoggle={(event) => handleMenuToggle('actions', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-64 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" role="menuitem" disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length)} onclick={() => { closeMenu('actions', true); saveOnlyMessage(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800">메시지만 저장</button>{#if selectedLeafId}<button type="button" role="menuitem" onclick={() => { closeMenu('actions', true); clearParent(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800">새 시작 분기</button>{/if}</div>
 
@@ -975,10 +1011,10 @@ ui.drawerOpen = true;
 <SpeechDictation id={`chat-speech-${encodeURIComponent(activeChatId)}`} disabled={saving || selectedParentMissing} onappend={appendDictation} />
 <button
  type="submit"
- disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length) || !completionConfigured || !modelId}
+ disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length) || !completionConfigured || !modelId || !chatAccount}
  class="flex size-9 items-center justify-center rounded-full bg-black text-sm font-medium text-white hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:bg-white dark:text-black"
 >
-{#if saving}<span class="sr-only">생성 중</span>{:else if capabilityLoading}<span class="sr-only">상태 확인 중</span>{:else if capabilityError}<span class="sr-only">AI 상태 확인 필요</span>{:else if !completionConfigured}<span class="sr-only">AI 응답 사용 불가</span>{:else if !modelId}<span class="sr-only">모델 선택 필요</span>{:else}<span class="sr-only">전송</span>{/if}<Icon name="chevron" class="size-4 -rotate-90" />
+{#if saving}<span class="sr-only">생성 중</span>{:else if capabilityLoading}<span class="sr-only">상태 확인 중</span>{:else if capabilityError}<span class="sr-only">AI 상태 확인 필요</span>{:else if !completionConfigured}<span class="sr-only">AI 응답 사용 불가</span>{:else if !modelId || !chatAccount}<span class="sr-only">모델과 계정 선택 필요</span>{:else}<span class="sr-only">전송</span>{/if}<Icon name="chevron" class="size-4 -rotate-90" />
 </button>
 </div>
 </div>
@@ -986,7 +1022,7 @@ ui.drawerOpen = true;
 {#if saving}<span role="status">요청 처리 중입니다. 중복 전송은 막혀 있습니다. 중지 기능은 서버에서 지원하지 않습니다.</span>
 {:else if capabilityLoading}기능 상태 확인 중입니다. AI 요청은 상태 확인 뒤에 활성화됩니다.
 {:else if capabilityError}AI 상태를 확인할 수 없습니다. 저장만 하거나 상태를 다시 확인하세요.
-{:else if capabilities?.completion.configured}보내기는 메시지를 한 번 저장한 뒤 선택한 모델에 AI 응답을 요청합니다.
+{:else if capabilities?.completion.configured}보내기는 메시지를 한 번 저장한 뒤 선택한 계정의 호스트에 AI 응답을 요청합니다.
 {:else}AI 응답을 사용할 수 없습니다. 저장만 하거나 서버 기능 상태를 다시 확인하세요.
 {/if}
 </p>

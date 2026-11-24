@@ -1,4 +1,11 @@
 <script module lang="ts">
+type Provider = 'chatgpt' | 'claude' | 'grok' | 'openrouter';
+
+export function newProviderAccountId(provider: Provider): string {
+	const random = crypto.getRandomValues(new Uint8Array(12));
+	return `${provider}-${Array.from(random, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
 export type LoginStatus = 'starting' | 'pending' | 'completed' | 'failed' | 'cancelled' | 'expired';
 export type LoginStart = { jobId: string; status: 'starting'; callbackMode: 'host_loopback' };
 export type LoginPoll = { status: LoginStatus; authorizationUrl?: string };
@@ -10,14 +17,30 @@ export function isLocalLoginHost(hostname: string): boolean {
 	return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
 }
 
+export function isWebLoginPage(protocol: string, hostname: string): boolean {
+	return protocol === 'https:' || (protocol === 'http:' && isLocalLoginHost(hostname));
+}
+
 export function safeAuthorizationHref(value?: string): string | null {
 	if (!value) return null;
 	try {
 		const url = new URL(value);
-		return url.protocol === 'https:' && !url.username && !url.password ? url.href : null;
+		const provider = ['auth.openai.com', 'claude.ai', 'openrouter.ai', 'auth.x.ai', 'accounts.x.ai'].includes(url.hostname);
+		return url.protocol === 'https:' && provider && !url.username && !url.password && !url.port && !url.hash ? url.href : null;
 	} catch {
 		return null;
 	}
+}
+
+export function loginCallbackAddress(authorizationHref: string): string | null {
+	try {
+		if (!safeAuthorizationHref(authorizationHref)) return null;
+		const authorization = new URL(authorizationHref);
+		const redirects = authorization.searchParams.getAll(authorization.hostname === 'openrouter.ai' ? 'callback_url' : 'redirect_uri');
+		if (redirects.length !== 1) return null;
+		const url = new URL(redirects[0]);
+		return url.protocol === 'http:' && isLocalLoginHost(url.hostname) && url.port && !url.username && !url.password && !url.search && !url.hash ? url.href : null;
+	} catch { return null; }
 }
 
 export function parseLoginStart(value: unknown): LoginStart {
@@ -48,7 +71,6 @@ import { getJson, postJson } from '$lib/api';
 import { ui } from '$lib/ui.svelte';
 import AccountRouting from '$lib/components/AccountRouting.svelte';
 
-type Provider = 'chatgpt' | 'claude' | 'grok' | 'openrouter';
 type Quota = {
 account_id: string;
 checked_at: string;
@@ -75,7 +97,6 @@ canceling?: boolean;
 startedAt: number;
 };
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
-const WEB_LOGIN_PROVIDERS: Provider[] = ['chatgpt', 'claude', 'openrouter'];
 
 const PROVIDERS: Provider[] = ['chatgpt', 'claude', 'grok', 'openrouter'];
 const PROVIDER_LABEL: Record<Provider, string> = {
@@ -86,8 +107,7 @@ openrouter: 'OpenRouter'
 };
 
 let accounts = $state<Account[]>([]);
-let accountId = $state('');
-let provider = $state<Provider>('claude');
+let addingProvider = $state<Provider | null>(null);
 let label = $state('');
 let editingId = $state('');
 let renameLabel = $state('');
@@ -97,7 +117,8 @@ let loading = $state(false);
 let busy = $state(false);
 let error = $state('');
 let localBrowser = $state(false);
-let localLoginConfirmed = $state(false);
+let secureLoginPage = $state(false);
+let submittingCallback = $state(false);
 let loginJobs = $state<Record<string, AccountLogin>>({});
 let loginTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let mounted = false;
@@ -105,6 +126,7 @@ let mounted = false;
 onMount(() => {
 mounted = true;
 localBrowser = isLocalLoginHost(window.location.hostname);
+secureLoginPage = isWebLoginPage(window.location.protocol, window.location.hostname);
 void refresh();
 return () => {
 mounted = false;
@@ -151,8 +173,8 @@ const status = loginJobs[accountId]?.status;
 return status === 'starting' || status === 'pending';
 }
 
-function canStartWebLogin(account: Account): boolean {
-return localBrowser && localLoginConfirmed && WEB_LOGIN_PROVIDERS.includes(account.provider);
+function canStartWebLogin(): boolean {
+return secureLoginPage;
 }
 
 function scheduleLoginPoll(accountId: string, jobId: string, delay: number) {
@@ -164,7 +186,7 @@ void pollLogin(accountId, jobId);
 }
 
 async function startLogin(account: Account) {
-if (!canStartWebLogin(account) || isActiveLogin(account.id)) return;
+if (!canStartWebLogin() || isActiveLogin(account.id)) return;
 stopLoginTimer(account.id);
 const startedAt = Date.now();
 try {
@@ -246,6 +268,24 @@ scheduleLoginPoll(accountId, current.jobId, 1500);
 }
 }
 
+async function submitCallback(event: SubmitEvent, accountId: string) {
+event.preventDefault();
+const form = event.currentTarget;
+const job = loginJobs[accountId];
+if (!(form instanceof HTMLFormElement) || !job || job.status !== 'pending' || submittingCallback) return;
+const callbackUrl = new FormData(form).get('callbackUrl');
+if (typeof callbackUrl !== 'string' || !callbackUrl.trim()) return;
+submittingCallback = true;
+try {
+await postJson(`/api/accounts/login/${encodeURIComponent(job.jobId)}/callback`, { callbackUrl: callbackUrl.trim() });
+form.reset();
+} catch {
+ui.notify('이 로그인에 해당하는 localhost 주소인지 확인해 주세요.', 'error');
+} finally {
+submittingCallback = false;
+}
+}
+
 async function mutate(path: string, body: unknown, operation: string) {
 if (busy) return;
 busy = true;
@@ -262,12 +302,22 @@ busy = false;
 }
 }
 
-async function addAccount(event: SubmitEvent) {
-event.preventDefault();
-await mutate('/api/accounts/add', { id: accountId, provider, label }, '계정 추가');
-if (!error) {
-accountId = '';
+function openAccountForm(provider: Provider | null) {
+if (busy) return;
+addingProvider = provider;
 label = '';
+}
+
+async function addAccount(event: SubmitEvent, provider: Provider) {
+event.preventDefault();
+const nickname = label.trim();
+if (busy || addingProvider !== provider || !nickname) return;
+const addedId = newProviderAccountId(provider);
+await mutate('/api/accounts/add', { id: addedId, provider, label: nickname }, '계정 추가');
+if (!error) {
+openAccountForm(null);
+const added = accounts.find((account) => account.id === addedId);
+if (mounted && added && canStartWebLogin()) await startLogin(added);
 }
 }
 
@@ -334,18 +384,9 @@ busy = false;
 새로고침
 </button>
 </div>
-<p class="text-sm text-neutral-600 dark:text-neutral-400">계정 목록과 연결 상태는 현재 Postudio node 호스트에서 가져옵니다. 로그인 정보는 브라우저에 저장하지 않습니다. 원격 호스트의 브라우저 로그인은 지원하지 않으며, 해당 node 호스트에서 <code>distill accounts login &lt;id&gt;</code>를 실행하세요.</p>
-{#if localBrowser}
-<div class="flex flex-col gap-2 rounded-xl border border-neutral-200 p-4 dark:border-neutral-800">
-	<p class="text-sm">이 로컬 페이지는 node 호스트에서 OAuth 로그인을 시작합니다. 인증 링크를 직접 열어 완료하세요. 자동으로 새 창을 열지 않습니다.</p>
-	<label class="flex min-h-11 items-center gap-3 text-sm">
-		<input type="checkbox" bind:checked={localLoginConfirmed} />
-		이 브라우저가 node와 같은 컴퓨터에서 실행 중
-	</label>
-</div>
-{/if}
-{#if !localBrowser}
-<p class="text-sm text-amber-700 dark:text-amber-300">이 페이지 주소가 localhost가 아니므로 브라우저 로그인은 사용할 수 없습니다. node 호스트에서 CLI 로그인을 실행하세요.</p>
+<p class="text-sm text-neutral-600 dark:text-neutral-400">계정은 이 Postudio 호스트의 Distill에 추가됩니다. 제공자 로그인은 직접 승인하며, 연결 정보는 해당 호스트에만 저장됩니다.</p>
+{#if !secureLoginPage}
+<p class="text-sm text-amber-700 dark:text-amber-300">브라우저에서 계정을 연결하려면 HTTPS 또는 localhost로 접속하세요.</p>
 {/if}
 
 {#if error}
@@ -355,56 +396,30 @@ busy = false;
 <p role="status" class="text-sm text-neutral-500">계정 목록을 불러오는 중입니다.</p>
 {/if}
 
-<form class="grid gap-3 rounded-xl border border-neutral-200 p-4 dark:border-neutral-800 sm:grid-cols-2" onsubmit={addAccount}>
-<h3 class="text-sm font-medium sm:col-span-2">계정 추가</h3>
-<label class="flex flex-col gap-1 text-sm">
-<span>계정 ID</span>
-<input
- bind:value={accountId}
- required
- maxlength="64"
- pattern={'[A-Za-z0-9_][A-Za-z0-9_-]{0,63}'}
- autocomplete="off"
- class="min-h-10 rounded-lg border border-neutral-300 bg-transparent px-3 dark:border-neutral-700"
-/>
+{#each PROVIDERS as provider (provider)}
+{@const providerAccounts = accounts.filter((account) => account.provider === provider)}
+<section aria-labelledby={`provider-${provider}`} class="flex flex-col gap-3 rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800 sm:p-5">
+<div class="flex flex-wrap items-center justify-between gap-2">
+<h3 id={`provider-${provider}`} class="text-base font-semibold">{PROVIDER_LABEL[provider]}</h3>
+<button type="button" disabled={busy || loading} aria-label={`${PROVIDER_LABEL[provider]} 계정 추가`} aria-expanded={addingProvider === provider} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => openAccountForm(addingProvider === provider ? null : provider)}>+ 계정 추가</button>
+</div>
+{#if addingProvider === provider}
+<form class="flex flex-wrap items-end gap-2 rounded-xl bg-neutral-100 p-3 dark:bg-neutral-900" onsubmit={(event) => addAccount(event, provider)}>
+<label class="flex min-w-0 flex-1 basis-48 flex-col gap-1 text-sm">
+<span>계정 별명</span>
+<input bind:value={label} required maxlength="120" autocomplete="off" placeholder="예: 개인용, 업무용" class="min-h-10 rounded-lg border border-neutral-300 bg-transparent px-3 dark:border-neutral-700" />
 </label>
-<label class="flex flex-col gap-1 text-sm">
-<span>제공자</span>
-<select bind:value={provider} class="min-h-10 rounded-lg border border-neutral-300 bg-transparent px-3 dark:border-neutral-700">
-{#each PROVIDERS as item (item)}
-<option value={item}>{PROVIDER_LABEL[item]}</option>
-{/each}
-</select>
-</label>
-<label class="flex flex-col gap-1 text-sm sm:col-span-2">
-<span>표시 이름</span>
-<input
- bind:value={label}
- required
- maxlength="120"
- autocomplete="off"
- class="min-h-10 rounded-lg border border-neutral-300 bg-transparent px-3 dark:border-neutral-700"
-/>
-</label>
-<button
- type="submit"
- disabled={busy}
- class="min-h-11 justify-self-start rounded-xl bg-neutral-900 px-4 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900"
->
-계정 추가
-</button>
+<button type="submit" disabled={busy || !label.trim()} class="min-h-10 rounded-lg bg-neutral-900 px-3 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900">{secureLoginPage ? '추가 및 로그인' : '추가'}</button>
+<button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-sm dark:border-neutral-700" onclick={() => openAccountForm(null)}>취소</button>
 </form>
-
-{#if accounts.length === 0 && !loading && !error}
-<p class="text-sm text-neutral-500">등록된 계정이 없습니다.</p>
 {/if}
+{#if providerAccounts.length}
 <ul class="flex flex-col gap-3">
-{#each accounts as account (account.id)}
+{#each providerAccounts as account (account.id)}
 <li class="flex flex-col gap-3 rounded-2xl border border-neutral-200 bg-white p-4 sm:p-5 dark:border-neutral-800 dark:bg-neutral-950">
 <div class="flex flex-wrap items-start justify-between gap-3">
 <div class="min-w-0 flex-1">
-<p class="break-words text-sm font-medium">{account.label} <span class="font-normal text-neutral-500">({PROVIDER_LABEL[account.provider]})</span></p>
-<p class="break-all font-mono text-xs text-neutral-500">{account.id}</p>
+<p class="break-words text-sm font-medium" title={account.id}>{account.label}</p>
 <p class="text-sm">{account.connected ? '연결됨' : '연결 안 됨'}{account.email ? ` · ${account.email}` : ''}</p>
 {#if account.connection_error === 'unreadable'}
 <p class="text-xs text-amber-700 dark:text-amber-300">저장된 연결 정보를 읽을 수 없습니다.</p>
@@ -414,12 +429,9 @@ busy = false;
 {#if account.quota?.remaining_percent != null}
 <p class="text-xs text-neutral-500">남은 사용량 {Math.round(account.quota.remaining_percent)}%</p>
 {/if}
-{#if account.provider === 'grok'}
-<p class="text-xs text-amber-700 dark:text-amber-300">Grok 웹 로그인은 지원하지 않습니다. node 호스트에서 <code>distill accounts login {account.id}</code>를 실행하세요.</p>
-{/if}
 </div>
 <div class="flex flex-wrap gap-2">
-<button type="button" disabled={busy || !canStartWebLogin(account) || isActiveLogin(account.id)} title={account.provider === 'grok' ? 'Grok은 브라우저 로그인을 지원하지 않습니다. CLI를 사용하세요.' : undefined} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => void startLogin(account)}>{account.provider === 'grok' ? 'CLI 로그인' : account.connected ? '다시 로그인' : '연결'}</button>
+<button type="button" disabled={busy || !canStartWebLogin() || isActiveLogin(account.id)} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => void startLogin(account)}>{account.connected ? '다시 로그인' : '로그인 시작'}</button>
 <button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => beginRename(account)}>이름 변경</button>
 <button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => toggleUsage(account.id)}>{Object.hasOwn(usageOpen, account.id) && usageOpen[account.id] ? '사용량 숨기기' : '사용량'}</button>
 <button type="button" disabled={busy} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-xs disabled:opacity-40 dark:border-neutral-700" onclick={() => logout(account)}>로그아웃</button>
@@ -441,7 +453,16 @@ busy = false;
 		{#if isActiveLogin(account.id)}
 			{@const authorizationHref = safeAuthorizationHref(job.authorizationUrl)}
 			{#if authorizationHref}
-				<a href={authorizationHref} target="_blank" rel="noopener noreferrer" class="min-h-10 self-start content-center rounded-lg border border-neutral-300 px-3 text-sm underline dark:border-neutral-700">OAuth 인증 링크 열기</a>
+				{@const callbackAddress = loginCallbackAddress(authorizationHref)}
+				<a href={authorizationHref} target="_blank" rel="noopener noreferrer" class="min-h-10 self-start content-center rounded-lg border border-neutral-300 px-3 text-sm underline dark:border-neutral-700">제공자 로그인 열기</a>
+				{#if callbackAddress}<p class="break-all text-xs text-neutral-600 dark:text-neutral-400">콜백 주소: <code>{callbackAddress}</code></p>{/if}
+				<form class="flex flex-wrap items-end gap-2" onsubmit={(event) => submitCallback(event, account.id)}>
+					<label class="flex min-w-0 flex-1 flex-col gap-1 text-sm">
+						<span>{localBrowser ? '인증 후 자동으로 연결되지 않으면 인증 탭의 localhost 주소를 붙여넣으세요.' : '인증 후 localhost 페이지가 열리지 않으면, 인증 탭 주소창의 전체 주소를 복사해 여기에 붙여넣으세요.'}</span>
+						<input name="callbackUrl" type="password" required maxlength="8192" autocomplete="off" spellcheck={false} placeholder="http://localhost:…" class="min-h-10 rounded-lg border border-neutral-300 bg-transparent px-3 dark:border-neutral-700" />
+					</label>
+					<button type="submit" disabled={submittingCallback || job.canceling} class="min-h-10 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700">인증 완료</button>
+				</form>
 			{:else if job.status === 'pending'}
 				<p class="text-sm text-neutral-600 dark:text-neutral-400">안전한 HTTPS 인증 링크를 기다리는 중입니다.</p>
 			{/if}
@@ -463,5 +484,10 @@ busy = false;
 </li>
 {/each}
 </ul>
+{:else if !loading && !error}
+<p class="text-sm text-neutral-500">등록된 계정이 없습니다.</p>
+{/if}
+</section>
+{/each}
 </section>
 <AccountRouting {accounts} />

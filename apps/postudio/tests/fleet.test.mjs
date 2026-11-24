@@ -26,6 +26,41 @@ test('host list splits newlines and commas without splitting hostname letters', 
   ]);
 });
 
+test('work-mode peers come from the server roster, even without browser host settings', () => {
+  fleet.saveHosts(['https://unpaired.example']);
+  assert.deepEqual(fleet.pairedHostOrigins({ peers: [
+    { origin: 'https://peer.example' }, { origin: 'https://peer.example' },
+    { origin: 'https://local.example' }, { origin: 'http://peer.example' },
+    { origin: 'https://peer.example/redirect' }, { origin: 'https://a@peer.example' },
+    { origin: 'javascript:alert(1)' }, null
+  ] }, 'https://local.example'), ['https://peer.example']);
+  assert.throws(() => fleet.pairedHostOrigins({ error: 'unavailable' }, 'https://local.example'), /Invalid peer roster/);
+});
+
+test('chat fleet includes connected paired-host accounts when the browser host is logged out', async () => {
+  const { loadChatFleet } = await vite.ssrLoadModule('/src/lib/chat-fleet.ts');
+  const nodeId = 'a'.repeat(64);
+  const peer = 'https://paired.example';
+  const model = { modelId: 'chatgpt/gpt-test', name: 'GPT test' };
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (url === '/api/connections') return { ok: true, json: async () => ({ peers: [{ origin: peer, nodeId }, { origin: 'https://untrusted.example', nodeId: 'invalid' }] }) };
+    if (String(url).endsWith('/api/models')) return { ok: true, json: async () => ({ currentModelId: model.modelId, availableModels: [model] }) };
+    if (url === '/api/chat-accounts') return { ok: true, json: async () => [] };
+    assert.equal(url, `${peer}/api/chat-accounts`);
+    return { ok: true, json: async () => [{ id: 'legacy-chatgpt', label: 'peer', provider: 'chatgpt', connected: true, email: 'not-projected@example.com' }] };
+  };
+  const result = await loadChatFleet('https://local.example');
+  assert.deepEqual(result.models, [model]);
+  assert.equal(result.accounts.length, 1);
+  assert.equal(result.accounts[0].peerNodeId, nodeId);
+  assert.equal(result.accounts[0].accountId, 'legacy-chatgpt');
+  assert.equal(result.accounts[0].label, 'peer');
+  assert.equal(result.accounts[0].email, undefined);
+  assert.ok(calls.every((call) => !call.includes('untrusted.example')));
+});
+
 test('ordinary GET stays on current origin while explicit host pins destination', async () => {
   fleet.saveHosts(['https://peer-a.example', 'https://peer-b.example']);
   const calls = [];

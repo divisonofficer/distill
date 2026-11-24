@@ -22,7 +22,7 @@ use crate::agent::{RequestFailure, lock as agent_lock};
 use crate::chat_store::{
     ChatEvent, ChatMessage, Conversation, MAX_TEXT_BYTES, MAX_TITLE_BYTES, Store,
 };
-use crate::chat_sync::{SyncHealth, SyncStatus};
+use crate::chat_sync::{PeerSync, SyncHealth, SyncStatus};
 use crate::keeper::{Keeper, MAX_CHAT_PROGRESS_BYTES};
 use crate::sep::TextFileIn;
 
@@ -31,18 +31,18 @@ const HISTORY_PAGE_SIZE: usize = 50;
 const MAX_HISTORY_CURSOR_BYTES: usize = 4096;
 const ID_RANDOM_BYTES: usize = 18;
 const ID_ATTEMPTS: usize = 8;
-const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+pub(crate) const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_MODEL_ID_BYTES: usize = 1024;
 const FAILED_COMPLETION_CAPACITY: usize = 128;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionPromptMessage {
     pub role: String,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionResult {
     pub model_id: String,
@@ -63,6 +63,13 @@ pub trait ChatCompleter: Send + Sync {
         model_id: String,
         messages: Vec<CompletionPromptMessage>,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>>;
+
+    fn complete_for_account(
+        &self,
+        _request: AccountCompletion,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>> {
+        Box::pin(async { Err(CompletionError::Definitive) })
+    }
 
     fn complete_with_progress(
         &self,
@@ -85,6 +92,33 @@ impl AcpChatCompleter {
 }
 
 impl ChatCompleter for AcpChatCompleter {
+    fn complete_for_account(
+        &self,
+        request: AccountCompletion,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>> {
+        let keeper = self.keeper.clone();
+        Box::pin(async move {
+            let params = serde_json::to_value(request).map_err(|_| CompletionError::Definitive)?;
+            let result = keeper
+                .handle()
+                .request_with_timeout_classified(
+                    "_x.ai/chat/complete-account",
+                    params,
+                    COMPLETION_TIMEOUT,
+                )
+                .await;
+            if let Err(RequestFailure::Rejected(error)) = &result
+                && serde_json::from_str::<serde_json::Value>(error)
+                    .ok()
+                    .and_then(|value| value["code"].as_i64())
+                    .is_some_and(|code| matches!(code, -32601 | -32602))
+            {
+                return Err(CompletionError::Definitive);
+            }
+            decode_acp_completion(result)
+        })
+    }
+
     fn complete(
         &self,
         model_id: String,
@@ -158,6 +192,7 @@ struct ChatState {
     history_cursor_key: Arc<hmac::Key>,
     completer: Option<Arc<dyn ChatCompleter>>,
     sync_status: SyncStatus,
+    peer_sync: Option<PeerSync>,
     pending: Arc<Mutex<HashMap<(String, String), CompletionState>>>,
     progress: Arc<Mutex<HashMap<(String, String), CompletionProgress>>>,
     failures: Arc<Mutex<VecDeque<FailedCompletion>>>,
@@ -243,6 +278,46 @@ impl Drop for CompletionGate {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CompletionRequest {
     model_id: String,
+    account_id: Option<String>,
+    peer_node_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AccountCompletion {
+    pub model_id: String,
+    pub account_id: String,
+    pub messages: Vec<CompletionPromptMessage>,
+}
+
+impl AccountCompletion {
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.model_id.trim().is_empty()
+            && self.model_id.len() <= MAX_MODEL_ID_BYTES
+            && valid_account_id(&self.account_id)
+            && self.messages.len() <= 128
+            && self.messages.first().is_some_and(|msg| msg.role == "user")
+            && self.messages.last().is_some_and(|msg| msg.role == "user")
+            && self
+                .messages
+                .iter()
+                .all(|msg| matches!(msg.role.as_str(), "user" | "assistant"))
+            && self
+                .messages
+                .iter()
+                .map(|msg| msg.text.len())
+                .sum::<usize>()
+                <= MAX_TEXT_BYTES
+    }
+}
+
+fn valid_account_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 #[derive(Deserialize)]
@@ -421,6 +496,15 @@ pub fn routes_with_services(
     completer: Option<Arc<dyn ChatCompleter>>,
     sync_status: SyncStatus,
 ) -> Router {
+    routes_with_peers(store, completer, sync_status, None)
+}
+
+pub(crate) fn routes_with_peers(
+    store: Store,
+    completer: Option<Arc<dyn ChatCompleter>>,
+    sync_status: SyncStatus,
+    peer_sync: Option<PeerSync>,
+) -> Router {
     let mut cursor_secret = [0; 32];
     SystemRandom::new()
         .fill(&mut cursor_secret)
@@ -450,6 +534,7 @@ pub fn routes_with_services(
             history_cursor_key,
             completer,
             sync_status,
+            peer_sync,
             pending: Arc::new(Mutex::new(HashMap::new())),
             progress: Arc::new(Mutex::new(HashMap::new())),
             failures: Arc::new(Mutex::new(VecDeque::new())),
@@ -542,6 +627,7 @@ async fn rename_chat(
         .append(ChatEvent::Title {
             chat_id: chat_id.clone(),
             title: title.clone(),
+            revision: None,
         })
         .is_err()
     {
@@ -743,6 +829,22 @@ async fn complete_message(
     if target.role != "user" {
         return api_error(StatusCode::BAD_REQUEST, "invalid_target_message");
     }
+    if request
+        .account_id
+        .as_deref()
+        .is_some_and(|id| !valid_account_id(id))
+        || request.peer_node_id.is_some() && request.account_id.is_none()
+    {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_account_route");
+    }
+    if let Some(node_id) = &request.peer_node_id
+        && !state
+            .peer_sync
+            .as_ref()
+            .is_some_and(|sync| sync.has_peer(node_id))
+    {
+        return api_error(StatusCode::BAD_REQUEST, "peer_not_paired");
+    }
     if let Some(message) = existing_completion(&conversation, &message_id, &request.model_id) {
         return completed_response(message);
     }
@@ -815,6 +917,7 @@ async fn complete_message(
     let operation_chat_id = chat_id.clone();
     let operation_message_id = message_id.clone();
     let user_author = target.author.clone();
+    let peer_sync = state.peer_sync;
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let gate = CompletionGate {
@@ -824,10 +927,23 @@ async fn complete_message(
             key,
             completed: false,
         };
-        match completer
-            .complete_with_progress(model_id.clone(), messages, progress_tx)
-            .await
-        {
+        let result = if let Some(account_id) = request.account_id {
+            let request_body = AccountCompletion {
+                model_id: model_id.clone(),
+                account_id,
+                messages,
+            };
+            match (request.peer_node_id, peer_sync) {
+                (Some(node_id), Some(sync)) => sync.complete_on_peer(&node_id, request_body).await,
+                (None, _) => completer.complete_for_account(request_body).await,
+                _ => Err(CompletionError::Definitive),
+            }
+        } else {
+            completer
+                .complete_with_progress(model_id.clone(), messages, progress_tx)
+                .await
+        };
+        match result {
             Err(CompletionError::OutcomeUnknown) => {
                 gate.mark_unknown();
                 let _ = tx.send(Err(CompletionError::OutcomeUnknown));

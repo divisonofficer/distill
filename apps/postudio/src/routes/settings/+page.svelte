@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import AccountSettings from '$lib/components/AccountSettings.svelte';
+import ConnectionSettings from '$lib/components/ConnectionSettings.svelte';
 	import { postJson, getJson } from '$lib/api';
 	import { loadDefaultMode, MODES, MODE_LABEL, saveDefaultMode } from '$lib/prefs';
 	import type { Mode } from '$lib/types';
@@ -157,7 +158,7 @@ function saveFleet() {
 	<h1 class="sr-only">설정</h1>
 	<div class="settings-body flex min-h-0 flex-1">
 		<nav aria-label="설정 메뉴" class="settings-nav">
-			{#each [{ id: 'accounts-h', label: '계정', href: '#accounts-h' }, { id: 'routing-h', label: '모델 라우팅', href: '#routing-h' }, { id: 'push-h', label: '알림', href: '#push-h' }, { id: 'fleet-h', label: '호스트', href: '#fleet-h' }, { id: 'mode-h', label: '작업 기본값', href: '#mode-h' }] as item}
+			{#each [{ id: 'accounts-h', label: '계정', href: '#accounts-h' }, { id: 'routing-h', label: '모델 라우팅', href: '#routing-h' }, { id: 'push-h', label: '알림', href: '#push-h' }, { id: 'fleet-h', label: '호스트', href: '#fleet-h' }, { id: 'connections-h', label: '연결 및 공유', href: '#connections-h' }, { id: 'mode-h', label: '작업 기본값', href: '#mode-h' }] as item}
 				<a href={item.href} aria-current={page.url.hash === item.href || (!page.url.hash && item.id === 'accounts-h') ? 'location' : undefined}>{item.label}</a>
 			{/each}
 		</nav>
@@ -185,7 +186,7 @@ function saveFleet() {
 
 	<section id="fleet-h" class="settings-card flex flex-col gap-3" aria-labelledby="fleet-title">
 <h2 id="fleet-title" class="text-[22px] font-semibold tracking-tight">호스트</h2>
-<p class="text-sm text-neutral-600 dark:text-neutral-300">호스트 URL을 우선순위 순서대로 입력합니다. 채팅은 현재 호스트에 유지됩니다.</p>
+<p class="text-sm text-neutral-600 dark:text-neutral-300">호스트 URL을 우선순위 순서대로 입력해요. 일반 채팅은 연결된 호스트끼리 공유돼요.</p>
 <textarea aria-label="호스트 주소 목록" bind:value={fleetText} rows="3" spellcheck="false" placeholder="https://host.example" class="w-full rounded-xl border border-neutral-300 bg-transparent p-3 text-sm dark:border-neutral-700"></textarea>
 {#if fleetError}<p role="alert" class="break-words text-sm text-red-700 dark:text-red-300">{fleetError}</p>{/if}
 <div class="flex flex-wrap gap-2">
@@ -196,6 +197,8 @@ function saveFleet() {
 {#each fleetHosts as host (host.origin)}<li>{host.online ? '온라인' : '오프라인'} · {host.origin}</li>{/each}
 </ul>
 </section>
+
+<ConnectionSettings onpaired={() => { fleetHosts = configuredHosts(); fleetText = fleetHosts.map((host) => host.origin).join('\n'); void refreshFleet(); }} />
 
 <section id="mode-h" class="settings-card flex flex-col gap-3" aria-labelledby="mode-title">
 		<h2 id="mode-title" class="text-[22px] font-semibold tracking-tight">작업 기본값</h2>

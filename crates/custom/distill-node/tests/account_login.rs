@@ -39,7 +39,22 @@ if len(args) >= 2 and args[:2] == ["accounts", "login-web"]:
         print(json.dumps(value), flush=True)
     def pending(url="https://auth.openai.com/oauth/authorize?state=test"):
         emit({"status": "pending", "authorizationUrl": url, "callbackMode": "host_loopback"})
-    if mode == "pending" or mode == "timeout":
+    if mode == "callback":
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from urllib.parse import parse_qs, urlencode, urlsplit
+        class Callback(BaseHTTPRequestHandler):
+            def do_GET(self):
+                assert self.path.startswith('/auth/callback?')
+                assert parse_qs(urlsplit(self.path).query) == {'code': ['test-code'], 'state': ['test-state']}
+                self.send_response(302)
+                self.send_header('Location', 'https://example.invalid/must-not-follow')
+                self.end_headers()
+        with HTTPServer(('127.0.0.1', 0), Callback) as server:
+            redirect = f'http://localhost:{server.server_port}/auth/callback'
+            pending('https://auth.openai.com/oauth/authorize?' + urlencode({'redirect_uri': redirect, 'state': 'test-state'}))
+            server.handle_request()
+        emit({'status': 'completed'})
+    elif mode == "pending" or mode == "timeout":
         pending()
         time.sleep(30)
     elif mode == "complete":
@@ -54,8 +69,8 @@ if len(args) >= 2 and args[:2] == ["accounts", "login-web"]:
         emit({"status": "pending", "authorizationUrl": "https://auth.openai.com/oauth/authorize", "callbackMode": "host_loopback", "accessToken": "secret-token"})
     elif mode == "bad_url":
         pending("https://auth.openai.com.evil.test/login")
-    elif mode == "grok":
-        pending("https://auth.x.ai/authorize")
+    elif mode == "grok_lookalike":
+        pending("https://auth.x.ai.evil.test/authorize")
     elif mode == "userinfo":
         pending("https://user:secret@auth.openai.com/login")
     elif mode == "empty_userinfo":
@@ -194,6 +209,54 @@ async fn wait_for(app: &Router, job_id: &str, target: &str) -> Value {
         sleep(Duration::from_millis(10)).await;
     }
     panic!("job did not reach {target}");
+}
+
+#[tokio::test]
+async fn remote_callback_is_bound_to_owner_job_and_oauth_state() {
+    let dir = TempDir::new().unwrap();
+    let app = app(fake_config(&dir, "callback"), limits());
+    let id = start(&app, "test-account").await;
+    let pending = wait_for(&app, &id, "pending").await;
+    let auth = url::Url::parse(pending["authorizationUrl"].as_str().unwrap()).unwrap();
+    let (_, redirect) = auth
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .unwrap();
+    let path = format!("/api/accounts/login/{id}/callback");
+    for (owner, callback, expected) in [
+        (
+            "not-owner@example.com",
+            format!("{redirect}?code=test-code&state=test-state"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            OWNER,
+            format!("{redirect}?code=test-code&state=wrong"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            OWNER,
+            format!("{redirect}/other?code=test-code&state=test-state"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            OWNER,
+            format!("{redirect}?code=test-code&state=test-state"),
+            StatusCode::ACCEPTED,
+        ),
+    ] {
+        let response = call(
+            &app,
+            "POST",
+            &path,
+            Some(json!({"callbackUrl": callback})),
+            Some(owner),
+        )
+        .await;
+        assert_eq!(response.status(), expected);
+    }
+    let completed = wait_for(&app, &id, "completed").await;
+    assert!(completed.get("authorizationUrl").is_none());
 }
 
 #[tokio::test]
@@ -359,7 +422,7 @@ async fn malformed_urls_and_output_limits_fail_without_leaking_secrets() {
     for (mode, output_limit) in [
         ("malformed", 64 * 1024),
         ("bad_url", 64 * 1024),
-        ("grok", 64 * 1024),
+        ("grok_lookalike", 64 * 1024),
         ("userinfo", 64 * 1024),
         ("empty_userinfo", 64 * 1024),
         ("failed_event", 64 * 1024),

@@ -27,6 +27,7 @@ static ROUTING_TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 pub fn routes(cfg: AgentConfig) -> Router {
     Router::new()
         .route("/api/accounts", get(list))
+        .route("/api/chat-accounts", get(chat_accounts))
         .route("/api/accounts/add", post(add))
         .route("/api/accounts/rename", post(rename))
         .route("/api/accounts/logout", post(logout))
@@ -216,10 +217,39 @@ impl IntoResponse for ApiError {
     }
 }
 
+async fn list_accounts(cfg: &AgentConfig) -> Result<Vec<CliAccountStatus>, ApiError> {
+    let output = run_cli(cfg, &[OsStr::new("accounts"), OsStr::new("list")]).await?;
+    serde_json::from_slice(&output).map_err(|_| ApiError::failed())
+}
+
+#[derive(Serialize)]
+struct ChatAccountView {
+    id: String,
+    provider: Provider,
+    label: String,
+    connected: bool,
+}
+
+async fn chat_accounts(
+    State(cfg): State<AgentConfig>,
+) -> Result<Json<Vec<ChatAccountView>>, ApiError> {
+    Ok(Json(
+        list_accounts(&cfg)
+            .await?
+            .into_iter()
+            .filter(|account| account.connected)
+            .map(|account| ChatAccountView {
+                id: account.id,
+                provider: account.provider,
+                label: account.label,
+                connected: true,
+            })
+            .collect(),
+    ))
+}
+
 async fn list(State(cfg): State<AgentConfig>) -> Result<Json<Vec<AccountView>>, ApiError> {
-    let output = run_cli(&cfg, &[OsStr::new("accounts"), OsStr::new("list")]).await?;
-    let accounts: Vec<CliAccountStatus> =
-        serde_json::from_slice(&output).map_err(|_| ApiError::failed())?;
+    let accounts = list_accounts(&cfg).await?;
     Ok(Json(
         accounts
             .into_iter()

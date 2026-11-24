@@ -32,7 +32,7 @@ pub enum AccountsCommand {
         #[arg(long)]
         device_code: bool,
     },
-    /// Start local-browser login (ChatGPT, Claude, OpenRouter only). Callback runs on this host; remote device handoff is unsupported.
+    /// Start provider OAuth and stream status as JSON lines. The callback listener runs on this host.
     LoginWeb {
         id: String,
     },
