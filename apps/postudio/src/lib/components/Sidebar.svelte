@@ -7,7 +7,7 @@ import Badge from '$lib/components/Badge.svelte';
 import Icon from '$lib/components/Icon.svelte';
 import AccountSummary from '$lib/components/AccountSummary.svelte';
 import { activityBadge } from '$lib/format';
-import { sessionHref, sessionOrigin } from '$lib/fleet';
+import { pairedHostOrigins, sessionHref, sessionOrigin } from '$lib/fleet';
 import { board, sortRows } from '$lib/board.svelte';
 import { groupWorkspaceRows, isTemporaryWorkspace, visibleWorkspaceRows, type WorkspaceSession } from '$lib/workspaces';
 import { chatDisplayTitle, chatPreviewTitles, chatTitleOverrides, parseChatList, parseCreatedChat, type ChatSummary } from '$lib/chats';
@@ -22,6 +22,9 @@ catch { return ''; }
 });
 let pinnedRow = $state.raw<BoardRow | undefined>();
 let pinnedHostResponding = $state(false);
+let pairedHosts = $state.raw<{ origin: string; online?: boolean }[]>([]);
+let peerRosterUnavailable = $state(false);
+let refreshingPeers = false;
 const selectedRow = $derived(rows.find((row) => row.sessionId === page.params.id && rowOrigin(row) === activeHost) ?? (pinnedRow && pinnedRow.sessionId === page.params.id && pinnedRow.apiOrigin === activeHost ? pinnedRow : undefined));
 const selectedWorkspaceName = $derived(selectedRow?.cwd?.split(/[\\/]/).filter(Boolean).at(-1) || (page.url.pathname === '/new' ? '새 작업' : page.url.pathname.startsWith('/s/') ? '작업공간' : 'Postudio'));
 const selectedHostConnected = $derived(activeHost === board.origin ? board.connected : !!pinnedRow && pinnedRow.apiOrigin === activeHost && pinnedRow.sessionId === page.params.id && pinnedHostResponding);
@@ -96,9 +99,33 @@ creatingChat = false;
 }
 }
 
-afterNavigate(() => void refreshChatList());
+async function refreshPairedHosts() {
+if (chatMode || refreshingPeers) return;
+refreshingPeers = true;
+try {
+const origins = pairedHostOrigins(await getJson<unknown>('/api/connections'), page.url.origin);
+pairedHosts = origins.map((origin) => ({ origin, online: pairedHosts.find((peer) => peer.origin === origin)?.online }));
+peerRosterUnavailable = false;
+pairedHosts = await Promise.all(origins.map(async (origin) => {
+try { await getJson('/api/node', origin); return { origin, online: true }; }
+catch { return { origin, online: false }; }
+}));
+} catch {
+peerRosterUnavailable = true;
+} finally {
+refreshingPeers = false;
+}
+}
+
+afterNavigate(() => {
+void refreshChatList();
+void refreshPairedHosts();
+});
 onMount(() => {
-const timer = window.setInterval(() => void refreshChatList(), 15000);
+const timer = window.setInterval(() => {
+void refreshChatList();
+void refreshPairedHosts();
+}, 15000);
 return () => window.clearInterval(timer);
 });
 
@@ -145,7 +172,7 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 </div>
 {/snippet}
 
-<svelte:window onfocus={refreshChatList} />
+<svelte:window onfocus={() => { void refreshChatList(); void refreshPairedHosts(); }} />
 
 <header class="flex min-h-[60px] shrink-0 items-center justify-between gap-2 px-3">
 {#if chatMode}<span class="text-base font-bold">AI 채팅</span>{:else}<div class="min-w-0 flex-1"><div class="flex min-w-0 items-center gap-2 text-sm font-semibold"><svg class="size-4 shrink-0" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h7l2 2h9v11H3z" /></svg><span class="truncate" title={selectedRow?.cwd ?? selectedWorkspaceName}>{selectedWorkspaceName}</span>{#if selectedRow?.activity === 'working'}<span class="size-3 shrink-0 animate-spin rounded-full border-2 border-neutral-400 border-t-neutral-800 motion-reduce:animate-none" role="img" aria-label="작업 실행 중"></span>{/if}</div><div class="mt-1 truncate pl-6 text-[11.5px] text-neutral-500 dark:text-neutral-400" title={selectedRow ? rowOrigin(selectedRow) : activeHost}>{selectedRow ? rowOrigin(selectedRow) : activeHost || '호스트 확인 필요'} · {selectedHostConnected ? '연결됨' : '연결 중'}</div></div>{/if}
@@ -194,7 +221,19 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 {:else}
 <section aria-label="원격 연결" class="mb-3 flex flex-col gap-2 px-2 pt-2">
 <h2 class="text-xs font-semibold text-neutral-500">원격 연결</h2>
-<div class="flex min-w-0 items-center gap-2 text-xs"><Icon name="server" class="size-4 shrink-0" /><span class="min-w-0 flex-1 truncate" title={board.origin}>활성 호스트: {board.origin || '확인 중'}</span><span class="shrink-0" class:text-green-700={board.connected}>{board.connected ? '연결됨' : '연결 중'}</span></div>
+<div class="flex min-w-0 items-center gap-2 text-xs"><Icon name="server" class="size-4 shrink-0" /><span class="min-w-0 flex-1 truncate" title={activeHost}>활성 호스트: {activeHost || '확인 중'}</span><span class="shrink-0" class:text-green-700={selectedHostConnected}>{selectedHostConnected ? '연결됨' : '연결 중'}</span></div>
+{#if pairedHosts.length}
+<ul aria-label="페어링된 호스트" class="flex flex-col gap-0.5">
+{#each pairedHosts as peer (peer.origin)}
+<li>
+<a href={`${peer.origin}/new`} onclick={close} title={peer.origin} class="flex min-h-9 min-w-0 items-center gap-2 rounded-lg px-2 text-xs hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800">
+<Icon name="server" class="size-4 shrink-0 text-neutral-500" /><span class="min-w-0 flex-1 truncate">{new URL(peer.origin).host}</span><span class="shrink-0" class:text-green-700={peer.online}>{peer.origin === activeHost && selectedHostConnected ? '사용 중' : peer.online === true ? '연결 가능' : peer.online === false ? '접속 확인 실패' : '확인 중'}</span>
+</a>
+</li>
+{/each}
+</ul>
+{/if}
+{#if peerRosterUnavailable}<p class="text-xs text-neutral-500">페어링된 호스트 목록을 확인하지 못했습니다.</p>{/if}
 </section>
 <section aria-labelledby="coding-workspace-heading" class="flex flex-col gap-0.5">
 <div class="flex h-9 items-center justify-between gap-2 px-2"><h2 id="coding-workspace-heading" class="text-xs font-semibold text-neutral-600 dark:text-neutral-300">워크스페이스</h2><a href={portsHref()} onclick={close} class="rounded px-1 py-1 text-xs text-neutral-600 hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:text-neutral-300 dark:hover:bg-neutral-800">포트</a></div>

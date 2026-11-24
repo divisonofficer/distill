@@ -108,6 +108,7 @@ function turnEvents(text: string): Sep[] {
 export async function mockFetch(method: string, path: string, body?: unknown): Promise<unknown> {
 	await loadAll();
 	if (method === 'GET' && path === '/api/node') return { host: 'mock-host', version: '0.0.0-mock' };
+	if (method === 'GET' && path === '/api/connections') return { peers: [] };
 	if (method === 'GET' && path === '/api/sessions') return { sessions: [...sessions.values()].map(rowOf) };
 	if (method === 'GET' && path === '/api/push/key') return { publicKey: PUBLIC_KEY };
 	if (method === 'POST' && (path === '/api/push/subscribe' || path === '/api/push/unsubscribe')) return undefined;

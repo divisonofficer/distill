@@ -26,6 +26,17 @@ test('host list splits newlines and commas without splitting hostname letters', 
   ]);
 });
 
+test('work-mode peers come from the server roster, even without browser host settings', () => {
+  fleet.saveHosts(['https://unpaired.example']);
+  assert.deepEqual(fleet.pairedHostOrigins({ peers: [
+    { origin: 'https://peer.example' }, { origin: 'https://peer.example' },
+    { origin: 'https://local.example' }, { origin: 'http://peer.example' },
+    { origin: 'https://peer.example/redirect' }, { origin: 'https://a@peer.example' },
+    { origin: 'javascript:alert(1)' }, null
+  ] }, 'https://local.example'), ['https://peer.example']);
+  assert.throws(() => fleet.pairedHostOrigins({ error: 'unavailable' }, 'https://local.example'), /Invalid peer roster/);
+});
+
 test('ordinary GET stays on current origin while explicit host pins destination', async () => {
   fleet.saveHosts(['https://peer-a.example', 'https://peer-b.example']);
   const calls = [];

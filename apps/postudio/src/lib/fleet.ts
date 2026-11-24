@@ -59,6 +59,17 @@ export function pairingOrigin(value: string): string | null {
  const url = new URL(origin);
  return url.protocol === 'https:' || (url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(url.hostname))) ? origin : null;
 }
+/** Use the server pairing roster, not the browser's manually configured hosts. */
+export function pairedHostOrigins(value: unknown, currentOrigin: string): string[] {
+ if (!value || typeof value !== 'object' || !('peers' in value) || !Array.isArray(value.peers)) throw new Error('Invalid peer roster');
+ const origins = new Set<string>();
+ for (const peer of value.peers) {
+  if (!peer || typeof peer !== 'object' || typeof peer.origin !== 'string') continue;
+  const origin = pairingOrigin(peer.origin);
+  if (origin && origin === peer.origin && origin !== currentOrigin) origins.add(origin);
+ }
+ return [...origins];
+}
 export function savePairedHost(value: string): FleetHost[] {
  const origin = pairingOrigin(value);
  if (!origin) throw new Error('Invalid peer origin');
