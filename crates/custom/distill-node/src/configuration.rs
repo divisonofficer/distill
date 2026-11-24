@@ -73,6 +73,7 @@ mod tests {
             web_dir: None,
             chat_peer_config: None,
             untrusted_origin: Some(origin.into()),
+            openresearch_bin: None,
         }
     }
 

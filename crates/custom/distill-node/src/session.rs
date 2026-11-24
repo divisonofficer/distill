@@ -26,12 +26,33 @@ const MAX_PROMPT_ID_BYTES: usize = 128;
 struct Ctx {
     cfg: AgentConfig,
     keeper: Keeper,
+    research: Option<crate::research_context::ResearchContext>,
 }
 
 pub fn routes(cfg: AgentConfig, keeper: Keeper) -> Router {
+    routes_inner(cfg, keeper, None)
+}
+
+pub(crate) fn routes_with_context(
+    cfg: AgentConfig,
+    keeper: Keeper,
+    research: crate::research_context::ResearchContext,
+) -> Router {
+    routes_inner(cfg, keeper, Some(research))
+}
+
+fn routes_inner(
+    cfg: AgentConfig,
+    keeper: Keeper,
+    research: Option<crate::research_context::ResearchContext>,
+) -> Router {
     Router::new()
         .route("/ws/session/{id}", get(ws_session))
-        .with_state(Ctx { cfg, keeper })
+        .with_state(Ctx {
+            cfg,
+            keeper,
+            research,
+        })
 }
 
 async fn ws_session(
@@ -54,13 +75,18 @@ async fn run(mut socket: WebSocket, ctx: Ctx, id: String) {
             return;
         }
     };
-    let mut conn = Conn::new(id.clone(), handle, cwd.to_string_lossy().into_owned());
+    let mut conn = Conn::new(
+        id.clone(),
+        handle,
+        cwd.to_string_lossy().into_owned(),
+        ctx.research.clone(),
+    );
     let (_, events) = conn.request(
         "session/load",
         json!({
             "sessionId": id,
             "cwd": cwd.to_string_lossy(),
-            "mcpServers": [],
+            "mcpServers": ctx.keeper.mcp_servers(&id),
             "_meta": {"yoloMode": false, "autoMode": false, "noReplay": true, "postudioHistoryPaging": true},
         }),
     );
@@ -99,7 +125,7 @@ async fn run(mut socket: WebSocket, ctx: Ctx, id: String) {
             }
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
-                    if !emit(&mut socket, &conn.on_client_msg(&text)).await {
+                    if !emit(&mut socket, &conn.on_client_msg(&text).await).await {
                         break;
                     }
                 }
@@ -126,6 +152,7 @@ struct Conn {
     history_cursor: Option<String>,
     history_has_more: bool,
     history_request_pending: bool,
+    research: Option<crate::research_context::ResearchContext>,
 }
 
 struct Done {
@@ -135,7 +162,12 @@ struct Done {
 }
 
 impl Conn {
-    fn new(id: String, handle: AgentHandle, history_cwd: String) -> Self {
+    fn new(
+        id: String,
+        handle: AgentHandle,
+        history_cwd: String,
+        research: Option<crate::research_context::ResearchContext>,
+    ) -> Self {
         Self {
             reducer: Reducer::new(id.clone()),
             id,
@@ -150,6 +182,7 @@ impl Conn {
             history_cursor: None,
             history_has_more: false,
             history_request_pending: false,
+            research,
         }
     }
 
@@ -193,7 +226,7 @@ impl Conn {
         events
     }
 
-    fn on_client_msg(&mut self, raw: &str) -> Vec<Sep> {
+    async fn on_client_msg(&mut self, raw: &str) -> Vec<Sep> {
         let msg: ClientMsg = match serde_json::from_str(raw) {
             Ok(msg) => msg,
             Err(e) => return vec![error(format!("bad message: {e}"))],
@@ -231,11 +264,17 @@ impl Conn {
                         "prompt_id must be a non-empty string of at most 128 bytes",
                     );
                 }
-                let blocks =
+                let mut blocks =
                     match crate::attachments::prompt_blocks(Some(&text), &images, &text_files) {
                         Ok(blocks) => blocks,
                         Err(message) => return prompt_rejected(prompt_id, message),
                     };
+                if let Some(research) = &self.research {
+                    match research.blocks(&sid).await {
+                        Ok(mut context) => blocks.append(&mut context),
+                        Err(message) => return prompt_rejected(prompt_id, message),
+                    }
+                }
                 self.request(
                     "session/prompt",
                     prompt_params(&sid, &blocks, prompt_id.as_deref(), send_now),

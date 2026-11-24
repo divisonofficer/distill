@@ -20,7 +20,7 @@ pub type CwdResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
 struct Edge {
     resolve_cwd: CwdResolver,
     client: reqwest::Client,
-    prohibited_ports: Arc<[u16]>,
+    prohibited_ports: crate::ports::PortPolicy,
 }
 
 const HOP_BY_HOP: [&str; 9] = [
@@ -44,6 +44,13 @@ pub fn routes_with_prohibited_ports(
     resolve_cwd: CwdResolver,
     prohibited_ports: impl IntoIterator<Item = u16>,
 ) -> Router {
+    routes_with_policy(resolve_cwd, crate::ports::port_policy(prohibited_ports))
+}
+
+pub fn routes_with_policy(
+    resolve_cwd: CwdResolver,
+    prohibited_ports: crate::ports::PortPolicy,
+) -> Router {
     #[allow(
         clippy::disallowed_methods,
         reason = "localhost-only proxy client to 127.0.0.1 ports; no TLS"
@@ -56,7 +63,7 @@ pub fn routes_with_prohibited_ports(
     let state = Edge {
         resolve_cwd,
         client,
-        prohibited_ports: prohibited_ports.into_iter().collect::<Vec<_>>().into(),
+        prohibited_ports,
     };
     Router::new()
         .route("/p/{port}", any(proxy))
@@ -73,7 +80,12 @@ async fn proxy(State(edge): State<Edge>, req: Request) -> Response {
         Ok(target) => target,
         Err(status) => return (status, "invalid port").into_response(),
     };
-    if edge.prohibited_ports.contains(&port) {
+    if edge
+        .prohibited_ports
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&port)
+    {
         return (StatusCode::FORBIDDEN, "port is not proxyable").into_response();
     }
     if is_websocket(&parts.headers) {

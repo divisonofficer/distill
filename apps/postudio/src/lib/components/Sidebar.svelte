@@ -15,6 +15,7 @@ import { ui } from '$lib/ui.svelte';
 import type { BoardRow } from '$lib/types';
 
 const chatMode = $derived(page.url.pathname.startsWith('/c'));
+const researchMode = $derived(page.url.pathname.startsWith('/research'));
 const rows = $derived(sortRows(board.rows));
 const activeHost = $derived.by(() => {
 try { return page.url.pathname.startsWith('/s/') ? sessionOrigin(page.url.search) ?? page.url.origin : board.origin; }
@@ -184,7 +185,7 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 
 <nav aria-label="작업 모드" class="mx-3 flex h-10 shrink-0 gap-[2px] rounded-[11px] bg-[#e8e8eb] p-[3px] dark:bg-neutral-800">
 <a href="/c" onclick={close} aria-current={chatMode ? 'page' : undefined} class={['flex flex-1 items-center justify-center gap-2 rounded-lg text-[13.5px] focus-visible:outline-2 focus-visible:outline-neutral-500', chatMode ? 'bg-white font-semibold text-neutral-900 shadow-sm dark:bg-neutral-950 dark:text-white' : 'font-medium text-neutral-600 dark:text-neutral-300']}><Icon name="chat" class="size-4" />채팅</a>
-<a href="/new" onclick={close} aria-current={!chatMode ? 'page' : undefined} class={['flex flex-1 items-center justify-center gap-2 rounded-lg text-[13.5px] focus-visible:outline-2 focus-visible:outline-neutral-500', !chatMode ? 'bg-white font-semibold text-neutral-900 shadow-sm dark:bg-neutral-950 dark:text-white' : 'font-medium text-neutral-600 dark:text-neutral-300']}><Icon name="terminal" class="size-4" />작업</a>
+<a href="/new" onclick={close} aria-current={!chatMode && !researchMode ? 'page' : undefined} class={['flex flex-1 items-center justify-center gap-2 rounded-lg text-[13.5px] focus-visible:outline-2 focus-visible:outline-neutral-500', !chatMode && !researchMode ? 'bg-white font-semibold text-neutral-900 shadow-sm dark:bg-neutral-950 dark:text-white' : 'font-medium text-neutral-600 dark:text-neutral-300']}><Icon name="terminal" class="size-4" />작업</a>
 </nav>
 
 <div class="flex shrink-0 items-center gap-1 px-3 pt-2">
@@ -198,12 +199,9 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 </nav>
 {/if}
 
-<section aria-label="연구 도구" class="flex shrink-0 flex-col px-3 pt-2">
-<h2 class="px-2 py-1 text-xs font-semibold text-neutral-500">연구 도구</h2>
-{#each [{label:'캘린더',icon:'calendar'}, {label:'논문 서지 관리',icon:'book'}, {label:'LaTeX 논문 에디터',icon:'document'}, {label:'회의 PPT 만들기',icon:'presentation'}] as tool}
-<button type="button" disabled title="아직 사용할 수 없습니다" aria-describedby="research-tools-unavailable" class="flex h-9 cursor-not-allowed items-center gap-2 rounded-lg px-3 text-left text-sm text-neutral-500 opacity-70"><Icon name={tool.icon as 'calendar' | 'book' | 'document' | 'presentation'} class="size-4 shrink-0" />{tool.label}</button>
-{/each}
-<span id="research-tools-unavailable" class="sr-only">연구 도구는 아직 사용할 수 없습니다.</span>
+<section aria-label="연구" class="flex shrink-0 flex-col px-3 pt-2">
+<h2 class="px-2 py-1 text-xs font-semibold text-neutral-500">연구</h2>
+<a href="/research{board.origin ? `?host=${encodeURIComponent(board.origin)}` : ''}" onclick={close} aria-current={page.url.pathname.startsWith('/research') ? 'page' : undefined} class={['flex h-9 items-center gap-2 rounded-lg px-3 text-sm text-neutral-700 hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:text-neutral-300 dark:hover:bg-neutral-800', page.url.pathname.startsWith('/research') && 'bg-neutral-200 dark:bg-neutral-800']}><Icon name="book" class="size-4 shrink-0" />연구 워크스페이스</a>
 </section>
 
 <div class="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto px-3 pb-2 pt-2">

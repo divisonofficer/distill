@@ -92,11 +92,19 @@ impl Drop for Stack {
 /// session created on a stack is conversation 1, the second is conversation 2. Later sessions
 /// get `FALLBACK_REPLY`. `port` 0 picks free ports.
 pub async fn start(port: u16, web_dir: Option<PathBuf>) -> anyhow::Result<Stack> {
+    start_with_openresearch_bin(port, web_dir, None).await
+}
+
+pub async fn start_with_openresearch_bin(
+    port: u16,
+    web_dir: Option<PathBuf>,
+    openresearch_bin: Option<PathBuf>,
+) -> anyhow::Result<Stack> {
     let server = MockInferenceServer::start()
         .await
         .context("start mock server")?;
     let sandbox = TestSandbox::builder().mock_url(server.url()).build();
-    let booted = boot(&server, &sandbox, port, web_dir).await;
+    let booted = boot(&server, &sandbox, port, web_dir, openresearch_bin).await;
     match booted {
         Ok((leader, node_config, cwd, port)) => {
             let url = format!("http://127.0.0.1:{port}");
@@ -126,6 +134,7 @@ async fn boot(
     sandbox: &TestSandbox,
     port: u16,
     web_dir: Option<PathBuf>,
+    openresearch_bin: Option<PathBuf>,
 ) -> anyhow::Result<(LeaderFixture, NodeConfig, PathBuf, u16)> {
     let root = sandbox.root().to_path_buf();
     let cwd = root.join("proj");
@@ -202,6 +211,7 @@ async fn boot(
         web_dir,
         chat_peer_config: None,
         untrusted_origin: Some(format!("http://127.0.0.1:{web_port}")),
+        openresearch_bin,
     };
     Ok((leader, cfg, cwd, port))
 }

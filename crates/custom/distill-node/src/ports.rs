@@ -1,7 +1,11 @@
 //! Local listening TCP port discovery for the Studio.
 
-use std::process::Stdio;
 use std::time::Duration;
+use std::{
+    collections::HashSet,
+    process::Stdio,
+    sync::{Arc, RwLock},
+};
 use tokio::io::AsyncReadExt;
 
 use axum::Router;
@@ -11,9 +15,15 @@ use axum::routing::get;
 use serde::Serialize;
 use tokio::process::Command;
 
+pub type PortPolicy = Arc<RwLock<HashSet<u16>>>;
+
+pub fn port_policy(ports: impl IntoIterator<Item = u16>) -> PortPolicy {
+    Arc::new(RwLock::new(ports.into_iter().collect()))
+}
+
 #[derive(Clone)]
 struct Config {
-    blocked: Vec<u16>,
+    blocked: PortPolicy,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -29,11 +39,13 @@ struct PortList {
 }
 
 pub fn routes(blocked_ports: Vec<u16>) -> Router {
+    routes_with_policy(port_policy(blocked_ports))
+}
+
+pub fn routes_with_policy(blocked: PortPolicy) -> Router {
     Router::new()
         .route("/api/ports", get(list))
-        .with_state(Config {
-            blocked: blocked_ports,
-        })
+        .with_state(Config { blocked })
 }
 
 async fn list(State(config): State<Config>) -> (StatusCode, axum::Json<serde_json::Value>) {
@@ -47,7 +59,12 @@ async fn list(State(config): State<Config>) -> (StatusCode, axum::Json<serde_jso
     }
     #[cfg(not(windows))]
     {
-        match discover(&config.blocked).await {
+        let blocked = config
+            .blocked
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match discover(&blocked.into_iter().collect::<Vec<_>>()).await {
             Ok(ports) => (
                 StatusCode::OK,
                 axum::Json(serde_json::json!(PortList { ports })),

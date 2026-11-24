@@ -1,0 +1,613 @@
+diff --git a/src/commands/remote_host.rs b/src/commands/remote_host.rs
+index e64dab79..29d04539 100644
+--- a/src/commands/remote_host.rs
++++ b/src/commands/remote_host.rs
+@@ -1197,6 +1197,16 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn legacy_server_descriptor_defaults_private_ports_empty() {
++        let descriptor: ServerDescriptor = serde_json::from_value(serde_json::json!({
++            "instance": "i", "pid": 1, "starttime": 1, "port": 1234,
++            "version": "0.2.27", "proto": 2, "token": "secret"
++        }))
++        .unwrap();
++        assert!(descriptor.private_ports.is_empty());
++    }
++
+     #[test]
+     fn a_descriptor_from_a_host_without_build_ids_still_reads() {
+         let old = r#"{"instanceId":"i","hostname":"box","port":1,"version":"0.2.26","dashboardProtocol":5,"controlProtocol":1}"#;
+@@ -1419,6 +1429,8 @@ pub(crate) struct ServerDescriptor {
+     pub version: String,
+     pub proto: u32,
+     pub token: String,
++    #[serde(rename = "privatePorts", default)]
++    pub private_ports: Vec<u16>,
+ }
+ 
+ impl ServerDescriptor {
+@@ -1433,6 +1445,7 @@ impl ServerDescriptor {
+                 version: String::new(),
+                 proto: 2,
+                 token,
++                private_ports: Vec::new(),
+             })),
+             _ => Err(anyhow!(
+                 "Agent server credentials are incomplete. Restart this agent session."
+@@ -1799,6 +1812,7 @@ mod discovery_tests {
+             version: "test".into(),
+             proto: 2,
+             token: "secret".into(),
++            private_ports: Vec::new(),
+         };
+         descriptor.publish(&directory).unwrap();
+         let app = axum::Router::new().route(
+@@ -1837,6 +1851,7 @@ mod discovery_tests {
+             version: "test".into(),
+             proto: 2,
+             token: "secret".into(),
++            private_ports: Vec::new(),
+         };
+         descriptor.publish(&directory).unwrap();
+         let calls = Arc::new(AtomicUsize::new(0));
+@@ -1882,6 +1897,7 @@ mod discovery_tests {
+             version: "test".into(),
+             proto: 2,
+             token: "private-token".into(),
++            private_ports: Vec::new(),
+         };
+         let calls = Arc::new(AtomicUsize::new(0));
+         let count = calls.clone();
+@@ -1986,6 +2002,7 @@ mod discovery_tests {
+             version: "test".into(),
+             proto: 2,
+             token: "private-test-token".into(),
++            private_ports: Vec::new(),
+         };
+         use std::io::Write;
+         let mut count = OpenOptions::new()
+@@ -2024,6 +2041,7 @@ mod discovery_tests {
+             version: "test".into(),
+             proto: 2,
+             token: "old".into(),
++            private_ports: Vec::new(),
+         };
+         stale.publish(&data_dir).unwrap();
+         assert!(ServerDescriptor::live(&data_dir).await.unwrap().is_none());
+@@ -2074,6 +2092,7 @@ mod discovery_tests {
+             version: "test".into(),
+             proto: 2,
+             token: "secret".into(),
++            private_ports: Vec::new(),
+         };
+         descriptor.publish(&data_dir).unwrap();
+         let app = axum::Router::new().route(
+diff --git a/src/commands/up.rs b/src/commands/up.rs
+index 71e49858..a843b489 100644
+--- a/src/commands/up.rs
++++ b/src/commands/up.rs
+@@ -281,6 +281,10 @@ pub async fn run(args: UpArgs) -> Result<()> {
+         version: env!("CARGO_PKG_VERSION").into(),
+         proto: 2,
+         token,
++        private_ports: crate::local::trackio::reserved_port()
++            .map_err(|error| crate::error::anyhow!(error))?
++            .into_iter()
++            .collect(),
+     }
+     .publish(&data_dir)?;
+     if args.headless {
+@@ -3102,6 +3106,7 @@ impl CreateRunReq {
+             invocation_context: self.invocation_context,
+             telemetry_suppressed: self.telemetry_suppressed,
+             exp_id: self.experiment_id,
++            expected_commit: None,
+             disk: self.disk,
+             provider: self.provider,
+             backend: Some(backend.unwrap_or_else(|| "local".to_string())),
+diff --git a/src/commands/up/api_v2.rs b/src/commands/up/api_v2.rs
+index eefc8bc5..8298362b 100644
+--- a/src/commands/up/api_v2.rs
++++ b/src/commands/up/api_v2.rs
+@@ -350,6 +350,15 @@ fn routes(api: Arc<Api>) -> Router {
+     Router::new()
+         .route("/api/v2/runs", get(runs).post(run))
+         .route("/api/v2/runs/{id}", get(get_run))
++        .route(
++            "/api/v2/projects/{project}/experiments/{experiment}/snapshot",
++            get(snapshot),
++        )
++        .route(
++            "/api/v2/projects/{project}/experiments/{experiment}/workspace",
++            post(workspace),
++        )
++        .route("/api/v2/runs/{id}/reconnect", post(reconnect))
+         .route("/api/v2/runs/{id}/cancel", post(cancel))
+         .route("/api/v2/runs/{id}/abandon", post(abandon))
+         .route("/api/v2/runs/{id}/cleanup", post(cleanup))
+@@ -395,7 +404,13 @@ enum Failure {
+ }
+ impl From<crate::error::Error> for Failure {
+     fn from(error: crate::error::Error) -> Self {
+-        Self::Message(StatusCode::BAD_REQUEST, error.to_string())
++        let message = error.to_string();
++        let status = if message.contains("Expected commit does not match") {
++            StatusCode::CONFLICT
++        } else {
++            StatusCode::BAD_REQUEST
++        };
++        Self::Message(status, message)
+     }
+ }
+ impl IntoResponse for Failure {
+@@ -424,9 +439,14 @@ async fn hello(
+         ));
+     }
+     let proof = crate::commands::remote_host::hello_proof(&api.token, &api.instance, &query.nonce);
+-    Ok(Json(
+-        json!({"instance":api.instance, "proto":2, "version":env!("CARGO_PKG_VERSION"), "proof":proof}),
+-    ))
++    Ok(Json(json!({
++        "instance": api.instance,
++        "proto": 2,
++        "version": env!("CARGO_PKG_VERSION"),
++        "proof": proof,
++        "postudioContract": 1,
++        "capabilities": ["expectedCommit", "snapshot", "workspace", "privatePorts", "runReconnect"],
++    })))
+ }
+ 
+ #[derive(Default, Deserialize, Serialize)]
+@@ -483,6 +503,250 @@ async fn runs(State(api): State<Arc<Api>>, Query(filter): Query<Filter>) -> ApiR
+ async fn get_run(State(api): State<Arc<Api>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+     Ok(Json(api.view(&api.run(&id)?)?))
+ }
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct ExperimentSnapshot {
++    head_commit: String,
++    uncommitted_count: Option<usize>,
++    worktree_path: Option<String>,
++    branch: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    cwd: Option<String>,
++}
++
++async fn snapshot(
++    State(api): State<Arc<Api>>,
++    Path((project_id, experiment_id)): Path<(String, String)>,
++) -> ApiResult<Json<Value>> {
++    tokio::task::spawn_blocking(move || snapshot_value(&api, &project_id, &experiment_id, false))
++        .await
++        .map_err(|_| {
++            Failure::Message(
++                StatusCode::INTERNAL_SERVER_ERROR,
++                "Snapshot task failed".into(),
++            )
++        })?
++        .map(Json)
++}
++
++async fn workspace(
++    State(api): State<Arc<Api>>,
++    Path((project_id, experiment_id)): Path<(String, String)>,
++) -> ApiResult<Json<Value>> {
++    tokio::task::spawn_blocking(move || snapshot_value(&api, &project_id, &experiment_id, true))
++        .await
++        .map_err(|_| {
++            Failure::Message(
++                StatusCode::INTERNAL_SERVER_ERROR,
++                "Workspace task failed".into(),
++            )
++        })?
++        .map(Json)
++}
++
++fn snapshot_git(path: &std::path::Path, args: &[&str]) -> ApiResult<std::process::Output> {
++    let mut command = crate::local::git::git_command();
++    command.current_dir(path).args(args);
++    let mut command = tokio::process::Command::from(command);
++    command.kill_on_drop(true);
++    match tokio::runtime::Handle::current()
++        .block_on(async { tokio::time::timeout(Duration::from_secs(10), command.output()).await })
++    {
++        Ok(output) => output
++            .map_err(crate::error::Error::from)
++            .map_err(Into::into),
++        Err(_) => Err(Failure::Message(
++            StatusCode::CONFLICT,
++            "Git snapshot command timed out after 10 seconds".into(),
++        )),
++    }
++}
++
++fn git_snapshot_output(path: &std::path::Path, args: &[&str]) -> ApiResult<String> {
++    let output = snapshot_git(path, args)?;
++    if !output.status.success() {
++        return Err(Failure::Message(
++            StatusCode::CONFLICT,
++            "Cannot validate experiment workspace".into(),
++        ));
++    }
++    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
++}
++
++fn snapshot_value(
++    api: &Api,
++    project_id: &str,
++    experiment_id: &str,
++    create: bool,
++) -> ApiResult<Value> {
++    let store = api.store();
++    let experiment = store
++        .get_local_experiment(experiment_id)?
++        .ok_or_else(|| Failure::Message(StatusCode::NOT_FOUND, "Experiment not found.".into()))?;
++    if experiment.project_id != project_id {
++        return Err(Failure::Message(
++            StatusCode::NOT_FOUND,
++            "Experiment not found in project.".into(),
++        ));
++    }
++    let project = store
++        .get_local_project(project_id)?
++        .ok_or_else(|| Failure::Message(StatusCode::NOT_FOUND, "Project not found.".into()))?;
++    let repo = PathBuf::from(&project.repo_path);
++    let head = git_snapshot_output(
++        &repo,
++        &[
++            "rev-parse",
++            "--verify",
++            &format!("{}^{{commit}}", experiment.branch_name),
++        ],
++    )?;
++    if !matches!(head.len(), 40 | 64) || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++        return Err(Failure::Message(
++            StatusCode::CONFLICT,
++            "Cannot validate experiment branch commit".into(),
++        ));
++    }
++    let workspace = crate::store::data_dir()
++        .join("worktrees")
++        .join("postudio")
++        .join(project_id)
++        .join(experiment_id);
++    let mut path = if workspace.join(".git").exists() {
++        Some(workspace.clone())
++    } else {
++        None
++    };
++    let worktree = if create {
++        if let Some(path) = &path {
++            path.clone()
++        } else {
++            std::fs::create_dir_all(workspace.parent().unwrap())
++                .map_err(crate::error::Error::from)?;
++            let workspace_utf8 = workspace.to_str().ok_or_else(|| {
++                Failure::Message(
++                    StatusCode::BAD_REQUEST,
++                    "Workspace path is not valid UTF-8.".into(),
++                )
++            })?;
++            let output = snapshot_git(
++                &repo,
++                &[
++                    "-c",
++                    "core.hooksPath=/dev/null",
++                    "worktree",
++                    "add",
++                    "--",
++                    workspace_utf8,
++                    &experiment.branch_name,
++                ],
++            )?;
++            if !output.status.success() {
++                return Err(Failure::Message(
++                    StatusCode::CONFLICT,
++                    String::from_utf8_lossy(&output.stderr).trim().to_string(),
++                ));
++            }
++            path = Some(workspace.clone());
++            workspace.clone()
++        }
++    } else {
++        path.clone().unwrap_or(repo.clone())
++    };
++    let head_path = if worktree.join(".git").exists() {
++        worktree.clone()
++    } else {
++        repo.clone()
++    };
++    if path.is_some() {
++        let branch =
++            git_snapshot_output(&head_path, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
++        let actual = git_snapshot_output(&head_path, &["rev-parse", "HEAD"])?;
++        let common = git_snapshot_output(
++            &head_path,
++            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
++        )?;
++        let expected_common = git_snapshot_output(
++            &repo,
++            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
++        )?;
++        if branch != experiment.branch_name
++            || actual != head
++            || std::fs::canonicalize(common).ok() != std::fs::canonicalize(expected_common).ok()
++        {
++            return Err(Failure::Message(StatusCode::CONFLICT,"Experiment workspace changed repository, branch or commit; restore it before approving a snapshot.".into()));
++        }
++    }
++    let count = if path.is_some() {
++        let output = snapshot_git(
++            &head_path,
++            &[
++                "-c",
++                "core.fsmonitor=false",
++                "status",
++                "--porcelain=v1",
++                "--untracked-files=all",
++                "-z",
++            ],
++        )?;
++        if output.status.success() {
++            Some(
++                output
++                    .stdout
++                    .split(|byte| *byte == 0)
++                    .filter(|entry| !entry.is_empty())
++                    .count(),
++            )
++        } else {
++            None
++        }
++    } else {
++        None
++    };
++    let output = if path.is_some() {
++        git_snapshot_output(&head_path, &["branch", "--show-current"])
++            .unwrap_or_else(|_| experiment.branch_name.clone())
++    } else {
++        experiment.branch_name.clone()
++    };
++    let result = ExperimentSnapshot {
++        head_commit: head,
++        uncommitted_count: count,
++        worktree_path: path.map(|p| p.to_string_lossy().into_owned()),
++        branch: output.trim().to_string(),
++        cwd: create.then(|| worktree.to_string_lossy().into_owned()),
++    };
++    serde_json::to_value(result)
++        .map_err(crate::error::Error::from)
++        .map_err(Into::into)
++}
++
++async fn reconnect(State(api): State<Arc<Api>>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
++    let run = api.run(&id)?;
++    if Phase::parse(&run.status).is_some_and(Phase::is_terminal) {
++        return Ok(Json(api.view(&run)?));
++    }
++    let handle = handle_of(&run).ok_or_else(|| {
++        Failure::Message(StatusCode::CONFLICT, "Run has no native handle yet".into())
++    })?;
++    if let crate::engine::handle::Handle::Ssh { host, .. }
++    | crate::engine::handle::Handle::Slurm { host, .. } = &handle
++    {
++        retry_host(State(api.clone()), Path(host.clone())).await?;
++    }
++    let backend = api.commands.backend(&run)?;
++    let watched = [WatchedRun {
++        id: id.clone(),
++        handle,
++    }];
++    let observations = backend.observe(&watched, Duration::from_secs(3)).await;
++    api.engine
++        .apply_observations(backend.as_ref(), &watched, observations)
++        .await;
++    Ok(Json(api.view(&api.run(&id)?)?))
++}
++
+ async fn run(
+     State(api): State<Arc<Api>>,
+     Json(args): Json<crate::ExpRunArgs>,
+diff --git a/src/commands/up/api_v2/tests.rs b/src/commands/up/api_v2/tests.rs
+index 76ab5b64..3faf9aa1 100644
+--- a/src/commands/up/api_v2/tests.rs
++++ b/src/commands/up/api_v2/tests.rs
+@@ -294,6 +294,7 @@ impl Fixture {
+             port: listener.local_addr().unwrap().port(),
+             version: env!("CARGO_PKG_VERSION").into(),
+             proto: 2,
++            private_ports: Vec::new(),
+         };
+         let requests = Arc::new(AtomicUsize::new(0));
+         let count = requests.clone();
+diff --git a/src/compute.rs b/src/compute.rs
+index 074bee96..cd10c2c8 100644
+--- a/src/compute.rs
++++ b/src/compute.rs
+@@ -30,14 +30,23 @@ pub struct SourceSnapshot {
+     pub ray_package: Option<(String, PathBuf)>,
+ }
+ 
++fn validate_expected_commit(expected: Option<&str>, revision: &str) -> Result<()> {
++    if expected.is_some_and(|expected| expected != revision) {
++        return Err(anyhow!("Expected commit does not match experiment branch head; refresh snapshot and approve again."));
++    }
++    Ok(())
++}
++
+ impl SourceSnapshot {
+-    pub fn create(
++    pub fn create_expected(
+         project: &LocalProject,
+         experiment: &LocalExperiment,
+         include_ray_package: bool,
++        expected_commit: Option<&str>,
+     ) -> Result<Self> {
+         let repo = Path::new(&project.repo_path);
+         let revision = crate::local::git::local_head_sha(repo, &experiment.branch_name)?;
++        validate_expected_commit(expected_commit, &revision)?;
+         let dir = crate::store::data_dir().join("source-snapshots");
+         prepare_snapshot_dir(&dir)?;
+ 
+@@ -287,6 +296,7 @@ pub trait ComputeBackend: Send + Sync {
+         &self,
+         project: &LocalProject,
+         experiment: &LocalExperiment,
++        expected_commit: Option<&str>,
+     ) -> Result<StagedSource>;
+     /// The launch intent the run engine stores before any side effect. Secrets are added by
+     /// the engine at launch.
+@@ -321,11 +331,18 @@ async fn stage_snapshot(
+     project: &LocalProject,
+     experiment: &LocalExperiment,
+     include_ray_package: bool,
++    expected_commit: Option<&str>,
+ ) -> Result<StagedSource> {
+     let project = project.clone();
+     let experiment = experiment.clone();
++    let expected_commit = expected_commit.map(str::to_owned);
+     tokio::task::spawn_blocking(move || {
+-        SourceSnapshot::create(&project, &experiment, include_ray_package)
++        SourceSnapshot::create_expected(
++            &project,
++            &experiment,
++            include_ray_package,
++            expected_commit.as_deref(),
++        )
+     })
+     .await
+     .map_err(|error| anyhow!("source snapshot task failed: {error}"))?
+@@ -370,8 +387,9 @@ macro_rules! backend_adapter {
+                 &self,
+                 project: &LocalProject,
+                 experiment: &LocalExperiment,
++                expected_commit: Option<&str>,
+             ) -> Result<StagedSource> {
+-                stage_snapshot(project, experiment, $ray_package).await
++                stage_snapshot(project, experiment, $ray_package, expected_commit).await
+             }
+ 
+             async fn prepare(
+@@ -826,7 +844,10 @@ where
+     )
+     .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?
+     .to_string();
+-    let source = backend.stage_source(&project, &experiment).await?.0;
++    let source = backend
++        .stage_source(&project, &experiment, args.expected_commit.as_deref())
++        .await?
++        .0;
+     let run_id = uuid::Uuid::new_v4().to_string();
+     let launch = backend.prepare(args, &source, &run_id, &command).await?;
+ 
+@@ -1199,6 +1220,7 @@ echo ok
+     pub(crate) fn tinker_args() -> crate::ExpRunArgs {
+         crate::ExpRunArgs {
+             exp_id: "exp".into(),
++            expected_commit: None,
+             disk: None,
+             provider: None,
+             backend: Some("tinker".into()),
+@@ -1359,6 +1381,13 @@ echo ok
+         assert!(validate_run_args(&args).is_err());
+     }
+ 
++    #[test]
++    fn expected_commit_mismatch_is_rejected_before_snapshot_creation() {
++        assert!(validate_expected_commit(Some("old-sha"), "new-sha").is_err());
++        assert!(validate_expected_commit(Some("same-sha"), "same-sha").is_ok());
++        assert!(validate_expected_commit(None, "any-sha").is_ok());
++    }
++
+     #[test]
+     fn invalid_timeout_is_rejected_before_submission() {
+         let mut args = tinker_args();
+diff --git a/src/local/trackio.rs b/src/local/trackio.rs
+index 0b2cbbcb..ca4d292b 100644
+--- a/src/local/trackio.rs
++++ b/src/local/trackio.rs
+@@ -17,6 +17,31 @@ pub const SPACE_ID: &str = "TRACKIO_SPACE_ID";
+ pub const PROJECT: &str = "TRACKIO_PROJECT";
+ pub const WRITE_TOKEN: &str = "TRACKIO_WRITE_TOKEN";
+ const DIR: &str = "TRACKIO_DIR";
++const POSTUDIO_PORT: &str = "ORX_POSTUDIO_TRACKIO_PORT";
++
++fn parse_reserved_port(value: Option<&str>) -> Result<Option<u16>, String> {
++    value
++        .map(|value| {
++            let port: u16 = value.parse().map_err(|_| {
++                format!("{POSTUDIO_PORT} must be a valid nonzero loopback TCP port.")
++            })?;
++            if port == 0 {
++                return Err(format!(
++                    "{POSTUDIO_PORT} must be a valid nonzero loopback TCP port."
++                ));
++            }
++            Ok(port)
++        })
++        .transpose()
++}
++
++pub fn reserved_port() -> Result<Option<u16>, String> {
++    match std::env::var(POSTUDIO_PORT) {
++        Ok(value) => parse_reserved_port(Some(&value)),
++        Err(std::env::VarError::NotPresent) => Ok(None),
++        Err(error) => Err(format!("Could not read {POSTUDIO_PORT}: {error}")),
++    }
++}
+ /// 0.43 is the release the dashboard's `runs`, `sidebar` and `navbar` params were checked against.
+ const LOCAL_REQUIREMENT: &str = "trackio>=0.43,<1";
+ 
+@@ -902,9 +927,16 @@ async fn start_local() -> Result<(LocalChild, String), String> {
+     use crate::local::shell_env::find;
+     let install = "Install uv, or run `pip install trackio`, to see local runs in Trackio.";
+     let dir = local_dir().ok_or("No home directory for Trackio's local store")?;
+-    let port = crate::local::opencode::free_port()
+-        .map_err(|error| error.to_string())?
+-        .to_string();
++    let port = match reserved_port()? {
++        Some(port) => {
++            let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
++                .map_err(|error| format!("Reserved Trackio port {port} is unavailable: {error}"))?;
++            drop(listener);
++            port
++        }
++        None => crate::local::opencode::free_port().map_err(|error| error.to_string())?,
++    }
++    .to_string();
+     let mut cmd = if let Some(uvx) = find("uvx") {
+         let mut cmd = crate::process::tokio_command(uvx);
+         cmd.args([
+@@ -973,6 +1005,14 @@ async fn start_local() -> Result<(LocalChild, String), String> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn reserved_port_is_validated_without_fallback() {
++        assert_eq!(parse_reserved_port(None).unwrap(), None);
++        assert_eq!(parse_reserved_port(Some("43127")).unwrap(), Some(43127));
++        assert!(parse_reserved_port(Some("0")).is_err());
++        assert!(parse_reserved_port(Some("bad")).is_err());
++    }
++
+     #[test]
+     fn base_url_drops_tokens_and_credentials() {
+         assert_eq!(
+diff --git a/src/main.rs b/src/main.rs
+index a0929f64..71b796d0 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -593,6 +593,10 @@ pub enum ExpCommand {
+ #[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
+ pub struct ExpRunArgs {
+     pub exp_id: String,
++    /// Required by Postudio to bind approval to an immutable source revision.
++    #[arg(long)]
++    #[serde(default)]
++    pub expected_commit: Option<String>,
+     /// Disk in GB for a `--backend openresearch` instance (default 100).
+     #[arg(long)]
+     pub disk: Option<i64>,

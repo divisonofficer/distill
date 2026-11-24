@@ -32,7 +32,7 @@ for line in sys.stdin:
         continue
     i, meth, p = m.get("id"), m["method"], m.get("params", {})
     if meth == "initialize":
-        ok(i, {"authMethods": [{"id": "xai.api_key"}]})
+        ok(i, {"authMethods": [{"id": "xai.api_key"}], "receivedCapabilities": p.get("clientCapabilities")})
     elif meth == "authenticate":
         ok(i, {})
     elif meth == "_x.ai/sessions/list":
@@ -76,6 +76,17 @@ fn fake_config() -> (tempfile::TempDir, AgentConfig) {
         extra_env: Vec::new(),
     };
     (dir, cfg)
+}
+
+#[tokio::test]
+async fn initialize_requests_live_user_message_echo() {
+    let (_dir, cfg) = fake_config();
+    let (handle, _rx) = spawn(&cfg).await.unwrap();
+    let init = handle.initialize().await.unwrap();
+    assert_eq!(
+        init.pointer("/receivedCapabilities/_meta/x.ai~1userMessageEcho"),
+        Some(&json!(true))
+    );
 }
 
 #[tokio::test]
