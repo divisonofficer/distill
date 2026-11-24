@@ -1,4 +1,4 @@
-//! Browser login jobs. Authorization URLs use a loopback callback on the node, so browser must run on same computer.
+//! Browser login jobs backed by Distill's provider OAuth. Remote browsers can relay a job-bound loopback callback.
 
 use std::process::Stdio;
 use std::sync::{Arc, Weak};
@@ -29,7 +29,13 @@ const DEFAULT_MAX_JOBS: usize = 16;
 const DEFAULT_MAX_OUTPUT: usize = 64 * 1024;
 const DEFAULT_MAX_LINE: usize = 8 * 1024;
 const ID_RANDOM_BYTES: usize = 16;
-const AUTHORIZATION_HOSTS: [&str; 3] = ["auth.openai.com", "claude.ai", "openrouter.ai"];
+const AUTHORIZATION_HOSTS: [&str; 5] = [
+    "auth.openai.com",
+    "claude.ai",
+    "openrouter.ai",
+    "auth.x.ai",
+    "accounts.x.ai",
+];
 
 /// Short limits support deterministic tests; production uses 300 seconds, 10 minutes, 16 jobs and bounded output.
 #[derive(Clone, Copy, Debug)]
@@ -136,6 +142,12 @@ struct StartRequest {
 #[serde(deny_unknown_fields)]
 struct CancelRequest {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CallbackRequest {
+    callback_url: String,
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -170,7 +182,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Mount login job endpoints. Browser authorization and callback stay on node localhost; no callback or token is forwarded.
+/// Mount login jobs and the owner-authenticated, job-bound callback relay.
 pub fn routes(cfg: AgentConfig) -> Router {
     routes_inner(cfg, LoginLimits::default())
 }
@@ -201,6 +213,10 @@ fn routes_inner(cfg: AgentConfig, limits: LoginLimits) -> Router {
         .route("/api/accounts/login", post(start))
         .route("/api/accounts/login/{job_id}", get(poll))
         .route("/api/accounts/login/{job_id}/cancel", post(cancel))
+        .route(
+            "/api/accounts/login/{job_id}/callback",
+            post(relay_callback),
+        )
         .with_state(state)
 }
 
@@ -309,6 +325,122 @@ async fn cancel(
         .find(|job| job.id == job_id && job.owner == owner)
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(JobView::from_job(job)))
+}
+
+async fn relay_callback(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+    Json(request): Json<CallbackRequest>,
+) -> Result<StatusCode, ApiError> {
+    let owner = owner(&headers)?;
+    let target = {
+        let jobs = state.manager.jobs.lock().await;
+        let job = jobs
+            .jobs
+            .iter()
+            .find(|job| job.id == job_id && job.owner == owner)
+            .ok_or_else(ApiError::not_found)?;
+        let authorization_url = job
+            .authorization_url
+            .as_deref()
+            .filter(|_| job.status == JobStatus::Pending)
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "Login job is not awaiting a callback.",
+                )
+            })?;
+        callback_target(authorization_url, &request.callback_url).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Callback does not match this login job.",
+            )
+        })?
+    };
+    let failed = || {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "Could not deliver the login callback.",
+        )
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| failed())?;
+    let response = client.get(target).send().await.map_err(|_| failed())?;
+    if !response.status().is_success() && !response.status().is_redirection() {
+        return Err(failed());
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+fn callback_target(authorization: &str, submitted: &str) -> Option<Url> {
+    if submitted.len() > DEFAULT_MAX_LINE || validate_authorization_url(authorization).is_err() {
+        return None;
+    }
+    let authorization = Url::parse(authorization).ok()?;
+    let provider = authorization.host_str()?;
+    let parameter = if provider == "openrouter.ai" {
+        "callback_url"
+    } else {
+        "redirect_uri"
+    };
+    let mut target = Url::parse(&query_value(&authorization, parameter)?).ok()?;
+    let input = Url::parse(submitted.trim()).ok()?;
+    let loopback = |url: &Url| {
+        url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_some_and(|port| port >= 1024)
+            && url.fragment().is_none()
+    };
+    if !loopback(&target)
+        || !loopback(&input)
+        || target.query().is_some()
+        || target.port() != input.port()
+        || target.path() != input.path()
+    {
+        return None;
+    }
+    match provider {
+        "auth.openai.com" if target.path() == "/auth/callback" => {}
+        "claude.ai" | "auth.x.ai" | "accounts.x.ai" if target.path() == "/callback" => {}
+        "openrouter.ai"
+            if target
+                .path()
+                .strip_prefix("/auth/callback/")
+                .is_some_and(|nonce| {
+                    !nonce.is_empty()
+                        && nonce
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                }) => {}
+        _ => return None,
+    }
+    let code = query_value(&input, "code").filter(|code| !code.trim().is_empty())?;
+    target.set_host(Some("127.0.0.1")).ok()?;
+    let mut query = target.query_pairs_mut();
+    query.append_pair("code", &code);
+    if provider != "openrouter.ai" {
+        let expected_state =
+            query_value(&authorization, "state").filter(|state| !state.is_empty())?;
+        if query_value(&input, "state")? != expected_state {
+            return None;
+        }
+        query.append_pair("state", &expected_state);
+    }
+    drop(query);
+    Some(target)
+}
+
+fn query_value(url: &Url, name: &str) -> Option<String> {
+    let mut values = url.query_pairs().filter(|(key, _)| key == name);
+    let value = values.next()?.1.into_owned();
+    values.next().is_none().then_some(value)
 }
 
 fn owner(headers: &HeaderMap) -> Result<String, ApiError> {
@@ -484,11 +616,17 @@ async fn reap(child: &mut Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // Let the CLI drop its staged credentials before escalating to SIGKILL.
-        #[allow(clippy::disallowed_methods, reason = "fixed signal command for owned login child")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "fixed signal command for owned login child"
+        )]
         let signal = Command::new("/bin/kill")
             .args(["-TERM", &pid.to_string()])
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .kill_on_drop(true).status();
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status();
         let _ = timeout(Duration::from_secs(1), signal).await;
         if timeout(Duration::from_secs(2), child.wait()).await.is_ok() {
             return;

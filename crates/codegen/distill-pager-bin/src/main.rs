@@ -1999,30 +1999,17 @@ fn accounts_login_web_terminal_event(completed: bool) -> serde_json::Value {
     serde_json::json!({ "status": if completed { "completed" } else { "failed" } })
 }
 
-fn supports_accounts_login_web(provider: distill_shell::accounts::Provider) -> bool {
-    provider != distill_shell::accounts::Provider::Grok
-}
-
-async fn run_accounts_login_web(store: &distill_shell::accounts::AccountStore, id: &str) -> bool {
+async fn run_accounts_login_web(
+    store: &distill_shell::accounts::AccountStore,
+    id: &str,
+    grok: anyhow::Result<Option<distill_shell::accounts::GrokLoginConfig>>,
+) -> bool {
     let mut stdout = std::io::stdout().lock();
-    let account = match store.get(id) {
-        Ok(account) => account,
-        Err(_) => {
-            let _ = write_accounts_login_web_event(
-                &mut stdout,
-                &accounts_login_web_terminal_event(false),
-            );
-            return false;
-        }
-    };
-    if !supports_accounts_login_web(account.provider) {
-        eprintln!(
-            "Grok login-web is unsupported; use `distill accounts login <id>` for the existing Grok login flow."
-        );
+    let Ok(grok) = grok else {
         let _ =
             write_accounts_login_web_event(&mut stdout, &accounts_login_web_terminal_event(false));
         return false;
-    }
+    };
 
     #[cfg(unix)]
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -2039,7 +2026,7 @@ async fn run_accounts_login_web(store: &distill_shell::accounts::AccountStore, i
 
     let (feedback_tx, mut feedback_rx) = tokio::sync::mpsc::unbounded_channel();
     let attempt = async {
-        let login = store.login_tui(id, None, feedback_tx);
+        let login = store.login_tui(id, grok, feedback_tx);
         tokio::pin!(login);
         let feedback = tokio::select! {
             result = &mut login => {
@@ -2074,10 +2061,7 @@ async fn run_accounts_login_web(store: &distill_shell::accounts::AccountStore, i
 
 #[cfg(test)]
 mod accounts_login_web_tests {
-    use super::{
-        accounts_login_web_terminal_event, supports_accounts_login_web,
-        write_accounts_login_web_event,
-    };
+    use super::{accounts_login_web_terminal_event, write_accounts_login_web_event};
     use std::io::{self, Write};
 
     #[derive(Default)]
@@ -2132,20 +2116,6 @@ mod accounts_login_web_tests {
             accounts_login_web_terminal_event(false),
             serde_json::json!({ "status": "failed" })
         );
-    }
-
-    #[test]
-    fn grok_is_not_supported_for_login_web() {
-        assert!(!supports_accounts_login_web(
-            distill_shell::accounts::Provider::Grok
-        ));
-        for provider in [
-            distill_shell::accounts::Provider::Chatgpt,
-            distill_shell::accounts::Provider::Claude,
-            distill_shell::accounts::Provider::Openrouter,
-        ] {
-            assert!(supports_accounts_login_web(provider));
-        }
     }
 }
 
@@ -2372,7 +2342,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                         serde_json::json!({"ok": true})
                     }
                     AccountsCommand::LoginWeb { id } => {
-                        let completed = run_accounts_login_web(&store, &id).await;
+                        let completed = run_accounts_login_web(&store, &id, grok_config(&id)).await;
                         distill_shell::instrumentation::finalize_and_exit(if completed {
                             0
                         } else {
