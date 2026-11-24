@@ -1061,8 +1061,7 @@ mod tests {
                 envelope_hash(
                     b.export()
                         .iter()
-                        .filter(|e| e.author == b.identity().node_id)
-                        .last()
+                        .rfind(|e| e.author == b.identity().node_id)
                         .unwrap(),
                 )
                 .unwrap(),

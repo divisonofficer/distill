@@ -105,10 +105,10 @@ async fn create_chat(
             .map_or((session_id.as_str(), None), |(session, grant)| {
                 (session, Some(grant))
             });
-        if let Some(grant) = grant {
-            if let Err(error) = state.bindings.bind(grant, session_id).await {
-                return fail(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
-            }
+        if let Some(grant) = grant
+            && let Err(error) = state.bindings.bind(grant, session_id).await
+        {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
         }
         return response(&state, &project, &experiment, session_id).await;
     }

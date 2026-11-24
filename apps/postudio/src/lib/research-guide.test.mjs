@@ -32,6 +32,8 @@ assert.equal(phaseLabel('lost'),'확인 필요');
 assert.equal(phaseLabel('cancelled'),'취소됨');
 
 const targets=[{id:'offline',label:'Offline',backend:'local',available:false},{id:'ready',label:'Ready',backend:'local',available:true}];
-assert.equal(availableTarget(targets,'offline').id,'ready');
-assert.equal(availableTarget(targets,'missing').id,'ready');
+// No silent fallback: the run confirmation and SSH approval both key off the selected target.
+assert.equal(availableTarget(targets,'ready').id,'ready');
+assert.equal(availableTarget(targets,'offline'),null);
+assert.equal(availableTarget(targets,'missing'),null);
 assert.equal(availableTarget([],''),null);

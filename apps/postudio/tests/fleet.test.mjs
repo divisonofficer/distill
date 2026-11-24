@@ -64,7 +64,7 @@ test('chat fleet includes connected paired-host accounts when the browser host i
 test('ordinary GET stays on current origin while explicit host pins destination', async () => {
   fleet.saveHosts(['https://peer-a.example', 'https://peer-b.example']);
   const calls = [];
-  globalThis.fetch = async (url) => { calls.push(String(url)); return { ok: true, json: async () => ({}) }; };
+  globalThis.fetch = async (url) => { calls.push(String(url)); return { ok: true, text: async () => '{}', json: async () => ({}) }; };
   await api.getJson('/api/node');
   await api.getJson('/api/node', 'https://peer-b.example');
   await api.getJson('/api/chats', 'https://peer-b.example');

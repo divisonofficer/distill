@@ -29,6 +29,10 @@ pub(crate) struct ResearchScope {
     pub project_id: String,
     pub experiment_id: String,
     pub session_id: Option<String>,
+    #[expect(
+        dead_code,
+        reason = "kept for grant revocation, which is not wired to session close yet (grants expire meanwhile)"
+    )]
     pub grant_id: String,
 }
 
@@ -107,9 +111,7 @@ impl ResearchBindings {
             .unwrap_or_else(std::env::current_exe)
             .context("resolve research MCP executable")?;
         let mcp_exe = Arc::new(
-            mcp_exe
-                .canonicalize()
-                .context("resolve research MCP executable path")?,
+            dunce::canonicalize(&mcp_exe).context("resolve research MCP executable path")?,
         );
         if !mcp_exe.is_file() {
             bail!("Research MCP executable must be a file");
@@ -245,16 +247,16 @@ impl ResearchBindings {
         state
             .grants
             .iter()
-            .filter_map(|(id, grant)| {
-                (grant.session_id.as_deref() == Some(session_id)
+            .filter(|&(_id, grant)| {
+                grant.session_id.as_deref() == Some(session_id)
                     && !grant.revoked
-                    && grant.expires_at > now)
-                    .then(|| ResearchScope {
-                        project_id: grant.project_id.clone(),
-                        experiment_id: grant.experiment_id.clone(),
-                        session_id: grant.session_id.clone(),
-                        grant_id: id.clone(),
-                    })
+                    && grant.expires_at > now
+            })
+            .map(|(id, grant)| ResearchScope {
+                project_id: grant.project_id.clone(),
+                experiment_id: grant.experiment_id.clone(),
+                session_id: grant.session_id.clone(),
+                grant_id: id.clone(),
             })
             .collect()
     }
@@ -269,16 +271,23 @@ impl ResearchBindings {
             state
                 .grants
                 .iter()
-                .filter_map(|(id, grant)| {
-                    (grant.session_id.as_deref() == Some(session)
+                .filter(|&(_id, grant)| {
+                    grant.session_id.as_deref() == Some(session)
                         && !grant.revoked
-                        && grant.expires_at > now)
-                        .then(|| this.server_config(id, &this.token(id)))
+                        && grant.expires_at > now
                 })
+                .map(|(id, _grant)| this.server_config(id, &this.token(id)))
                 .collect()
         })
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "not wired to session close yet; grants expire meanwhile"
+        )
+    )]
     pub(crate) async fn revoke(&self, grant_id: &str) -> Result<()> {
         validate_id(grant_id)?;
         let mut state = self

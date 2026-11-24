@@ -546,15 +546,14 @@ fn content_of(update: &Value) -> Option<Vec<ToolContent>> {
         .get("content")
         .and_then(Value::as_array)
         .map(|items| items.iter().filter_map(tool_content).collect());
-    if content.as_ref().is_none_or(Vec::is_empty) {
-        if let Some(marker) = update
+    if content.as_ref().is_none_or(Vec::is_empty)
+        && let Some(marker) = update
             .get("rawOutput")
             .and_then(|raw| research_output(raw, 0))
-        {
-            return Some(vec![ToolContent::Text {
-                text: marker.to_string(),
-            }]);
-        }
+    {
+        return Some(vec![ToolContent::Text {
+            text: marker.to_string(),
+        }]);
     }
     content
 }

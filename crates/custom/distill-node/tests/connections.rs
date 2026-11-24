@@ -96,6 +96,10 @@ async fn pairing_sync_restart_and_revoke() {
         )
         .into_future(),
     );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "localhost-only test client against two nodes bound on 127.0.0.1"
+    )]
     let client = reqwest::Client::new();
     let owner_post = |url: String, origin: &str, body: Value| {
         client

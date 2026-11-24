@@ -248,10 +248,10 @@ async fn link_paper(
             "Paper must match a current server search result",
         );
     };
-    if let Some(experiment_id) = req.experiment_id.as_deref() {
-        if let Err(response) = s.service.owned_experiment(&project, experiment_id).await {
-            return response;
-        }
+    if let Some(experiment_id) = req.experiment_id.as_deref()
+        && let Err(response) = s.service.owned_experiment(&project, experiment_id).await
+    {
+        return response;
     }
     match s
         .service

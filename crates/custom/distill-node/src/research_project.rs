@@ -173,10 +173,10 @@ async fn links(
             if let Some(children) = item["children"].as_array() {
                 pending.extend(children.iter().cloned());
             }
-            if item["isDir"] != true {
-                if let Some(path) = item["path"].as_str() {
-                    available.push(path.to_owned());
-                }
+            if item["isDir"] != true
+                && let Some(path) = item["path"].as_str()
+            {
+                available.push(path.to_owned());
             }
         }
         if artifact_paths
@@ -341,12 +341,12 @@ async fn get_approval(
         return error(StatusCode::NOT_FOUND, "Approval not found in this project");
     };
     let mut run = Value::Null;
-    if item.status == "submitted" {
-        if let Some(id) = item.run_id.as_deref() {
-            match service.owned_run(&project, id).await {
-                Ok(v) => run = v,
-                Err(e) => return e,
-            }
+    if item.status == "submitted"
+        && let Some(id) = item.run_id.as_deref()
+    {
+        match service.owned_run(&project, id).await {
+            Ok(v) => run = v,
+            Err(e) => return e,
         }
     }
     Json(json!({"approval":item,"run":if run.is_null(){None}else{Some(run)}})).into_response()

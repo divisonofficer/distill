@@ -42,6 +42,10 @@ pub(crate) async fn run_stdio(endpoint: NodeEndpoint, grant_id: String) -> anyho
     if token.is_empty() || grant_id.is_empty() {
         bail!("research MCP grant credentials are empty");
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "talks only to this node's loopback API (the node passes its own listener); proxies and redirects are disabled"
+    )]
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())

@@ -129,10 +129,10 @@ pub(crate) fn routes_for_service(state: ResearchService) -> Router {
 }
 async fn status(State(s): State<ResearchState>) -> Json<Value> {
     let mut status = serde_json::to_value(inspect(&s).await).expect("status serialization");
-    if status["connected"] == true {
-        if let Ok(caps) = s.capabilities().await {
-            status["capabilities"] = caps;
-        }
+    if status["connected"] == true
+        && let Ok(caps) = s.capabilities().await
+    {
+        status["capabilities"] = caps;
     }
     Json(status)
 }
@@ -273,6 +273,10 @@ async fn start(s: &ResearchState) -> Result<(), String> {
         .insert(metrics_port);
     drop(metrics_reservation);
     drop(reservation);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the OpenResearch runtime is a node-owned service that outlives node restarts; it is tracked by its runtime descriptor and stopped by PID"
+    )]
     let c = isolated_command(bin)
         .args([
             "--no-telemetry",
@@ -299,10 +303,10 @@ async fn start(s: &ResearchState) -> Result<(), String> {
     *lock = Some(c);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(Some(d)) = descriptor(s).await {
-            if validate(s, &d).await.is_ok() {
-                return Ok(());
-            }
+        if let Ok(Some(d)) = descriptor(s).await
+            && validate(s, &d).await.is_ok()
+        {
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("OpenResearch start requested but no authenticated server became ready; inspect status before retrying.".into());
@@ -337,7 +341,7 @@ async fn descriptor_at(root: &Path) -> Result<Option<Descriptor>, String> {
             ));
         }
     }
-    let canonical = tokio::fs::canonicalize(&data)
+    let canonical = canonicalize(data.clone())
         .await
         .map_err(|e| format!("Research data directory unavailable: {e}"))?;
     let hash = digest::digest(&digest::SHA256, canonical.to_string_lossy().as_bytes());
@@ -571,8 +575,7 @@ async fn upstream(
 async fn projects(State(s): State<ResearchState>) -> Response {
     api(upstream(&s, Method::GET, "api/projects", None)
         .await
-        .map(|v| json!({"projects":v["projects"]}))
-        .map_err(|e| e))
+        .map(|v| json!({"projects":v["projects"]})))
 }
 async fn create_project(State(s): State<ResearchState>, Json(r): Json<ProjectReq>) -> Response {
     if r.name.trim().is_empty() {
@@ -589,8 +592,14 @@ async fn create_project(State(s): State<ResearchState>, Json(r): Json<ProjectReq
     let body = json!({"name":r.name,"path":r.path,"createFolder":false,"initializeGit":false,"githubSyncEnabled":false,"locale":"ko","starterAgent":{"harness":"","profile":null,"model":null}});
     api(upstream(&s, Method::POST, "api/projects", Some(body)).await)
 }
+/// `dunce::canonicalize` on the blocking pool: no `\\?\` verbatim paths on Windows.
+async fn canonicalize(path: PathBuf) -> std::io::Result<PathBuf> {
+    tokio::task::spawn_blocking(move || dunce::canonicalize(path))
+        .await
+        .map_err(std::io::Error::other)?
+}
 async fn git_repo(p: &Path) -> bool {
-    let Ok(path) = tokio::fs::canonicalize(p).await else {
+    let Ok(path) = canonicalize(p.to_path_buf()).await else {
         return false;
     };
     let output = tokio::time::timeout(
@@ -607,7 +616,7 @@ async fn git_repo(p: &Path) -> bool {
     .await;
     match output {
         Ok(Ok(out)) if out.status.success() => {
-            tokio::fs::canonicalize(String::from_utf8_lossy(&out.stdout).trim())
+            canonicalize(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
                 .await
                 .is_ok_and(|root| root == path)
         }
@@ -684,6 +693,10 @@ async fn create_experiment(
     } else {
         cmd.arg("--baseline");
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bounded orx CLI call with kill_on_drop; the child cannot outlive this request"
+    )]
     let mut child = match cmd
         .env("HOME", s.root.join("home"))
         .env("ORX_DATA_DIR", s.root.join("data"))
@@ -730,8 +743,7 @@ async fn runs(State(s): State<ResearchState>, AxumPath(id): AxumPath<String>) ->
         None,
     )
     .await
-    .map(|v| json!({"runs":v["runs"]}))
-    .map_err(|e| e))
+    .map(|v| json!({"runs":v["runs"]})))
 }
 async fn create_run(
     State(s): State<ResearchState>,
@@ -895,8 +907,7 @@ async fn files(State(s): State<ResearchState>, AxumPath(id): AxumPath<String>) -
         }
         files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
         json!({"files":files})
-    })
-    .map_err(|e| e))
+    }))
 }
 fn enc(s: &str) -> String {
     urlencoding::encode(s).into_owned()
@@ -911,43 +922,17 @@ fn err(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(json!({"error":msg.into()}))).into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn missing_binary_is_unavailable() {
-        let s = ResearchState {
-            bin: None,
-            root: PathBuf::from("/tmp/unneeded"),
-            child: Arc::new(Mutex::new(None)),
-            run_submission: Arc::new(Mutex::new(())),
-            client: reqwest::Client::new(),
-            blocked_ports: crate::ports::port_policy([]),
-            refs: crate::research_refs::RefsStore::new(PathBuf::from("/tmp/unneeded")),
-        };
-        let st = inspect(&s).await;
-        assert!(!st.available);
-        assert!(!st.connected);
-        assert!(st.error.unwrap().contains("not configured"));
-    }
-    #[test]
-    fn hello_uses_exact_hmac_message() {
-        let nonce = "test-nonce";
-        let d = Descriptor {
-            pid: std::process::id(),
-            instance: "inst".into(),
-            port: 1,
-            version: EXPECTED_VERSION.into(),
-            proto: 2,
-            token: "secret".into(),
-            private_ports: vec![],
-        };
-        let mut m = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, d.token.as_bytes()));
-        m.update(d.instance.as_bytes());
-        m.update(&[0]);
-        m.update(nonce.as_bytes());
-        assert_eq!(STANDARD.encode(m.sign().as_ref()).len(), 44);
-    }
+#[expect(
+    clippy::disallowed_methods,
+    reason = "loopback-only client for the node-owned OpenResearch runtime on 127.0.0.1; proxies and redirects are disabled"
+)]
+fn loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("static client config")
 }
 
 impl ResearchState {
@@ -963,12 +948,7 @@ impl ResearchState {
             run_submission: Arc::new(Mutex::new(())),
             blocked_ports,
             refs: crate::research_refs::RefsStore::new(state_dir.clone()),
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("static client config"),
+            client: loopback_client(),
         }
     }
     pub(crate) fn state_dir(&self) -> PathBuf {
@@ -1086,6 +1066,10 @@ impl ResearchState {
                 "OpenResearch not configured",
             )
         })?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "bounded orx discover call with kill_on_drop; the 16 s timeout reaps it"
+        )]
         let mut child = isolated_command(bin)
             .args([
                 "--no-telemetry",
@@ -1104,6 +1088,7 @@ impl ResearchState {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|_| {
                 err(
@@ -1455,5 +1440,44 @@ impl ResearchState {
             bytes.extend_from_slice(&chunk);
         }
         Ok((mime, bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn missing_binary_is_unavailable() {
+        let s = ResearchState {
+            bin: None,
+            root: PathBuf::from("/tmp/unneeded"),
+            child: Arc::new(Mutex::new(None)),
+            run_submission: Arc::new(Mutex::new(())),
+            client: loopback_client(),
+            blocked_ports: crate::ports::port_policy([]),
+            refs: crate::research_refs::RefsStore::new(PathBuf::from("/tmp/unneeded")),
+        };
+        let st = inspect(&s).await;
+        assert!(!st.available);
+        assert!(!st.connected);
+        assert!(st.error.unwrap().contains("not configured"));
+    }
+    #[test]
+    fn hello_uses_exact_hmac_message() {
+        let nonce = "test-nonce";
+        let d = Descriptor {
+            pid: std::process::id(),
+            instance: "inst".into(),
+            port: 1,
+            version: EXPECTED_VERSION.into(),
+            proto: 2,
+            token: "secret".into(),
+            private_ports: vec![],
+        };
+        let mut m = hmac::Context::with_key(&hmac::Key::new(hmac::HMAC_SHA256, d.token.as_bytes()));
+        m.update(d.instance.as_bytes());
+        m.update(&[0]);
+        m.update(nonce.as_bytes());
+        assert_eq!(STANDARD.encode(m.sign().as_ref()).len(), 44);
     }
 }

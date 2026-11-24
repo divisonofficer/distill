@@ -62,14 +62,14 @@ async fn save(
     if let Some(error) = validate(&input.bindings, &aliases) {
         return (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response();
     }
-    if let Some(error) = source_error {
-        if !input.bindings.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":error})),
-            )
-                .into_response();
-        }
+    if let Some(error) = source_error
+        && !input.bindings.is_empty()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":error})),
+        )
+            .into_response();
     }
     let updated = match service.save_target_bindings(&project, input.bindings).await {
         Ok(value) => value,

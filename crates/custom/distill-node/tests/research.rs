@@ -93,7 +93,7 @@ async fn setup() -> (TempDir, axum::Router, Arc<Mutex<Vec<(String, Value)>>>) {
     let root = state.join("research/openresearch");
     let data = root.join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let canonical = std::fs::canonicalize(&data).unwrap();
+    let canonical = dunce::canonicalize(&data).unwrap();
     let hash = digest::digest(&digest::SHA256, canonical.to_string_lossy().as_bytes());
     let name: String = hash.as_ref()[..16]
         .iter()

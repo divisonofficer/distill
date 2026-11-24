@@ -208,10 +208,10 @@ async fn proxy(State(g): State<DashboardGateway>, request: Request) -> Response 
         if let Err(error) = g.service.owned_run(&project, parts[2]).await {
             return secured(error);
         }
-    } else if experiment_read {
-        if let Err(error) = g.service.owned_experiment(&project, parts[2]).await {
-            return secured(error);
-        }
+    } else if experiment_read
+        && let Err(error) = g.service.owned_experiment(&project, parts[2]).await
+    {
+        return secured(error);
     }
     let asset = path.starts_with("/assets/")
         && !path.ends_with(".html")
