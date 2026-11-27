@@ -32,6 +32,19 @@ test('summary popup uses manual top-layer popover with bounded fixed placement',
   assert.doesNotMatch(summary, /size-8 shrink-0 rounded-full/);
 });
 
+test('summary colors real usage at 70/90 thresholds and puts highest connected quota in footer', () => {
+  const block = summary.slice(summary.indexOf('const highestUsage = $derived.by(() => {'), summary.indexOf('function usageColor'));
+  assert.match(block, /account.connected && account.quota\?\.status === 'available'/);
+  assert.match(block, /Number.isFinite\(account.quota.remaining_percent\)/);
+  assert.match(block, /remaining_percent >= 0 && account.quota.remaining_percent <= 100/);
+  assert.match(block, /const used = 100 - account.quota!.remaining_percent!/);
+  assert.match(block, /used > highest.used/);
+  assert.match(summary, /used >= 90 \? '#c8392c' : used >= 70 \? '#d6a24a' : '#2b59c3'/);
+  assert.match(summary, /사용량 기간·초기화 시각 정보 없음/);
+  assert.doesNotMatch(summary, /주간 사용량|월요일|Plus|Max|로그아웃/);
+  assert.match(summary, /href="\/settings#accounts-h"/);
+});
+
 test('summary pins session host and discards stale requests', () => {
   assert.match(summary, /sessionOrigin\(page\.url\.search\)/);
   assert.match(summary, /current !== request \|\| target !== host/);

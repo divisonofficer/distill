@@ -213,6 +213,27 @@ void poll();
 return stop;
 }
 
+const CHAT_RECOVERY_TTL_MS = 360_000;
+const recoveryKey = (chatId: string) => `postudio.chat.inflight.v1:${chatId}`;
+
+export function rememberChatCompletion(chatId: string, userMessageId: string, modelId: string): void {
+try { sessionStorage.setItem(recoveryKey(chatId), JSON.stringify({ userMessageId, modelId, expiresAt: Date.now() + CHAT_RECOVERY_TTL_MS })); } catch { /* Storage is optional. */ }
+}
+
+export function readChatCompletion(chatId: string): { userMessageId: string; modelId: string; expiresAt: number } | undefined {
+try {
+const value = record(JSON.parse(sessionStorage.getItem(recoveryKey(chatId)) ?? 'null'));
+if (typeof value.userMessageId === 'string' && value.userMessageId.length > 0 && typeof value.modelId === 'string' && value.modelId.length > 0 && typeof value.expiresAt === 'number' && value.expiresAt > Date.now() && value.expiresAt <= Date.now() + CHAT_RECOVERY_TTL_MS) {
+return { userMessageId: value.userMessageId, modelId: value.modelId, expiresAt: value.expiresAt };
+}
+sessionStorage.removeItem(recoveryKey(chatId));
+} catch { /* Missing, blocked, or invalid storage. */ }
+}
+
+export function forgetChatCompletion(chatId: string, userMessageId: string): void {
+try { if (readChatCompletion(chatId)?.userMessageId === userMessageId) sessionStorage.removeItem(recoveryKey(chatId)); } catch { /* Storage is optional. */ }
+}
+
 export interface ChatDraftSnapshot {
 text: string;
 revision: number;

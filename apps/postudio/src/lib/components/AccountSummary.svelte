@@ -20,6 +20,14 @@ const host = $derived.by(() => {
  try { return page.url.pathname.startsWith('/s/') ? sessionOrigin(page.url.search) ?? page.url.origin : board.origin; }
  catch { return null; }
 });
+const highestUsage = $derived.by(() => {
+ const known = accounts.filter((account) => account.connected && account.quota?.status === 'available' && typeof account.quota.remaining_percent === 'number' && Number.isFinite(account.quota.remaining_percent) && account.quota.remaining_percent >= 0 && account.quota.remaining_percent <= 100);
+ return known.reduce<{ account: Account; used: number } | null>((highest, account) => {
+  const used = 100 - account.quota!.remaining_percent!;
+  return !highest || used > highest.used ? { account, used } : highest;
+ }, null);
+});
+function usageColor(used: number) { return used >= 90 ? '#c8392c' : used >= 70 ? '#d6a24a' : '#2b59c3'; }
 let repositionCleanup: (() => void) | undefined;
 function stopTracking() { repositionCleanup?.(); repositionCleanup = undefined; }
 function positionPanel() {
@@ -51,7 +59,7 @@ function close(restoreFocus = false) {
  panel?.hidePopover();
  if (restoreFocus) void tick().then(() => trigger?.focus());
 }
-onDestroy(stopTracking);
+onDestroy(() => { request++; stopTracking(); });
 function validAccounts(value: unknown): Account[] | null {
  if (!Array.isArray(value)) return null;
  const ids = new Set<string>();
@@ -89,28 +97,34 @@ async function refresh() {
 async function toggle() {
  if (open) { close(); return; }
  open = true;
+ void refresh();
  await tick();
  panel?.showPopover();
  positionPanel();
  panel?.focus();
  trackPosition();
 }
-$effect(() => { const currentHost = host; if (open) void refresh(); else { request++; accounts = []; loading = false; } void currentHost; });
-afterNavigate(() => { close(); request++; accounts = []; });
+$effect(() => { const currentHost = host; void refresh(); void currentHost; });
+afterNavigate(() => { close(); });
 function outside(event: MouseEvent) { if (open && root && !event.composedPath().includes(root)) close(); }
 function keydown(event: KeyboardEvent) { if (event.key === 'Escape' && open) { event.preventDefault(); close(true); } }
 </script>
 <svelte:window onkeydown={keydown} onclick={outside} />
 <div bind:this={root} data-account-summary class="relative min-w-0 flex-1">
 <button bind:this={trigger} type="button" aria-label="계정 및 사용량" aria-expanded={open} aria-haspopup="dialog" aria-controls="account-summary-panel" title="계정 및 사용량" class="flex w-full min-w-0 items-center gap-2 rounded-lg focus-visible:outline-2 focus-visible:outline-neutral-500" onclick={toggle}>
-<img src="/icon-192.png?v=ponix-character-33fbef92da78" alt="" class="size-8 shrink-0" /><span class="min-w-0 flex-1 truncate text-left text-sm font-medium">Postudio</span>
+<img src="/icon-192.png?v=ponix-character-33fbef92da78" alt="" class="size-8 shrink-0" /><span class="min-w-0 flex-1 text-left"><span class="block truncate text-sm font-medium">Postudio</span>{#if highestUsage}<span class="usage-track mt-1 block" title={`${highestUsage.account.label} · 사용량 ${Math.round(highestUsage.used)}%`}><span style:width={`${highestUsage.used}%`} style:background={usageColor(highestUsage.used)}></span></span>{:else}<span class="block truncate text-[11px] text-neutral-500">{loading ? '사용량 확인 중' : error ? '계정 확인 필요' : '사용량 정보 없음'}</span>{/if}</span>{#if highestUsage}<span class="text-xs font-semibold" style:color={usageColor(highestUsage.used)}>{Math.round(highestUsage.used)}%</span>{/if}
 </button>
 {#if open}
 <div bind:this={panel} id="account-summary-panel" role="dialog" aria-label="계정 및 사용량" tabindex="-1" popover="manual" class="fixed z-[100] m-0 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-3 shadow-xl dark:border-neutral-700 dark:bg-neutral-950">
 <div class="mb-2 flex items-center justify-between"><h2 class="text-sm font-semibold">계정 및 사용량</h2><div class="flex items-center gap-2"><button type="button" class="rounded px-2 py-1 text-xs underline" onclick={() => void refresh()}>새로고침</button><button type="button" aria-label="닫기" class="rounded px-2 py-1 text-sm" onclick={() => close(true)}>닫기</button></div></div>
 {#if loading}<p role="status" class="py-2 text-sm">계정 정보를 불러오는 중입니다.</p>{:else if error}<p role="alert" class="py-2 text-sm text-red-700 dark:text-red-300">계정 정보를 불러오지 못했습니다. <button type="button" class="underline" onclick={() => void refresh()}>다시 시도</button></p>{:else if accounts.length === 0}<p class="py-2 text-sm">등록된 계정이 없습니다.</p>{:else}
-<ul class="flex flex-col gap-2">{#each accounts as account (account.id)}<li class="rounded-lg border border-neutral-200 p-3 text-sm dark:border-neutral-800"><p class="break-words font-medium">{account.label} <span class="font-normal text-neutral-500">({account.provider})</span></p><p class="break-all font-mono text-xs text-neutral-500">{account.id}</p><p><span class={account.connected ? 'text-green-700 dark:text-green-400' : 'text-neutral-500'}>{account.connected ? '연결됨' : '연결 안 됨'}</span>{account.email ? ` · ${account.email}` : ''}</p>{#if account.quota?.status === 'unsupported'}<p class="mt-2 text-xs text-neutral-500">사용량: 지원되지 않음</p>{:else if account.quota?.status === 'unavailable'}<p class="mt-2 text-xs text-neutral-500">사용량: 확인할 수 없음</p>{:else if account.quota?.status === 'available' && typeof account.quota.remaining_percent === 'number' && Number.isFinite(account.quota.remaining_percent) && account.quota.remaining_percent >= 0 && account.quota.remaining_percent <= 100}<div class="mt-2"><div class="flex justify-between text-xs"><span>사용량 {Math.round(100 - account.quota.remaining_percent)}%</span><span>잔여량 {Math.round(account.quota.remaining_percent)}%</span></div><progress class="mt-1 h-2 w-full accent-blue-600" max="100" value={100 - account.quota.remaining_percent} aria-label="사용량"></progress></div>{:else}<p class="mt-2 text-xs text-neutral-500">사용량 정보 없음</p>{/if}</li>{/each}</ul>
+<ul class="flex flex-col gap-2">{#each accounts as account (account.id)}<li class="rounded-lg border border-neutral-200 p-3 text-sm dark:border-neutral-800"><p class="break-words font-medium">{account.label} <span class="font-normal text-neutral-500">({account.provider})</span></p><p class="break-all font-mono text-xs text-neutral-500">{account.id}</p><p><span class={account.connected ? 'text-green-700 dark:text-green-400' : 'text-neutral-500'}>{account.connected ? '연결됨' : '연결 안 됨'}</span>{account.email ? ` · ${account.email}` : ''}</p>{#if account.quota?.status === 'unsupported'}<p class="mt-2 text-xs text-neutral-500">사용량: 지원되지 않음</p>{:else if account.quota?.status === 'unavailable'}<p class="mt-2 text-xs text-neutral-500">사용량: 확인할 수 없음</p>{:else if account.quota?.status === 'available' && typeof account.quota.remaining_percent === 'number' && Number.isFinite(account.quota.remaining_percent) && account.quota.remaining_percent >= 0 && account.quota.remaining_percent <= 100}<div class="mt-2"><div class="flex justify-between text-xs"><span>사용량 {Math.round(100 - account.quota.remaining_percent)}%</span><span>잔여량 {Math.round(account.quota.remaining_percent)}%</span></div><progress class="mt-1 h-1.5 w-full" style:accent-color={usageColor(100 - account.quota.remaining_percent)} max="100" value={100 - account.quota.remaining_percent} aria-label={`${account.label} 사용량`}></progress><p class="mt-1 text-[11px] text-neutral-500">사용량 기간·초기화 시각 정보 없음</p></div>{:else}<p class="mt-2 text-xs text-neutral-500">사용량 정보 없음</p>{/if}</li>{/each}</ul>
 {/if}
+<nav aria-label="계정 메뉴" class="mt-2 border-t border-neutral-200 pt-2 dark:border-neutral-800"><a class="block rounded-lg px-2 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800" href="/settings#accounts-h" onclick={() => close()}>계정 연결·관리</a><a class="block rounded-lg px-2 py-2 text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800" href="/settings" onclick={() => close()}>설정</a></nav>
 </div>
 {/if}
 </div>
+
+<style>
+.usage-track{height:4px;border-radius:3px;background:#ececef;overflow:hidden}.usage-track>span{display:block;height:100%;border-radius:3px}
+</style>

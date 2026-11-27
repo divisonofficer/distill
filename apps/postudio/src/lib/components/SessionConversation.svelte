@@ -31,7 +31,8 @@ import {
 mergeDrafts,
 	type DraftAttachment
 } from '$lib/attachments';
-import { permissionActions, permissionOptionLabel, permissionPromptState } from '$lib/permissions';
+import { permissionPromptState } from '$lib/permissions';
+import ApprovalCard from '$lib/components/ApprovalCard.svelte';
 import { TaskHistoryScroll, type HistoryReplayMode, type HistoryScrollTarget, type ScrollMetrics } from '$lib/task-history-scroll';
 import type { ClientMsg, InteractionRequest, Mode, QueueEntry, Sep } from '$lib/types';
 
@@ -761,36 +762,14 @@ composer?.focus();
 {/each}
 <div id={pendingId} class="flex flex-col gap-3">
 {#each interactions.filter((request) => request.t !== 'question.request' || !request.tool_call_id.startsWith('cold-return-')) as request (request.id)}
-<InteractionCard {request} connected={view.connected} reply={(msg) => replyInteraction(request, msg)} />
+<InteractionCard {request} connected={view.connected} retryKey={interactionRetryKey} reply={(msg) => replyInteraction(request, msg)} />
 {/each}
-{#each view.permissions as p (p.toolCallId)}
-{@const actions = permissionActions(p.options)}
-{@const onceOption = actions.once}
-{@const rejectOption = actions.reject}
-{@const details = permissionDetails(p.toolCallId, p.title)}
-<section data-tool-call-id={p.toolCallId} aria-label="실행 승인" class="rounded-[14px] border border-[#ecd9b0] border-l-[3px] border-l-amber-600 bg-[#fffdf8] text-neutral-900 dark:border-neutral-700 dark:border-l-amber-500 dark:bg-neutral-900 dark:text-neutral-100">
-<div class="flex items-start gap-3 px-4 pt-3.5 pb-2.5">
-<span class="flex size-[30px] shrink-0 items-center justify-center rounded-[9px] bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"><Icon name="shield" class="size-4" /></span>
-<div class="min-w-0 flex-1"><h3 class="text-sm font-semibold">{details.isCommand ? '명령 실행 승인이 필요해요' : '도구 실행 승인이 필요해요'}</h3><p class="mt-0.5 text-xs leading-5 text-neutral-600 dark:text-neutral-300">{p.title !== details.command ? p.title : '요청 내용을 확인한 뒤 실행을 허용해 주세요.'}</p></div>
-{#if details.readOnly}<span class="shrink-0 rounded-full bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200">읽기 전용</span>{/if}
-</div>
-<div class="flex flex-col gap-1.5 px-4 pb-2.5">
-{#if details.command}<pre class="max-h-36 overflow-auto whitespace-pre-wrap break-words rounded-[10px] bg-neutral-950 px-3 py-2.5 font-mono text-xs leading-5 text-neutral-100">{details.command}</pre>{/if}
-<div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-neutral-500">{#if details.cwd}<span class="min-w-0 truncate font-mono" title={details.cwd}>작업 위치 · {details.cwd}</span>{/if}<button type="button" class="min-h-6 shrink-0 text-sky-800 underline underline-offset-4 dark:text-sky-300" onclick={() => jumpToTool(p.toolCallId)}>관련 도구 호출로 이동</button></div>
-</div>
-<div class="flex flex-wrap items-center gap-2 rounded-b-[13px] border-t border-[#f3e6c8] bg-[#fdf7ea] px-4 py-2.5 dark:border-neutral-700 dark:bg-neutral-800">
-{#if onceOption}<button type="button" disabled={!view.connected} class="inline-flex h-9 items-center gap-1.5 rounded-[10px] bg-neutral-900 px-4 text-[13px] font-semibold text-white hover:bg-neutral-700 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-950" onclick={() => send({ t: 'permission', id: p.id, option_id: onceOption.id })}><Icon name="check" class="size-3.5" />{permissionOptionLabel(onceOption)}</button>{/if}
-{#if rejectOption}<button type="button" disabled={!view.connected} class="h-9 rounded-[10px] border border-[#dcd3bf] bg-white px-3.5 text-[13px] font-medium hover:bg-neutral-50 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:border-neutral-600 dark:bg-neutral-900" onclick={() => send({ t: 'permission', id: p.id, option_id: rejectOption.id })}>{permissionOptionLabel(rejectOption)}</button>{/if}
-{#if actions.permanent.length || actions.other.length}
-{@const optionsId = `permission-options-${encodeURIComponent(sessionId)}-${encodeURIComponent(p.toolCallId)}`}
-<button type="button" popovertarget={optionsId} aria-haspopup="dialog" class="ml-auto inline-flex h-9 items-center gap-1 rounded-lg px-2 text-[13px] font-medium hover:bg-amber-100 dark:hover:bg-neutral-700">{actions.permanent.length ? '항상 적용' : '추가 선택'}<Icon name="chevron" class="size-3 -rotate-90" /></button>
-<div id={optionsId} popover="auto" data-composer-popover onbeforetoggle={positionComposerPopover} role="dialog" aria-label="추가 승인 선택" class="fixed inset-auto m-0 overflow-auto rounded-xl border border-neutral-200 bg-white p-1.5 shadow-xl dark:border-neutral-700 dark:bg-neutral-900">
-{#if actions.permanent.length}<p class="px-2.5 py-2 text-xs leading-5 text-neutral-600 dark:text-neutral-300">이 선택은 이후 승인 동작에 계속 적용됩니다.</p>{/if}
-{#each [...actions.permanent, ...actions.other] as opt (opt.id)}<button type="button" disabled={!view.connected} class="block min-h-9 w-full rounded-lg px-2.5 py-2 text-left text-[13px] hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={(event) => { if (send({ t: 'permission', id: p.id, option_id: opt.id })) event.currentTarget.closest<HTMLElement>('[popover]')?.hidePopover(); }}>{permissionOptionLabel(opt)}</button>{/each}
-</div>
+{#each view.permissions as p, index (p.toolCallId)}
+{#if index === 0}
+<ApprovalCard request={p} details={permissionDetails(p.toolCallId, p.title)} host={hostAddress} connected={view.connected} retryKey={interactionRetryKey} reply={send} jump={() => jumpToTool(p.toolCallId)} />
+{:else if index === 1}
+<p class="px-3 py-2 text-xs text-neutral-500" role="status">승인 대기 {view.permissions.length - 1}건 더 · 앞선 요청에 응답하면 표시돼요.</p>
 {/if}
-</div>
-</section>
 {/each}
 
 </div>

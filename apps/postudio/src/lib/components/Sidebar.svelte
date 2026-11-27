@@ -176,6 +176,11 @@ return (item.row.sessionId === page.params.id && rowOrigin(item.row) === activeH
 || item.children.some(containsActiveSession);
 }
 
+function hostLabel(origin: string): string {
+try { return new URL(origin).host; } catch { return '호스트 확인 필요'; }
+}
+const selectedHostState = $derived(selectedHostConnected ? '연결됨' : !workspaceRosterLoaded || isWorkspaceHostOnline(activeHost) ? '대기' : '끊김');
+
 function portsHref(): string {
 const origin = board.origin;
 return origin && origin !== (typeof location === 'undefined' ? '' : location.origin) ? `/ports?host=${encodeURIComponent(origin)}` : '/ports';
@@ -205,7 +210,7 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 <svelte:window onfocus={() => { void refreshChatList(); void refreshPairedHosts(); }} />
 
 <header class="flex min-h-[60px] shrink-0 items-center justify-between gap-2 px-3">
-{#if chatMode}<span class="text-base font-bold">AI 채팅</span>{:else}<div class="min-w-0 flex-1"><div class="flex min-w-0 items-center gap-2 text-sm font-semibold"><svg class="size-4 shrink-0" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h7l2 2h9v11H3z" /></svg><span class="truncate" title={selectedRow?.cwd ?? selectedWorkspaceName}>{selectedWorkspaceName}</span>{#if selectedRow?.activity === 'working'}<span class="size-3 shrink-0 animate-spin rounded-full border-2 border-neutral-400 border-t-neutral-800 motion-reduce:animate-none" role="img" aria-label="작업 실행 중"></span>{/if}</div><div class="mt-1 truncate pl-6 text-[11.5px] text-neutral-500 dark:text-neutral-400" title={selectedRow ? rowOrigin(selectedRow) : activeHost}>{selectedRow ? rowOrigin(selectedRow) : activeHost || '호스트 확인 필요'} · {selectedHostConnected ? '연결됨' : '연결 중'}</div></div>{/if}
+{#if chatMode}<span class="text-base font-bold">AI 채팅</span>{:else}<div class="min-w-0 flex-1"><div class="flex min-w-0 items-center gap-2 text-sm font-semibold"><svg class="size-4 shrink-0" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h7l2 2h9v11H3z" /></svg><span class="truncate" title={selectedRow?.cwd ?? selectedWorkspaceName}>{selectedWorkspaceName}</span>{#if selectedRow?.activity === 'working'}<span class="size-3 shrink-0 animate-spin rounded-full border-2 border-neutral-400 border-t-neutral-800 motion-reduce:animate-none" role="img" aria-label="작업 실행 중"></span>{/if}</div><div class="mt-1 truncate pl-6 text-[11.5px] text-neutral-500 dark:text-neutral-400" title={selectedRow ? rowOrigin(selectedRow) : activeHost}><span class="mr-1 inline-block size-[7px] rounded-full" class:bg-green-600={selectedHostState === '연결됨'} class:bg-amber-500={selectedHostState === '대기'} class:bg-neutral-400={selectedHostState === '끊김'}></span>{hostLabel(selectedRow ? rowOrigin(selectedRow) : activeHost)} · {selectedHostState}</div></div>{/if}
 {#if !chatMode && page.url.pathname.startsWith('/s/') && selectedRow && activeHost}
 <a href="/s/{encodeURIComponent(selectedRow.sessionId)}/artifacts{page.url.search}" onclick={close} class="shrink-0 rounded-lg px-2 py-1.5 text-xs text-neutral-600 hover:bg-neutral-200/70 dark:text-neutral-300 dark:hover:bg-neutral-800">아티팩트</a>
 {/if}
@@ -218,7 +223,7 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 </nav>
 
 <div class="flex shrink-0 items-center gap-1 px-3 pt-2">
-<button type="button" disabled={chatMode && creatingChat} class="flex h-10 flex-1 items-center gap-2 rounded-lg px-3 text-left text-sm font-medium hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 disabled:opacity-50 dark:hover:bg-neutral-800" onclick={() => chatMode ? createChat() : goto('/new')}><Icon name="new" class="size-4" />{chatMode ? (creatingChat ? '채팅 만드는 중…' : '새 채팅') : '새 작업'}</button>
+<button type="button" disabled={chatMode && creatingChat} class="flex h-9 flex-1 items-center gap-2 rounded-[10px] border border-neutral-200 bg-white px-3 text-left text-[13.5px] font-semibold hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 disabled:opacity-50 dark:hover:bg-neutral-800" onclick={() => chatMode ? createChat() : goto('/new')}><Icon name="new" class="size-4" />{chatMode ? (creatingChat ? '채팅 만드는 중…' : '새 채팅') : '새 작업'}</button>
 <button type="button" class="flex size-9 items-center justify-center rounded-lg hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 lg:hidden dark:hover:bg-neutral-800" aria-label="메뉴 닫기" onclick={close}><Icon name="close" /></button>
 </div>
 
@@ -248,13 +253,13 @@ return origin && origin !== (typeof location === 'undefined' ? '' : location.ori
 {:else}
 <section aria-label="원격 연결" class="mb-3 flex flex-col gap-2 px-2 pt-2">
 <h2 class="text-xs font-semibold text-neutral-500">원격 연결</h2>
-<div class="flex min-w-0 items-center gap-2 text-xs"><Icon name="server" class="size-4 shrink-0" /><span class="min-w-0 flex-1 truncate" title={activeHost}>활성 호스트: {activeHost || '확인 중'}</span><span class="shrink-0" class:text-green-700={selectedHostConnected}>{selectedHostConnected ? '연결됨' : '연결 중'}</span></div>
+<div class="flex min-w-0 items-center gap-2 text-xs"><Icon name="server" class="size-4 shrink-0" /><span class="min-w-0 flex-1 truncate" title={activeHost}>활성 호스트: {hostLabel(activeHost)}</span><span class="shrink-0" class:text-green-700={selectedHostConnected}>{selectedHostState}</span></div>
 {#if pairedHosts.length}
 <ul aria-label="페어링된 호스트" class="flex flex-col gap-0.5">
 {#each pairedHosts as peer (peer.origin)}
 <li>
 <a href={`${peer.origin}/new`} onclick={close} title={peer.origin} class="flex min-h-9 min-w-0 items-center gap-2 rounded-lg px-2 text-xs hover:bg-neutral-200/70 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800">
-<Icon name="server" class="size-4 shrink-0 text-neutral-500" /><span class="min-w-0 flex-1 truncate">{new URL(peer.origin).host}</span><span class="shrink-0" class:text-green-700={isWorkspaceHostOnline(peer.origin)}>{peer.origin === activeHost && selectedHostConnected ? '사용 중' : isWorkspaceHostOnline(peer.origin) ? '연결 가능' : '접속 확인 실패'}</span>
+<span class="size-[7px] shrink-0 rounded-full" class:bg-green-600={isWorkspaceHostOnline(peer.origin)} class:bg-neutral-400={!isWorkspaceHostOnline(peer.origin)}></span><span class="min-w-0 flex-1 truncate">{new URL(peer.origin).host}</span><span class="shrink-0" class:text-green-700={isWorkspaceHostOnline(peer.origin)}>{isWorkspaceHostOnline(peer.origin) ? '연결됨' : '끊김'}</span>
 </a>
 </li>
 {/each}

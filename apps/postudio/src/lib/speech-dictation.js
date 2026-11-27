@@ -1,5 +1,5 @@
 /** @typedef {{ supported: boolean, requested: boolean, listening: boolean, interim: string, message: string, error: boolean }} DictationState */
-/** @typedef {{ lang: string, continuous: boolean, interimResults: boolean, onstart?: () => void, onresult?: (event: { results: Array<{ isFinal: boolean, 0?: { transcript: string } }> }) => void, onerror?: (event: { error: string }) => void, onend?: () => void, start: () => void, abort?: () => void }} RecognitionInstance */
+/** @typedef {{ lang: string, continuous: boolean, interimResults: boolean, onstart?: () => void, onresult?: (event: { results: Array<{ isFinal: boolean, 0?: { transcript: string } }> }) => void, onerror?: (event: { error: string }) => void, onend?: () => void, start: () => void, stop?: () => void, abort?: () => void }} RecognitionInstance */
 /** @typedef {{ state: DictationState, stop: (message?: string) => void }} ActiveController */
 
 const RETRY_DELAYS = [300, 700, 1500, 3000, 5000];
@@ -33,6 +33,9 @@ export function createSpeechDictationController({ onFinal, onState, getRecogniti
   /** @type {ReturnType<typeof setTimeout> | null} */
   let restartTimer = null;
   let retryCount = 0;
+  let finishing = false;
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let finishTimer = null;
   let language = 'ko-KR';
   /** @type {DictationState} */
   let state = {
@@ -56,6 +59,9 @@ export function createSpeechDictationController({ onFinal, onState, getRecogniti
 
   function stop(message = '음성 입력을 중지했습니다.') {
     requested = false;
+    finishing = false;
+    if (finishTimer !== null) timers.clearTimeout(finishTimer);
+    finishTimer = null;
     generation++;
     runId++;
     if (restartTimer !== null) timers.clearTimeout(restartTimer);
@@ -65,6 +71,23 @@ export function createSpeechDictationController({ onFinal, onState, getRecogniti
     if (activeController === controller) activeController = null;
     publish({ requested: false, listening: false, interim: '', message, error: false });
     try { current?.abort?.(); } catch { /* Capture already ended. */ }
+  }
+
+  function finishResult() {
+    if (!finishing) return;
+    const pending = state.interim.trim();
+    stop(pending ? '미리보기 텍스트를 입력창에 넣었습니다.' : '음성 입력을 완료했습니다.');
+    if (pending) onFinal(pending);
+  }
+
+  function finish() {
+    if (!requested || finishing) return;
+    finishing = true;
+    publish({ listening: false, message: '인식한 텍스트를 입력창에 넣는 중입니다…' });
+    const current = recognition;
+    if (typeof current?.stop !== 'function') { finishResult(); return; }
+    finishTimer = timers.setTimeout(finishResult, 1200);
+    try { current.stop(); } catch { finishResult(); }
   }
 
   /** @param {string} message */
@@ -122,9 +145,10 @@ export function createSpeechDictationController({ onFinal, onState, getRecogniti
       };
       instance.onerror = (event) => {
         if (token !== generation || run !== runId || !requested || activeController !== controller) return;
+        if (finishing) { finishResult(); return; }
         const code = event.error;
         if (code === 'no-speech' || code === 'aborted') {
-          publish({ listening: false, interim: '', message: code === 'no-speech' ? '음성이 들리지 않습니다. 계속 듣고 있습니다…' : '음성 인식이 중단되었습니다.' });
+          publish({ listening: false, ...(code === 'aborted' ? { interim: '' } : {}), message: code === 'no-speech' ? '음성이 들리지 않습니다. 계속 듣고 있습니다…' : '음성 인식이 중단되었습니다.' });
           return;
         }
         const message = code === 'not-allowed' || code === 'service-not-allowed'
@@ -140,8 +164,13 @@ export function createSpeechDictationController({ onFinal, onState, getRecogniti
       };
       instance.onend = () => {
         if (token !== generation || run !== runId || !requested || activeController !== controller) return;
+        if (finishing) { finishResult(); return; }
+        const pending = state.interim.trim();
         runId++;
         recognition = null;
+        // Some engines end a continuous session without finalizing its last result.
+        // Save only the outstanding preview; the run id fences off any late final.
+        if (pending) onFinal(pending);
         scheduleRestart(token);
       };
       instance.start();
@@ -166,6 +195,7 @@ export function createSpeechDictationController({ onFinal, onState, getRecogniti
       return requested;
     },
     stop,
+    finish,
     /** @param {'ko-KR' | 'en-US'} nextLanguage */
     setLanguage(nextLanguage) {
       if (nextLanguage !== 'ko-KR' && nextLanguage !== 'en-US') return;

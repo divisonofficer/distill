@@ -84,8 +84,14 @@ pub struct NodeInfo {
 }
 
 /// Start the keeper and push sender, then serve both listeners until one fails.
-pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
+pub async fn run(mut cfg: NodeConfig) -> anyhow::Result<()> {
     validate_node_config(&cfg)?;
+    if let Some(bin) = &cfg.openresearch_bin {
+        cfg.agent.extra_env.push((
+            "POSTUDIO_OPENRESEARCH_BIN".into(),
+            bin.as_os_str().to_owned(),
+        ));
+    }
     let bindings = if cfg.openresearch_bin.is_some() {
         let endpoint = match &cfg.listen {
             ListenAddr::Tcp(addr) => {

@@ -59,21 +59,17 @@ function filename(attachment: UserAttachment): string {
 	return attachment.kind === 'image' ? attachment.name || '이미지' : attachment.name;
 }
 
-function snippet(text: string): string {
-	return text.length > 180 ? `${text.slice(0, 180)}…` : text;
-}
-
 function handleDialogClick(event: MouseEvent) {
 	if (event.target === dialog) closePreview();
 }
 </script>
 
 {#if items.length > 0}
-<ul class="flex flex-wrap gap-2 px-1 pt-1">
+<ul aria-label="첨부 파일" class="flex gap-2 overflow-x-auto px-1 pb-2 pt-1">
 	{#each items as item (item.key)}
 		{@const attachment = item.attachment}
 		{@const name = filename(attachment)}
-		<li class="relative min-w-0 max-w-full">
+		<li class="relative min-w-0 max-w-full shrink-0">
 			{#if attachment.kind === 'image' && isPreviewImageMime(attachment.mime)}
 				<button
 					type="button"
@@ -86,13 +82,13 @@ function handleDialogClick(event: MouseEvent) {
 			{:else if attachment.kind === 'text'}
 				<button
 					type="button"
-					class="block min-h-16 w-52 max-w-[calc(100vw-5rem)] overflow-hidden rounded-xl border border-neutral-300 bg-neutral-50 p-2 text-left text-xs hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:hover:bg-neutral-900"
+					class="flex h-14 w-[232px] max-w-[calc(100vw-5rem)] items-center gap-2 overflow-hidden rounded-xl border border-neutral-200 bg-white py-2 pl-2 pr-8 text-left text-xs hover:bg-neutral-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:bg-neutral-950 dark:hover:bg-neutral-900"
 					aria-label="텍스트 파일 미리보기: {attachment.name}"
 					onclick={(event) => openPreview(attachment, event.currentTarget)}
 				>
-					<span class="block truncate font-medium">{attachment.name}</span>
-					<span class="block text-neutral-500">{sizeLabel(item.size ?? textSize(attachment.text))}</span>
-					<span class="mt-1 block whitespace-pre-wrap break-all text-neutral-600 dark:text-neutral-400">{snippet(attachment.text)}</span>
+					<span aria-hidden="true" class="flex size-[38px] shrink-0 items-center justify-center rounded-lg bg-[#3a3a3e] text-[10px] font-bold text-white">{attachment.name.toLowerCase().endsWith('.md') ? 'MD' : 'TXT'}</span>
+					<span class="min-w-0"><span class="block truncate text-[13px] font-semibold">{attachment.name}</span>
+					<span class="mt-0.5 block text-[11.5px] text-neutral-500">{attachment.name.toLowerCase().endsWith('.md') ? 'MD' : 'TXT'} · {sizeLabel(item.size ?? textSize(attachment.text))}</span></span>
 				</button>
 			{:else}
 				<div class="min-h-16 w-52 max-w-[calc(100vw-5rem)] rounded-xl border border-neutral-300 bg-neutral-50 p-2 text-xs dark:border-neutral-700 dark:bg-neutral-950">
@@ -103,7 +99,7 @@ function handleDialogClick(event: MouseEvent) {
 			{#if removable && onremove}
 				<button
 					type="button"
-					class="absolute -top-2 -right-2 flex size-7 items-center justify-center rounded-full bg-neutral-800 text-white focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500"
+					class="absolute right-1 top-1 flex size-7 items-center justify-center rounded-full bg-white text-neutral-600 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 dark:bg-neutral-900 dark:text-neutral-300"
 					aria-label="첨부 {name} 제거"
 					onclick={() => onremove?.(item.key)}
 				>

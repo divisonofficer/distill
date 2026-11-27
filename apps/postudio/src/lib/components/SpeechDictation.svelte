@@ -2,7 +2,7 @@
 import { onDestroy, onMount, tick } from 'svelte';
 import { createSpeechDictationController } from '$lib/speech-dictation.js';
 
-let { id, active = true, disabled = false, onappend }: { id: string; active?: boolean; disabled?: boolean; onappend: (text: string) => void } = $props();
+let { id, active = true, disabled = false, onappend, onpreview }: { id: string; active?: boolean; disabled?: boolean; onappend: (text: string) => void; onpreview?: (text: string) => void } = $props();
 let language = $state<'ko-KR' | 'en-US'>('ko-KR');
 let panelOpen = $state(false);
 let capture = $state({ supported: false, requested: false, listening: false, interim: '', message: '음성 인식 기능을 확인하고 있습니다…', error: false });
@@ -32,6 +32,7 @@ onMount(() => {
     onFinal: (text: string) => onappend(text),
     onState: (next: typeof capture) => {
       capture = next;
+      onpreview?.(next.interim);
       if (next.error) panelOpen = true;
     }
   });
@@ -58,7 +59,7 @@ function changeLanguage(event: Event) {
 
 function handleTriggerClick() {
   if (capture.requested) {
-    controller?.stop();
+    controller?.finish();
     return;
   }
   panelOpen = !panelOpen;
@@ -69,7 +70,7 @@ function startCapture() {
 }
 
 function stopCapture() {
-  controller?.stop();
+  controller?.finish();
 }
 
 function handleEscape(event: KeyboardEvent) {
@@ -130,13 +131,13 @@ onDestroy(() => controller?.reset());
       <option value="en-US">English</option>
     </select>
     <p role={capture.error ? 'alert' : 'status'} aria-live={capture.error ? 'assertive' : 'polite'} class="mt-2 text-xs leading-5 text-neutral-600 dark:text-neutral-300">{capture.message}</p>
-    {#if capture.interim}
+    {#if capture.interim && !onpreview}
       <p class="mt-1 break-words text-xs leading-5 text-neutral-500 dark:text-neutral-400">{capture.interim}</p>
     {/if}
     {#if capture.error}
       <button type="button" disabled={!capture.supported || disabled || !active} onclick={startCapture} class="mt-2 min-h-9 rounded-lg border border-neutral-300 px-3 text-xs font-medium hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800">다시 시도</button>
     {:else if capture.requested}
-      <button type="button" disabled={disabled || !active} onclick={stopCapture} class="mt-2 min-h-9 rounded-lg border border-neutral-300 px-3 text-xs font-medium hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800">음성 입력 중지</button>
+      <button type="button" disabled={disabled || !active} onclick={stopCapture} class="mt-2 min-h-9 rounded-lg border border-neutral-300 px-3 text-xs font-medium hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:border-neutral-700 dark:hover:bg-neutral-800">중지하고 입력하기</button>
     {:else if capture.supported}
       <button type="button" disabled={disabled || !active} onclick={startCapture} class="mt-2 min-h-9 rounded-lg bg-neutral-900 px-3 text-xs font-medium text-white hover:bg-neutral-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900">음성 입력 시작</button>
     {/if}

@@ -114,8 +114,8 @@ const source = await readFile(resolve(root, 'src/lib/components/Markdown.svelte'
 const renderer = await readFile(resolve(root, 'src/lib/markdown.ts'), 'utf8');
 assert.match(renderer, /gfm: true/);
 assert.match(renderer, /DOMPurify\.sanitize\(html\)/);
-assert.match(source, /:global\(table\) \{[^}]*display: block;[^}]*overflow-x: auto;/s);
-assert.match(source, /:global\(th\),\s*\.md :global\(td\) \{[^}]*border: 1px solid/);
+assert.match(source, /:global\(\.table-wrap\) \{[^}]*overflow-x: auto;/s);
+assert.match(source, /:global\(th\),\s*\.md :global\(td\) \{[^}]*border-bottom: 1px solid/);
 });
 
 test('shell motion keeps one page, stable sidebar width, inert hiding and reduced motion', async () => {
@@ -214,13 +214,16 @@ assert.match(source, /goto\(sessionHref\(sessionId, destination\.host\), \{ noSc
 
 test('permission buttons stay tied to offered actions and fit mobile', async () => {
 const source = await readFile(resolve(root, 'src/lib/components/SessionConversation.svelte'), 'utf8');
-assert.match(source, /aria-label="실행 승인"/);
-assert.match(source, /flex flex-wrap items-center gap-2 rounded-b-\[13px\]/);
-assert.match(source, /popover="auto"[^>]*aria-label="추가 승인 선택"/);
-assert.match(source, /class="ml-auto inline-flex h-9/);
-assert.match(source, /\{#if onceOption\}[\s\S]*?option_id: onceOption\.id/);
-assert.match(source, /\{#if rejectOption\}[\s\S]*?option_id: rejectOption\.id/);
-assert.match(source, /\{#if actions\.permanent\.length \|\| actions\.other\.length\}/);
+const card = await readFile(resolve(root, 'src/lib/components/ApprovalCard.svelte'), 'utf8');
+assert.match(source, /<ApprovalCard request=\{p\}/);
+assert.match(source, /승인 대기 \{view.permissions.length - 1\}건 더/);
+assert.match(card, /aria-label="실행 승인"/);
+assert.match(card, /flex-wrap:wrap/);
+assert.match(card, /aria-label="추가 승인 선택"/);
+assert.match(card, /option_id: option\.id/);
+assert.match(card, /\{#if actions.once\}/);
+assert.match(card, /\{#if actions.reject\}/);
+assert.match(card, /\{#if actions\.permanent\.length \|\| actions\.other\.length\}/);
 assert.match(source, /const pendingId = \$derived\(`pending-interactions-\$\{sessionId\}`\)/);
 assert.match(source, /id=\{pendingId\}/);
 assert.ok(source.indexOf('id={pendingId}') < source.indexOf('class="relative mx-auto'));

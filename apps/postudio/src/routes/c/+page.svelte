@@ -86,11 +86,18 @@ return () => window.clearInterval(timer);
 <p role="status" class="text-sm text-neutral-600 dark:text-neutral-300">채팅 목록을 불러오는 중입니다.</p>
 {:else if loaded && chats.length === 0}
 <div class="rounded-2xl border border-dashed border-neutral-300 px-5 py-10 text-center dark:border-neutral-700">
-<p class="font-medium">아직 채팅이 없습니다.</p>
-<p class="mt-1 text-sm text-neutral-600 dark:text-neutral-300">새 채팅을 만들어 메시지를 서버에 저장하세요.</p>
+<Icon name="chat" class="mx-auto mb-3 size-11 rounded-xl bg-neutral-100 p-3 text-neutral-500 dark:bg-neutral-800" />
+<p class="text-[15px] font-semibold">아직 대화가 없어요</p>
+<p class="mx-auto mt-2 max-w-xs text-[13px] leading-relaxed text-neutral-600 dark:text-neutral-300">질문이나 TXT/MD 파일로 첫 대화를 시작해 보세요.</p>
+<button type="button" disabled={creating} class="mt-4 min-h-10 rounded-lg bg-neutral-900 px-4 text-[13px] font-semibold text-white disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-900" onclick={createChat}>{creating ? '채팅 만드는 중…' : '새 채팅'}</button>
 </div>
 {:else if filteredChats.length === 0}
-<p role="status" class="rounded-xl border border-dashed border-neutral-300 px-5 py-8 text-center text-sm text-neutral-600 dark:border-neutral-700 dark:text-neutral-300">검색 결과가 없습니다.</p>
+<div role="status" class="rounded-xl border border-neutral-200 px-5 py-9 text-center dark:border-neutral-700">
+<Icon name="chat" class="mx-auto mb-3 size-11 rounded-xl bg-neutral-100 p-3 text-neutral-500 dark:bg-neutral-800" />
+<p class="break-words text-[15px] font-semibold">“{search.trim()}”와 맞는 대화가 없어요</p>
+<p class="mx-auto mt-2 max-w-xs text-[13px] leading-relaxed text-neutral-600 dark:text-neutral-300">현재는 대화 제목에서 찾아요. 다른 단어로 검색해 보세요.</p>
+<button type="button" class="mt-3 min-h-10 rounded-lg border border-neutral-300 px-3 text-[13px] font-semibold dark:border-neutral-700" onclick={() => { search = ''; document.getElementById('chat-search')?.focus(); }}>검색어 지우기</button>
+</div>
 {:else if filteredChats.length > 0}
 <ul class="flex flex-col gap-2" aria-label="저장된 채팅">
 {#each filteredChats as chat (chat.chatId)}

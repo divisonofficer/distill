@@ -6,6 +6,16 @@ import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 
+test('reload recovery observes the existing completion without sending it again', async () => {
+const source = await readFile(resolve(root, 'src/routes/c/[id]/+page.svelte'), 'utf8');
+const recovery = source.slice(source.indexOf('async function recoverChatCompletion'), source.indexOf('async function requestCompletion'));
+assert.match(source, /rememberChatCompletion\(id, userMessageId, requestedModelId\);\s*const completionRequest = postJson/);
+assert.match(recovery, /readChatCompletion\(id\)/);
+assert.match(recovery, /startChatProgressPolling/);
+assert.match(recovery, /pollCompletion\(id, saved\.userMessageId, saved\.expiresAt, saved\.modelId\)/);
+assert.doesNotMatch(recovery, /postJson|requestCompletion\(/);
+});
+
 test('chat feedback follows acknowledged title and message saves only', async () => {
 const source = await readFile(resolve(root, 'src/routes/c/[id]/+page.svelte'), 'utf8');
 const title = source.slice(source.indexOf('async function saveChatTitle()'), source.indexOf('async function loadOlderHistory()'));
@@ -14,6 +24,7 @@ assert.match(title, /parseCreatedChat\([\s\S]*?setChatTitleOverride[\s\S]*?ui\.n
 assert.match(title, /if \(activeChatId === id\) \{[\s\S]*?ui\.notify\('채팅 제목을 저장하지 못했습니다\.', 'error'\)/);
 assert.match(save, /savedTextFilesMatch\(saved\.textFiles, originalFiles\)[\s\S]*?ui\.notify\('서버가 첨부 파일을 보존하지 않아 저장하지 않았습니다\.', 'error'\)/);
 assert.match(save, /appendMessage\(id, saved\);\s*if \(id === activeChatId && !generate\) ui\.notify/);
-assert.doesNotMatch(source.slice(0, source.indexOf('async function saveChatTitle()')), /ui\.notify/);
+const history = source.slice(source.indexOf('async function refreshHistory('), source.indexOf('async function saveChatTitle()'));
+assert.doesNotMatch(history, /ui\.notify/);
 assert.match(save, /if \(id === activeChatId\) \{\s*saveError = `메시지를 저장하지 못했습니다\.[\s\S]*?ui\.notify\('메시지를 저장하지 못했습니다\.', 'error'\)/);
 });

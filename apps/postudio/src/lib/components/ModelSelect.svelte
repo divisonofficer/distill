@@ -1,5 +1,5 @@
 <script lang="ts">
-import { onDestroy, tick, untrack } from 'svelte';
+import { onDestroy, tick, untrack, type Snippet } from 'svelte';
 import { getJson } from '$lib/api';
 import Icon from '$lib/components/Icon.svelte';
 import { authenticatedModels, defaultModelGroups, groupModels, isAutoModel, modelProvider, moveMenuIndex, moveModelIndex } from '$lib/models';
@@ -15,11 +15,13 @@ disabled = false,
 commitOnSelect = true,
 onselect,
 host,
-modelOptions
+modelOptions,
+menuFooter
 }: {
 id: string;
 host?: string;
 modelOptions?: Model[];
+menuFooter?: Snippet;
 label?: string;
 compact?: boolean;
 value?: string;
@@ -60,6 +62,7 @@ let searchModels = $derived(searchGroups.flatMap((group) => group.models));
 let submenuModels = $derived(menuGroups.find((group) => group.provider === submenuProvider)?.models ?? []);
 let selectedModel = $derived(catalogModels.find((model) => model.modelId === value));
 let selectedProvider = $derived(selectedModel ? modelProvider(selectedModel.modelId) : null);
+let compactName = $derived(modelOptions && selectedModel ? selectedModel.name.replace(/\s*\((?:ChatGPT|Claude|OpenRouter|xAI)\)\s*$/i, '').replace(/(\d)-(?=[A-Z][a-z]+\b)/g, '$1 ') : selectedModel?.name);
 let selectDisabled = $derived(disabled || loading || error !== '' || (modelOptions !== undefined && !modelOptions.length) || (catalog !== null && catalog.availableModels.length === 0));
 let activeDescendant = $derived.by(() => {
 if (!open) return undefined;
@@ -143,7 +146,7 @@ const rootHeight = rootEntries.length * 56 + 16;
 const searchHeight = searchModels.length * 40 + searchGroups.length * 28 + 16;
 const submenuHeight = submenuModels.length * 44 + 64;
 const compactSearchHeight = compact ? 48 : 0;
-const wantedHeight = Math.min(380, Math.max(96, query.trim() ? searchHeight : submenuProvider ? submenuHeight : rootHeight) + compactSearchHeight);
+const wantedHeight = Math.min(380, Math.max(96, query.trim() ? searchHeight : submenuProvider ? submenuHeight : rootHeight) + compactSearchHeight + (menuFooter ? 58 : 0));
 const above = Math.max(0, rect.top - 12);
 const below = Math.max(0, window.innerHeight - rect.bottom - 12);
 opensUp = compact
@@ -354,7 +357,7 @@ if (!root?.contains(event.relatedTarget as Node | null)) closeMenu();
 }
 </script>
 
-<div bind:this={root} class="relative flex min-w-0 flex-col gap-1.5" style:width={compact ? 'max-content' : undefined} style:max-width={compact ? '100%' : undefined} onfocusout={onFocusOut}>
+<div bind:this={root} class="relative flex min-w-0 flex-col gap-1.5" style:width={compact ? 'max-content' : undefined} style:max-width={compact ? '180px' : undefined} onfocusout={onFocusOut}>
 <label for={id} class={compact ? 'sr-only' : 'text-sm font-medium'}>{label}</label>
 {#if compact}
 <button
@@ -362,12 +365,13 @@ if (!root?.contains(event.relatedTarget as Node | null)) closeMenu();
 type="button"
 aria-label={`${label} · ${selectedModel?.name ?? (value && !loading ? '사용할 수 없는 모델' : '모델 선택')}`}
 aria-haspopup="dialog"
+title={selectedModel ? `${selectedModel.name} · ${value}` : value || '모델 선택'}
 aria-expanded={open}
 disabled={selectDisabled}
 onclick={() => { if (open) closeMenu(); else void openMenu(); }}
 onkeydown={onTriggerKeydown}
-class="flex h-[34px] max-w-[180px] min-w-0 items-center gap-2 rounded-lg px-2 text-sm outline-none hover:bg-neutral-100 focus-visible:ring-2 focus-visible:ring-sky-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-neutral-800"
-><span class="min-w-0 truncate">{selectedModel?.name ?? (value && !loading ? '사용할 수 없는 모델' : '모델 선택')}</span><Icon name="chevron" class={`size-4 shrink-0 text-neutral-700 dark:text-neutral-300 ${open ? 'rotate-90' : ''}`} /></button>
+class="flex min-h-[34px] min-w-0 items-center gap-1 rounded-lg px-2 text-left text-sm outline-none hover:bg-neutral-100 focus-visible:ring-2 focus-visible:ring-sky-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-neutral-800"
+>{#if selectedProvider}<span aria-hidden="true" class={`grid size-[18px] shrink-0 place-items-center rounded-[5px] text-[10px] font-bold ${providerBadgeClass(selectedProvider)}`}>{providerInitial(selectedProvider)}</span>{/if}<span class="min-w-0 truncate">{compactName ?? (value && !loading ? '사용할 수 없는 모델' : '모델 선택')}</span><Icon name="chevron" class={`size-3 shrink-0 text-neutral-700 dark:text-neutral-300 ${open ? '-rotate-90' : 'rotate-90'}`} /></button>
 {:else}
 <input
 {id}
@@ -442,8 +446,9 @@ onpointermove={() => (activeModelIndex = index)}
 <div class="flex h-full min-h-0 flex-col">
 <div class="flex h-12 shrink-0 items-center gap-2 border-b border-neutral-100 px-2 dark:border-neutral-800">
 <button type="button" aria-label="제공자 목록으로 돌아가기" title="뒤로" class="grid size-8 shrink-0 place-items-center rounded-lg text-neutral-600 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:text-neutral-300 dark:hover:bg-neutral-800" onmousedown={(event) => event.preventDefault()} onclick={() => void returnToRoot()}><Icon name="chevron" class="size-4 rotate-180" /></button>
-<p class="min-w-0 truncate text-sm font-semibold text-neutral-900 dark:text-neutral-100">{submenuProvider}</p>
+<span aria-hidden="true" class={`grid size-[22px] shrink-0 place-items-center rounded-md text-xs font-bold ${providerBadgeClass(submenuProvider)}`}>{providerInitial(submenuProvider)}</span><p class="min-w-0 truncate text-sm font-semibold text-neutral-900 dark:text-neutral-100">{submenuProvider}</p>
 </div>
+{#if menuFooter && submenuProvider === selectedProvider}<div class="shrink-0 border-b border-neutral-200 px-3 py-1 dark:border-neutral-700">{@render menuFooter()}</div>{/if}
 <div role="group" aria-label={`${submenuProvider} 모델`} class="min-h-0 flex-1 overflow-y-auto p-1.5">
 {#each submenuModels as model, index (model.modelId)}
 <button
@@ -487,7 +492,7 @@ onpointermove={() => (activeRootIndex = index)}
 <span aria-hidden="true" class={`grid size-9 shrink-0 place-items-center rounded-xl text-sm font-semibold ${providerBadgeClass(entry.provider)}`}>{providerInitial(entry.provider)}</span>
 <span class="min-w-0 flex-1">
 <span class="block truncate font-medium">{entry.provider}</span>
-{#if selectedProvider === entry.provider && selectedModel}<span class="block truncate text-xs text-neutral-500 dark:text-neutral-400">{selectedModel.name}</span>{/if}
+<span class="block truncate text-xs text-neutral-500 dark:text-neutral-400">{selectedProvider === entry.provider && selectedModel ? `${selectedModel.name} 사용 중` : `모델 ${menuGroups.find((group) => group.provider === entry.provider)?.models.length ?? 0}개`}</span>
 </span>
 <Icon name="chevron" class="size-4 shrink-0 text-neutral-400" />
 {/if}

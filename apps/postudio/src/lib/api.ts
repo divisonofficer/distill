@@ -29,7 +29,7 @@ async function requestJson<T>(path: string, host: string | undefined, method: st
  const text = await res.text(); return (text ? JSON.parse(text) : undefined) as T;
 }
 export async function getJson<T>(path: string, host?: string, timeoutMs = 2000): Promise<T> { return requestJson<T>(path, host, 'GET', undefined, timeoutMs); }
-export async function postJson<T>(path: string, body: unknown, host?: string): Promise<T> { return requestJson<T>(path, host, 'POST', body); }
+export async function postJson<T>(path: string, body: unknown, host?: string, timeoutMs?: number): Promise<T> { return requestJson<T>(path, host, 'POST', body, timeoutMs); }
 export async function putJson<T>(path: string, body: unknown, host?: string): Promise<T> { return requestJson<T>(path, host, 'PUT', body); }
 export async function deleteJson<T>(path: string, host?: string): Promise<T> { return requestJson<T>(path, host, 'DELETE', undefined); }
 

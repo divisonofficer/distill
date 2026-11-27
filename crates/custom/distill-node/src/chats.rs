@@ -71,6 +71,14 @@ pub trait ChatCompleter: Send + Sync {
         Box::pin(async { Err(CompletionError::Definitive) })
     }
 
+    fn complete_account_with_progress(
+        &self,
+        request: AccountCompletion,
+        _progress: watch::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>> {
+        self.complete_for_account(request)
+    }
+
     fn complete_with_progress(
         &self,
         model_id: String,
@@ -96,17 +104,28 @@ impl ChatCompleter for AcpChatCompleter {
         &self,
         request: AccountCompletion,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>> {
+        self.complete_account_with_progress(request, watch::channel(String::new()).0)
+    }
+
+    fn complete_account_with_progress(
+        &self,
+        request: AccountCompletion,
+        progress: watch::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>> {
         let keeper = self.keeper.clone();
         Box::pin(async move {
-            let params = serde_json::to_value(request).map_err(|_| CompletionError::Definitive)?;
-            let result = keeper
-                .handle()
-                .request_with_timeout_classified(
-                    "_x.ai/chat/complete-account",
-                    params,
-                    COMPLETION_TIMEOUT,
-                )
-                .await;
+            let mut params =
+                serde_json::to_value(request).map_err(|_| CompletionError::Definitive)?;
+            let request_id = new_id().ok_or(CompletionError::Definitive)?;
+            params["requestId"] = serde_json::Value::String(request_id.clone());
+            let result = observe_completion(
+                &keeper,
+                "_x.ai/chat/complete-account",
+                params,
+                &request_id,
+                progress,
+            )
+            .await;
             if let Err(RequestFailure::Rejected(error)) = &result
                 && serde_json::from_str::<serde_json::Value>(error)
                     .ok()
@@ -143,7 +162,6 @@ impl ChatCompleter for AcpChatCompleter {
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, CompletionError>> + Send>> {
         let keeper = self.keeper.clone();
         Box::pin(async move {
-            let mut notifications = keeper.chat_progress();
             let Some(request_id) = new_id() else {
                 return Err(CompletionError::Definitive);
             };
@@ -152,31 +170,47 @@ impl ChatCompleter for AcpChatCompleter {
                 "messages": messages,
                 "requestId": request_id,
             });
-            let handle = keeper.handle();
-            let request = handle.request_with_timeout_classified(
-                "_x.ai/chat/complete",
-                params,
-                COMPLETION_TIMEOUT,
-            );
-            tokio::pin!(request);
-            loop {
-                tokio::select! {
-                    result = &mut request => return decode_acp_completion(result),
-                    notification = notifications.recv() => match notification {
-                        Ok(notification)
-                            if notification.request_id == request_id
-                                && notification.text.len() <= MAX_CHAT_PROGRESS_BYTES =>
-                        {
-                            progress.send_replace(notification.text);
-                        }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
-            decode_acp_completion(request.await)
+            decode_acp_completion(
+                observe_completion(
+                    &keeper,
+                    "_x.ai/chat/complete",
+                    params,
+                    &request_id,
+                    progress,
+                )
+                .await,
+            )
         })
     }
+}
+
+async fn observe_completion(
+    keeper: &Keeper,
+    method: &str,
+    params: serde_json::Value,
+    request_id: &str,
+    progress: watch::Sender<String>,
+) -> Result<serde_json::Value, RequestFailure> {
+    let mut notifications = keeper.chat_progress();
+    let handle = keeper.handle();
+    let request = handle.request_with_timeout_classified(method, params, COMPLETION_TIMEOUT);
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            notification = notifications.recv() => match notification {
+                Ok(notification)
+                    if notification.request_id == request_id
+                        && notification.text.len() <= MAX_CHAT_PROGRESS_BYTES =>
+                {
+                    progress.send_replace(notification.text);
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+    request.await
 }
 
 fn decode_acp_completion(
@@ -935,7 +969,11 @@ async fn complete_message(
             };
             match (request.peer_node_id, peer_sync) {
                 (Some(node_id), Some(sync)) => sync.complete_on_peer(&node_id, request_body).await,
-                (None, _) => completer.complete_for_account(request_body).await,
+                (None, _) => {
+                    completer
+                        .complete_account_with_progress(request_body, progress_tx)
+                        .await
+                }
                 _ => Err(CompletionError::Definitive),
             }
         } else {

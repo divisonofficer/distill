@@ -29,6 +29,10 @@ chatTextFilesStore,
 getChatTextFiles,
 setChatTextFiles,
 finishChatOperation,
+getChatOperation,
+rememberChatCompletion,
+readChatCompletion,
+forgetChatCompletion,
 finishChatComposerMode,
 getChatComposerMode,
 getChatDraftSnapshot,
@@ -55,10 +59,12 @@ type ChatOperation
 } from '$lib/chats';
 import Icon from '$lib/components/Icon.svelte';
 import AttachmentPreview from '$lib/components/AttachmentPreview.svelte';
-import { readAttachmentFiles, MAX_ATTACHMENTS, type DraftAttachment } from '$lib/attachments';
+import { readChatTextFiles, CHAT_ATTACHMENT_HELP } from '$lib/chat-attachments';
 import type { TextFileIn } from '$lib/types';
 import HistorySkeleton from '$lib/components/HistorySkeleton.svelte';
 import Markdown from '$lib/components/Markdown.svelte';
+import ChatToolActivity from '$lib/components/ChatToolActivity.svelte';
+import { splitChatActivity } from '$lib/chat-activity';
 import ModelSelect from '$lib/components/ModelSelect.svelte';
 import SpeechDictation from '$lib/components/SpeechDictation.svelte';
 import { appendDictationText, stopActiveSpeechDictation } from '$lib/speech-dictation.js';
@@ -69,6 +75,23 @@ let history = $state.raw<ChatHistory | null>(null);
 let selectedLeafId = $state('');
 let draft = $state('');
 let modelId = $state('');
+let highlightedCitation = $state<{ messageId: string; number: number } | null>(null);
+let citationTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function jumpToCitation(messageId: string, number: number) {
+window.clearTimeout(citationTimer);
+highlightedCitation = { messageId, number };
+await tick();
+const card = document.getElementById(`${messageId}-source-${number}`);
+card?.focus({ preventScroll: true });
+card?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'nearest' });
+citationTimer = setTimeout(() => { highlightedCitation = null; }, 2000);
+}
+
+async function copyAnswer(text: string) {
+try { await navigator.clipboard.writeText(text); ui.notify('답변을 복사했어요.'); }
+catch { ui.notify('답변을 복사하지 못했어요.', 'error'); }
+}
 let fleet = $state.raw<ChatFleet>({ accounts: [], models: [], preferred: '', unreachable: 0 });
 let fleetLoading = $state(true);
 let selectedAccount = $state('');
@@ -124,11 +147,79 @@ let olderLoading = $state(false);
 let olderError = $state('');
 let olderRequestId = 0;
 let newestPageFingerprint = '';
-let followLatest = true;
+let followLatest = $state(true);
+let unreadAnswers = $state(0);
+let dragDepth = $state(0);
+let offline = $state(false);
+let connectionFailures = $state(0);
+let retrySeconds = $state(0);
+let checkingConnection = $state(false);
+let connectionNotice = $state(false);
+let connectionTimer: ReturnType<typeof setTimeout> | undefined;
+let connectionNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+const readOnlyConnection = $derived(offline || connectionFailures > 0 || checkingConnection);
+const retryDelays = [1, 2, 4, 8, 15];
+
+function clearConnectionRetry() {
+window.clearTimeout(connectionTimer);
+retrySeconds = 0;
+}
+function historyConnectionFailed() {
+connectionFailures++;
+if (connectionFailures === 1) connectionNoticeTimer = setTimeout(() => { connectionNotice = true; }, 2000);
+clearConnectionRetry();
+if (offline || connectionFailures >= 5) return;
+retrySeconds = retryDelays[connectionFailures - 1];
+function countdown() {
+connectionTimer = setTimeout(() => {
+retrySeconds--;
+if (retrySeconds > 0) countdown();
+else void checkConnection();
+}, 1000);
+}
+countdown();
+}
+async function checkConnection() {
+if (checkingConnection || offline) return;
+clearConnectionRetry();
+checkingConnection = true;
+try { await refreshHistory(activeChatId, false); }
+finally { checkingConnection = false; }
+}
+function onOffline() { offline = true; connectionNotice = true; clearConnectionRetry(); }
+function onOnline() { offline = false; void checkConnection(); }
+function handleHistoryScroll() {
+if (!messageScroller) return;
+followLatest = messageScroller.scrollHeight - messageScroller.clientHeight - messageScroller.scrollTop <= 160;
+if (followLatest) unreadAnswers = 0;
+if (messageScroller.scrollTop < 300 && hasOlderMessages && !olderLoading && !olderError) void loadOlderHistory();
+}
+function handleDragEnter(event: DragEvent) {
+if (!event.dataTransfer?.types.includes('Files')) return;
+event.preventDefault(); dragDepth++;
+}
+function handleDragOver(event: DragEvent) {
+if (!event.dataTransfer?.types.includes('Files')) return;
+event.preventDefault();
+event.dataTransfer.dropEffect = capabilities?.textAttachments?.supported && !saving && !readingFiles ? 'copy' : 'none';
+}
+function handleDragLeave(event: DragEvent) {
+if (event.dataTransfer?.types.includes('Files')) dragDepth = Math.max(0, dragDepth - 1);
+}
+function handleDrop(event: DragEvent) {
+if (!event.dataTransfer?.types.includes('Files')) return;
+event.preventDefault(); dragDepth = 0;
+void addChatFiles(Array.from(event.dataTransfer.files));
+}
+function handlePaste(event: ClipboardEvent) {
+if (!event.clipboardData?.files.length) return;
+event.preventDefault();
+void addChatFiles(Array.from(event.clipboardData.files));
+}
 
 async function scrollToLatest(id: string, force = false) {
 if (id !== activeChatId || (!force && !followLatest)) return;
-if (force) followLatest = true;
+if (force) { followLatest = true; unreadAnswers = 0; }
 await tick();
 if (id === activeChatId && followLatest && messageScroller) messageScroller.scrollTop = messageScroller.scrollHeight;
 }
@@ -180,7 +271,20 @@ if (history?.chatId !== id) loading = true;
 try {
 const next = parseChatHistory(await getJson<unknown>(chatHistoryPath(id)));
 if (request !== requestId || id !== activeChatId) return;
+if (!followLatest && history) unreadAnswers += next.messages.filter((message) => message.role === 'assistant' && !history!.messages.some((old) => old.messageId === message.messageId)).length;
 history = mergeChatHistory(history, next);
+clearConnectionRetry();
+window.clearTimeout(connectionNoticeTimer);
+connectionFailures = 0;
+connectionNotice = false;
+for (const message of next.messages) {
+if (message.role !== 'assistant' || !message.parentId) continue;
+const operation = getChatOperation(id, message.parentId);
+if (!operation || !['unknown', 'pending', 'observing'].includes(operation.status) || (operation.modelId && message.model !== operation.modelId)) continue;
+forgetChatCompletion(id, message.parentId);
+advanceChatParentIfUnchanged(id, message.parentId, message.messageId);
+updateChatOperation(id, message.parentId, { status: 'completed', error: undefined, progress: undefined });
+}
 const nextFingerprint = pageFingerprint(next);
 if (restartTraversal || !newestPageFingerprint || nextFingerprint !== newestPageFingerprint) {
 olderCursor = next.nextCursor;
@@ -192,6 +296,7 @@ loading = false;
 notFound = false;
 historyError = '';
 selectedLeafId = restoreChatParent(id, history.messages);
+void recoverChatCompletion(id, history);
 void scrollToLatest(id);
 } catch (cause) {
 if (request !== requestId || id !== activeChatId) return;
@@ -203,6 +308,7 @@ notFound = true;
 historyError = '';
 } else {
 historyError = `채팅 기록을 불러오지 못했습니다. ${detail}`;
+historyConnectionFailed();
 }
 }
 }
@@ -293,6 +399,7 @@ cancelTitleEdit();
 }
 
 async function saveChatTitle() {
+if (readOnlyConnection) { titleError = '연결 확인 후 제목을 저장할 수 있어요.'; return; }
 const id = activeChatId;
 if (!history || history.chatId !== id || titleSaving) return;
 const title = titleDraft.trim();
@@ -393,6 +500,9 @@ titleEditing = false;
 titleError = '';
 titleDraft = '';
 watchDraft(nextId);
+fileError = ''; dragDepth = 0; unreadAnswers = 0;
+clearConnectionRetry(); window.clearTimeout(connectionNoticeTimer);
+connectionFailures = 0; connectionNotice = false;
 selectedLeafId = '';
 }
 void refreshHistory(nextId);
@@ -403,12 +513,16 @@ onMount(() => {
 watchDraft(activeChatId);
 void refreshCapabilities();
 void refreshChatFleet();
-const timer = window.setInterval(() => void refreshHistory(activeChatId, false), 15000);
+offline = !navigator.onLine;
+const timer = window.setInterval(() => { if (!offline && !connectionFailures && !checkingConnection) void refreshHistory(activeChatId, false); }, 15000);
 const fleetTimer = window.setInterval(() => void refreshChatFleet(), 30000);
 return () => {
 stopActiveSpeechDictation();
 window.clearInterval(timer);
 window.clearInterval(fleetTimer);
+clearConnectionRetry();
+window.clearTimeout(connectionNoticeTimer);
+window.clearTimeout(citationTimer);
 if (entranceTimer !== undefined) window.clearTimeout(entranceTimer);
 if (activeMenu) closeMenu(activeMenu);
 stopMenuPositionTracking();
@@ -423,6 +537,8 @@ draft = (event.currentTarget as HTMLTextAreaElement).value;
 setChatDraft(activeChatId, draft);
 saveError = '';
 }
+
+let voicePreview = $state('');
 
 function appendDictation(sentence: string) {
 draft = appendDictationText(draft, sentence);
@@ -524,6 +640,8 @@ return chatChildren(messages, userMessageId).find((message) => message.role === 
 }
 
 function acceptAssistant(id: string, userMessageId: string, assistant: ChatMessage, next?: ChatHistory) {
+if (id === activeChatId && !followLatest && !history?.messages.some((message) => message.messageId === assistant.messageId)) unreadAnswers++;
+forgetChatCompletion(id, userMessageId);
 advanceChatParentIfUnchanged(id, userMessageId, assistant.messageId);
 updateChatOperation(id, userMessageId, { status: 'completed', error: undefined, progress: undefined });
 if (next) applyHistoryRecord(id, next);
@@ -531,26 +649,53 @@ else appendMessage(id, assistant);
 if (!next && id === activeChatId) void refreshHistory(id);
 }
 
-async function pollCompletion(id: string, userMessageId: string): Promise<{ message?: ChatMessage; next?: ChatHistory; error?: string }> {
-for (let attempt = 0; attempt < 20; attempt++) {
+async function recoverChatCompletion(id: string, snapshot: ChatHistory) {
+const saved = readChatCompletion(id);
+if (!saved || getChatOperation(id, saved.userMessageId)) return;
+const existing = snapshot.messages.find((message) => message.role === 'assistant' && message.parentId === saved.userMessageId && message.model === saved.modelId);
+if (existing) {
+forgetChatCompletion(id, saved.userMessageId);
+advanceChatParentIfUnchanged(id, saved.userMessageId, existing.messageId);
+selectedLeafId = restoreChatParent(id, snapshot.messages);
+return;
+}
+if (!beginChatOperation(id, saved.userMessageId, saved.modelId, 'generating')) return;
+const stop = startChatProgressPolling(id, saved.userMessageId, saved.modelId, (path) => getJson<unknown>(path));
+try {
+const observed = await pollCompletion(id, saved.userMessageId, saved.expiresAt, saved.modelId);
+if (observed.message) acceptAssistant(id, saved.userMessageId, observed.message, observed.next);
+else updateChatOperation(id, saved.userMessageId, { status: 'unknown', progress: undefined, error: '저장된 응답을 아직 확인하지 못했습니다. 요청을 다시 보내지 않았습니다.' });
+} finally {
+stop();
+finishChatOperation(id);
+}
+}
+
+async function pollCompletion(id: string, userMessageId: string, deadline = Date.now() + 20_000, modelId?: string): Promise<{ message?: ChatMessage; next?: ChatHistory; error?: string }> {
+let lastError: string | undefined;
+while (Date.now() < deadline) {
 await new Promise((resolve) => window.setTimeout(resolve, 1000));
 try {
 const next = parseChatHistory(await getJson<unknown>(chatHistoryPath(id)));
-const assistant = assistantReply(next.messages, userMessageId);
+const assistant = modelId ? next.messages.find((message) => message.role === 'assistant' && message.parentId === userMessageId && message.model === modelId) : assistantReply(next.messages, userMessageId);
 if (assistant) return { message: assistant, next };
 if (id === activeChatId) applyHistoryRecord(id, next);
+lastError = undefined;
 } catch (cause) {
-return { error: cause instanceof Error ? cause.message : '알 수 없는 오류' };
+lastError = cause instanceof Error ? cause.message : '알 수 없는 오류';
 }
 }
-return {};
+return { error: lastError };
 }
 
 async function requestCompletion(id: string, userMessageId: string, requestedModelId: string, route: ChatAccountRoute | undefined) {
 updateChatOperation(id, userMessageId, { status: 'generating', error: undefined, progress: undefined, route });
+rememberChatCompletion(id, userMessageId, requestedModelId);
 const completionRequest = postJson<unknown>(
 `/api/chats/${encodeURIComponent(id)}/messages/${encodeURIComponent(userMessageId)}/completion`,
-{ modelId: requestedModelId, ...route }
+{ modelId: requestedModelId, ...route },
+undefined,
+330_000 // The peer completion deadline is 315 seconds.
 );
 const stopProgressPolling = startChatProgressPolling(id, userMessageId, requestedModelId, (path) => getJson<unknown>(path));
 try {
@@ -562,30 +707,32 @@ acceptAssistant(id, userMessageId, assistant);
 stopProgressPolling();
 const detail = cause instanceof Error ? cause.message : '알 수 없는 오류';
 const disposition = classifyCompletionFailure(cause);
-if (disposition === 'pending') {
+if (disposition === 'pending' || disposition === 'unknown') {
 updateChatOperation(id, userMessageId, { status: 'observing', error: '', progress: undefined });
-const observed = await pollCompletion(id, userMessageId);
+const observed = await pollCompletion(id, userMessageId, undefined, requestedModelId);
 if (observed.message) {
 acceptAssistant(id, userMessageId, observed.message, 'next' in observed ? observed.next : undefined);
-} else {
+} else if (getChatOperation(id, userMessageId)?.status !== 'completed') {
 updateChatOperation(id, userMessageId, {
-status: 'pending',
-error: observed.error ? `기록을 확인하지 못했습니다. ${observed.error}` : '응답이 아직 기록되지 않았습니다. 요청은 다시 보내지 않았습니다.'
+status: disposition,
+error: observed.error ? `기록을 확인하지 못했습니다. ${observed.error}` : '아직 저장된 응답을 확인하지 못했습니다. 자동 재요청 없이 기록을 계속 확인합니다.'
 });
 }
 } else {
+forgetChatCompletion(id, userMessageId);
 updateChatOperation(id, userMessageId, {
 status: disposition,
 progress: undefined,
-error: disposition === 'unknown'
-? `요청 결과를 확인할 수 없습니다. 자동 재요청하지 않았습니다. ${detail}`
-: detail
+error: detail
 });
 }
 }
 }
 
 async function saveMessage(generate: boolean) {
+if (readOnlyConnection) { saveError = '연결을 확인한 뒤 보낼 수 있어요. 입력한 내용은 이 화면에 남겨 둡니다. 자동으로 보내지 않아요.'; return; }
+if (fileError) { saveError = '첨부 오류를 확인한 뒤 다시 보내 주세요.'; return; }
+if (voicePreview.trim()) return;
 stopActiveSpeechDictation();
 const id = activeChatId;
 const text = draft;
@@ -658,28 +805,25 @@ await saveMessage(true);
 }
 
 async function readSelectedFiles(event: Event) {
-const files = [...((event.currentTarget as HTMLInputElement).files ?? [])];
-(event.currentTarget as HTMLInputElement).value = '';
-if (!files.length) return;
-const id = activeChatId, token = ++fileReadToken; readingFiles = true; fileError = '';
-try {
-if (files.some((f) => /\.(png|jpe?g|gif|webp)$/i.test(f.name) || f.type.startsWith('image/'))) throw new Error('일반 채팅은 TXT/MD 파일만 지원합니다. 이미지는 첨부할 수 없습니다.');
-const current = getChatTextFiles(id);
-const currentDrafts: DraftAttachment[] = current.map((attachment) => ({ key: textFileKey(attachment), attachment: { kind: 'text', ...attachment }, size: new TextEncoder().encode(attachment.text).byteLength }));
-const result = await readAttachmentFiles(files, currentDrafts, nextTextFileKey);
-if (token !== fileReadToken || id !== activeChatId) return;
-let total = currentDrafts.reduce((n, f) => n + f.size, 0);
-const accepted = [...current];
-for (const item of result.attachments.slice(currentDrafts.length)) {
-if (item.attachment.kind !== 'text') continue;
-const size = new TextEncoder().encode(item.attachment.text).byteLength;
-if (accepted.length >= 10 || total + size > 1048576) { fileError = '첨부는 최대 10개, 전체 1 MiB까지 가능합니다.'; break; }
-const value = { name: item.attachment.name, text: item.attachment.text }; textFileKeys.set(value, ++nextTextFileKey); accepted.push(value); total += size;
+const input = event.currentTarget as HTMLInputElement;
+const files = Array.from(input.files ?? []);
+input.value = '';
+await addChatFiles(files);
 }
-if (result.error) { fileError = result.error; ui.notify(result.error, 'error'); }
-setChatTextFiles(id, accepted);
-} catch (cause) { if (token === fileReadToken && id === activeChatId) { fileError = cause instanceof Error ? cause.message : '파일을 읽지 못했습니다.'; ui.notify(fileError, 'error'); } }
-finally { if (token === fileReadToken && id === activeChatId) readingFiles = false; }
+async function addChatFiles(files: File[]) {
+if (!files.length) return;
+if (!capabilities?.textAttachments?.supported || saving || readingFiles || composerMode?.kind === 'edit') {
+fileError = '지금은 첨부할 수 없어요. 서버의 첨부 지원 상태와 진행 중인 작업을 확인해 주세요.';
+return;
+}
+const id = activeChatId, token = ++fileReadToken;
+readingFiles = true; fileError = '';
+try {
+const result = await readChatTextFiles(files, getChatTextFiles(id));
+if (token !== fileReadToken || id !== activeChatId) return;
+fileError = result.error;
+setChatTextFiles(id, result.files);
+} finally { if (token === fileReadToken && id === activeChatId) readingFiles = false; }
 }
 
 function removeTextFile(key: number | string) {
@@ -697,6 +841,7 @@ event.preventDefault();
 }
 
 async function generateForMessage(userMessageId: string) {
+if (readOnlyConnection) return;
 if (getChatComposerMode(activeChatId)?.kind === 'edit') return;
 const id = activeChatId;
 const requestedModelId = modelId;
@@ -711,7 +856,28 @@ finishChatOperation(id);
 }
 }
 
+async function regenerateAnswer(answer: ChatMessage) {
+if (readOnlyConnection) return;
+const id = activeChatId;
+const route = routeForSend();
+const requestedModelId = modelId;
+const source = history?.messages.find((message) => message.messageId === answer.parentId && message.role === 'user');
+if (!source || !route || !requestedModelId || !completionConfigured || saving || !beginChatOperation(id, null, requestedModelId, 'saving')) return;
+try {
+const saved = parseSavedMessage(await postJson<unknown>(`/api/chats/${encodeURIComponent(id)}/messages`, {
+text: source.text, parentId: source.parentId, ...(source.textFiles.length ? { textFiles: source.textFiles } : {})
+}));
+if (!savedTextFilesMatch(saved.textFiles, source.textFiles)) throw new Error('Attachments not preserved');
+bindChatOperationMessage(id, requestedModelId, saved.messageId, 'generating');
+appendMessage(id, saved);
+if (id === activeChatId) selectBranch(saved);
+await requestCompletion(id, saved.messageId, requestedModelId, route);
+} catch { if (id === activeChatId) ui.notify('다시 생성할 메시지를 저장하지 못했어요.', 'error'); }
+finally { finishChatOperation(id); }
+}
+
 async function retryCompletion(operation: ChatOperation) {
+if (readOnlyConnection) return;
 if (getChatComposerMode(activeChatId)?.kind === 'edit') return;
 if (!operation.userMessageId || !operation.modelId || saving) return;
 if (!beginChatOperation(operation.chatId, operation.userMessageId, operation.modelId, 'generating')) return;
@@ -756,7 +922,7 @@ ui.drawerOpen = true;
 <title>{history ? chatDisplayTitle(history, history.messages, {}, $chatTitleOverrides) : '새 채팅'} · Postudio</title>
 </svelte:head>
 
-<svelte:window onfocus={() => { refreshCurrent(); void refreshChatFleet(); }} onclick={dismissMessageActions} onfocusin={dismissMessageActions} onkeydown={dismissMessageActions} />
+<svelte:window onfocus={() => { refreshCurrent(); void refreshChatFleet(); }} onoffline={onOffline} ononline={onOnline} ondragenter={handleDragEnter} ondragover={handleDragOver} ondragleave={handleDragLeave} ondrop={handleDrop} ondragend={() => { dragDepth = 0; }} onclick={dismissMessageActions} onfocusin={dismissMessageActions} onkeydown={dismissMessageActions} />
 
 {#snippet branchPicker(messages: ChatMessage[], selectedId: string | undefined, label: string)}
 <div class="branch-picker my-1 flex min-h-11 max-w-full items-center justify-between gap-3 border-l-2 border-[#d0d0d4] pl-2 text-neutral-600 dark:text-neutral-300" aria-label={label + ' 탐색'}>
@@ -806,6 +972,13 @@ ui.drawerOpen = true;
 </details>
 </div>
 </header>
+{#if offline || (connectionNotice && connectionFailures > 0)}
+<div role={connectionFailures >= 5 ? 'alert' : 'status'} class={['flex min-h-10 flex-wrap items-center gap-2 border-b px-4 py-2 text-[13px]', offline ? 'border-neutral-200 bg-neutral-100 text-neutral-700 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-200' : connectionFailures >= 5 ? 'border-red-200 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950 dark:text-red-100' : 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100']}>
+<span class="min-w-0 flex-1"><b>{offline ? '인터넷에 연결되어 있지 않아요' : connectionFailures >= 5 ? '서버의 대화 기록에 연결할 수 없어요' : '대화 기록 연결을 확인하고 있어요'}</b> · {offline ? '연결되면 기록만 다시 확인해요.' : checkingConnection ? '기록 확인 중…' : retrySeconds > 0 ? `${retrySeconds}초 뒤 기록을 다시 확인해요.` : `${connectionFailures}번 확인하지 못했어요.`} 입력한 메시지는 자동 전송하지 않아요. 서버 작업은 계속될 수 있어요.</span>
+<button type="button" class="min-h-9 shrink-0 rounded-lg border border-current px-3 text-xs disabled:opacity-50" disabled={offline || checkingConnection} onclick={() => { connectionFailures = 0; void checkConnection(); }}>기록 다시 확인</button>
+<a href="/settings" class="min-h-9 content-center underline underline-offset-4">연결 설정</a>
+</div>
+{/if}
 {#if titleError}<p id="chat-title-error" role="alert" class="mx-auto w-full max-w-3xl px-4 pt-2 text-sm text-red-700 dark:text-red-300">{titleError}</p>{/if}
 
 {#if notFound}
@@ -825,13 +998,14 @@ ui.drawerOpen = true;
 {#if loading && !history}
 <div class="mx-auto w-full max-w-3xl px-4 py-6"><HistorySkeleton variant="chat" /></div>
 {:else if history}
-<div bind:this={messageScroller} onscroll={() => { if (messageScroller) if (messageScroller) followLatest = isNearBottom(messageScroller); }} class="min-h-0 flex-1 overflow-y-auto">
+<div bind:this={messageScroller} onscroll={handleHistoryScroll} class="min-h-0 flex-1 overflow-y-auto">
 <div bind:this={messageContent} class="mx-auto flex w-full max-w-[808px] flex-col gap-8 px-4 py-6 sm:px-6">
 {#if hasOlderMessages || olderLoading || olderError}
 <div class="flex flex-col items-center gap-2">
 <button type="button" class="min-h-11 rounded-full border border-neutral-300 px-4 text-sm font-medium hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-50 dark:border-neutral-700 dark:hover:bg-neutral-800" disabled={!hasOlderMessages || olderLoading} onclick={loadOlderHistory}>
 {olderLoading ? '이전 기록을 불러오는 중입니다.' : olderError ? '이전 기록 다시 불러오기' : '이전 메시지 불러오기'}
 </button>
+{#if olderLoading}<div class="w-full" aria-label="이전 메시지를 불러오는 중"><HistorySkeleton variant="chat" /></div>{/if}
 {#if olderError}<p role="alert" class="text-center text-sm text-red-700 dark:text-red-300">{olderError}</p>{/if}
 </div>
 {/if}
@@ -846,10 +1020,12 @@ ui.drawerOpen = true;
 
 {#if ancestry.length === 0 && !selectedLeafId}
 <section class="flex flex-col items-center gap-4 py-12 text-center">
-<h2 class="text-[28px] font-semibold tracking-tight">무엇을 도와드릴까요?</h2>
-<div class="flex flex-wrap justify-center gap-2">
-{#each ['오늘 메모 저장', '아이디어 정리하기', '할 일 메모하기'] as example (example)}
-<button type="button" class="min-h-10 rounded-full border border-neutral-300 px-4 text-sm hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800" onclick={() => { setChatDraft(activeChatId, example + '\n'); document.getElementById('chat-message')?.focus(); }}>{example}</button>
+<h2 class="text-[28px] font-semibold tracking-tight">무엇을 할까요?</h2>
+<p class="text-sm text-neutral-600 dark:text-neutral-300">질문이나 TXT/MD 파일로 첫 대화를 시작해 보세요.</p>
+{#if !fleetLoading && !fleet.models.length}<div class="max-w-sm rounded-xl bg-neutral-100 p-4 text-sm dark:bg-neutral-800"><p class="font-semibold">{fleet.unreachable ? '모델 계정에 연결할 수 없어요' : '연결된 모델 계정이 없어요'}</p><p class="mt-1 text-neutral-600 dark:text-neutral-300">설정에서 연결 상태를 확인하거나 모델 계정을 연결해 주세요.</p><a href="/settings" class="mt-3 inline-flex min-h-10 items-center rounded-lg border border-neutral-300 px-3 font-medium dark:border-neutral-600">계정 연결 설정</a></div>{/if}
+<div class="grid w-full grid-cols-1 gap-2 sm:grid-cols-2">
+{#each [{ title: '논문 찾기', text: '연구 주제와 검색 키워드를 함께 정리해 줘.' }, { title: '원고 다듬기', text: '다음 문단의 논리와 표현을 다듬어 줘.\n' }, { title: '실험 결과 정리', text: '다음 실험 결과를 표와 설명으로 정리해 줘.\n' }, { title: '미팅 준비', text: '이번 주 연구 진행 상황을 미팅용 개요로 정리해 줘.\n' }] as example (example.title)}
+<button type="button" class="min-h-16 rounded-xl border border-neutral-200 px-3 py-2 text-left text-sm hover:bg-neutral-50 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800" onclick={() => { setChatDraft(activeChatId, example.text); document.getElementById('chat-message')?.focus(); }}><b class="block text-[13px] font-semibold">{example.title}</b><span class="text-xs text-neutral-500">{example.text}</span></button>
 {/each}
 </div>
 </section>
@@ -860,10 +1036,11 @@ ui.drawerOpen = true;
 {@const selectedChildIndex = children.findIndex((child) => child.messageId === ancestry[index + 1]?.messageId)}
 {@const operation = $chatOperationStore[chatOperationKey(activeChatId, message.messageId)]}
 {@const hasAssistant = children.some((child) => child.role === 'assistant')}
+{@const activity = message.role === 'assistant' ? splitChatActivity(message.text) : null}
 <article class={['group relative max-w-full py-0', message.role === 'user' ? 'ml-auto w-full' : 'mr-auto w-full pl-11 text-neutral-900 dark:text-neutral-100', enteringMessageId === message.messageId && 'chat-message-enter']}>
 {#if message.role === 'assistant'}<span aria-hidden="true" class="absolute left-0 top-1 flex size-8 items-center justify-center rounded-full border border-neutral-200 text-sm">✦</span>{/if}
 {#if message.role === 'assistant'}
-<header class="mb-2 text-[13px] text-neutral-600 dark:text-neutral-300"><span class="font-medium">{message.model || 'AI 응답'}</span></header>
+<header class="mb-2 text-[13px] text-neutral-600 dark:text-neutral-300"><span class="font-medium" title={message.model ?? undefined}>{fleet.models.find((model) => model.modelId === message.model)?.name ?? message.model ?? 'AI 응답'}</span></header>
 {/if}
 {#if composerMode?.kind === 'edit' && composerMode.messageId === message.messageId}
 <form class="flex flex-col gap-3 rounded-[14px] border border-[#2b59c3] bg-[#f8faff] p-4 dark:border-[#7395e8] dark:bg-[#151b2a]" onsubmit={(event) => { event.preventDefault(); void saveMessage(false); }}>
@@ -874,7 +1051,9 @@ ui.drawerOpen = true;
 <div class="flex justify-end gap-2"><button type="button" class="h-9 min-h-9 rounded-lg px-3 text-sm hover:bg-neutral-100 disabled:opacity-50 dark:hover:bg-neutral-800" disabled={saving} onclick={cancelInlineEdit}>취소</button><button type="submit" class="h-9 min-h-9 rounded-lg bg-[#2b59c3] px-4 text-sm font-medium text-white disabled:opacity-40 dark:bg-[#7395e8] dark:text-[#101522]" disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !(history.messages.find((m) => m.messageId === message.messageId)?.textFiles.length))}>{saving ? '저장 중…' : '새 분기로 저장'}</button></div>
 </form>
 {:else}
-<div class={message.role === 'user' ? "ml-auto w-fit max-w-[80%] rounded-[20px] bg-[#f0f0f2] px-[18px] py-[11px] text-[15.5px] leading-[1.65] text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100" : "break-words text-[15.5px] leading-[1.75]"}><Markdown text={message.text} lineHeight="inherit" /></div>
+{#if activity?.calls.length}<ChatToolActivity calls={activity.calls} sources={activity.sources} />{/if}
+<div class={message.role === 'user' ? "ml-auto w-fit max-w-[80%] rounded-[20px] bg-[#f0f0f2] px-[18px] py-[11px] text-[15.5px] leading-[1.65] text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100" : "break-words text-[15.5px] leading-[1.75]"}><Markdown text={activity?.text ?? message.text} lineHeight="inherit" citations={activity?.sources} oncitation={(number) => jumpToCitation(message.messageId, number)} /></div>
+{#if activity?.sources.length}<ChatToolActivity calls={activity.calls} sources={activity.sources} showSources sourceScope={message.messageId} highlighted={highlightedCitation?.messageId === message.messageId ? highlightedCitation.number : 0} />{/if}
 {/if}
 {#if message.textFiles.length}<AttachmentPreview items={message.textFiles.map((attachment, fileIndex) => ({ key: `${message.messageId}-${fileIndex}`, attachment: { kind: 'text', ...attachment } }))} />{/if}
 {#if message.role === 'user'}
@@ -893,7 +1072,7 @@ ui.drawerOpen = true;
 {:else if operation?.status === 'failed'}
 <div role="alert" class="mt-2 flex flex-wrap items-center gap-2 text-xs text-red-700 dark:text-red-300">
 <span>AI 응답 생성 실패 · {operation.error}</span>
-{#if composerMode?.kind !== 'edit'}<button type="button" class="min-h-8 underline underline-offset-4" disabled={saving} onclick={() => retryCompletion(operation)}>같은 저장 메시지와 {operation.modelId} 모델로 다시 시도</button>{/if}
+{#if composerMode?.kind !== 'edit'}<button type="button" class="min-h-8 underline underline-offset-4" disabled={readOnlyConnection || saving} onclick={() => retryCompletion(operation)}>같은 저장 메시지와 {operation.modelId} 모델로 다시 시도</button>{/if}
 </div>
 {:else if operation?.status === 'completed'}
 <p role="status" class="sr-only">AI 응답 완료</p>
@@ -908,6 +1087,9 @@ ui.drawerOpen = true;
 {#if message.role === 'user'}
 <button type="button" aria-label="수정" id={`chat-edit-${message.messageId}`} disabled={saving || Boolean(message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId))} title={message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId) ? '이전 부모 메시지를 불러온 뒤 수정할 수 있습니다.' : undefined} class="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={() => editMessage(message)}><Icon name="edit" class="size-3.5" /><span>수정</span></button>
 {#if message.parentId && !history.messages.some((parent) => parent.messageId === message.parentId)}<span class="self-center text-xs text-amber-800 dark:text-amber-200">수정하려면 이전 부모 메시지를 불러오세요.</span>{/if}
+{:else}
+<button type="button" class="inline-flex min-h-9 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 dark:hover:bg-neutral-800" onclick={() => copyAnswer(activity?.text ?? message.text)}><Icon name="copy" class="size-3.5" />복사</button>
+<button type="button" disabled={readOnlyConnection || saving || !completionConfigured || !chatAccount || !history.messages.some((item) => item.messageId === message.parentId && item.role === 'user')} class="min-h-9 rounded-lg px-2 hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800" title="같은 질문을 새 분기에서 다시 생성" onclick={() => regenerateAnswer(message)}>다시 생성</button>
 {/if}
 <button type="button" aria-label="여기서 포크하기" disabled={saving} class="inline-flex min-h-11 items-center gap-1.5 rounded-lg px-2 hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 disabled:opacity-40 dark:hover:bg-neutral-800" onclick={() => forkFromMessage(message)}><Icon name="fork" class="size-3.5" /><span>여기서 포크하기</span></button>
 </div>
@@ -916,7 +1098,7 @@ ui.drawerOpen = true;
 <details class="message-actions absolute right-0 top-full z-10 w-fit text-neutral-500">
 <summary aria-label="추가 생성 작업" class="flex size-8 cursor-pointer list-none items-center justify-center rounded-md text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-800">⋯</summary>
 <div class="absolute right-0 top-8 z-20 w-52 rounded-xl border border-neutral-200 bg-white p-1 shadow-sm dark:border-neutral-700 dark:bg-neutral-900">
-<button type="button" class="min-h-10 w-full rounded-lg px-3 text-left text-xs text-neutral-700 hover:bg-neutral-100 disabled:opacity-50 dark:text-neutral-200 dark:hover:bg-neutral-800" disabled={!modelId || saving} onclick={(event) => { const menu = event.currentTarget.closest('details'); if (menu) { menu.open = false; menu.querySelector('summary')?.focus(); } void generateForMessage(message.messageId); }}>AI 응답 생성</button>
+<button type="button" class="min-h-10 w-full rounded-lg px-3 text-left text-xs text-neutral-700 hover:bg-neutral-100 disabled:opacity-50 dark:text-neutral-200 dark:hover:bg-neutral-800" disabled={readOnlyConnection || !modelId || saving} onclick={(event) => { const menu = event.currentTarget.closest('details'); if (menu) { menu.open = false; menu.querySelector('summary')?.focus(); } void generateForMessage(message.messageId); }}>AI 응답 생성</button>
 </div>
 </details>
 {/if}
@@ -926,12 +1108,17 @@ ui.drawerOpen = true;
 <span aria-hidden="true" class="absolute left-0 top-1 flex size-8 items-center justify-center rounded-full border border-neutral-200 text-sm">✦</span>
 <header class="mb-2 text-[13px] text-neutral-600 dark:text-neutral-300"><span class="font-medium">{operation.modelId}</span></header>
 {#if operation.progress?.text}
+{@const toolActivity = splitChatActivity(operation.progress.text, true)}
+{#if toolActivity.calls.length}
+<ChatToolActivity calls={toolActivity.calls} sources={toolActivity.sources} live writing={toolActivity.writing} />
+{:else}
 <div class="break-words text-[15.5px] leading-7" aria-live="polite"><Markdown text={operation.progress.text} />{#if operation.progress.status === 'generating'}<span class="stream-caret" aria-hidden="true"></span>{/if}</div>
+{/if}
 {#if operation.progress.status === 'failed'}<p role="status" class="mt-2 text-xs text-red-700 dark:text-red-300">응답 생성 실패 · 요청 결과 확인 중입니다.</p>{:else if operation.progress.status === 'completed'}<p role="status" class="mt-2 text-xs text-neutral-600 dark:text-neutral-300">응답 완료 · 저장된 답변 확인 중입니다.</p>{/if}
 {:else if operation.progress?.status === 'failed'}
 <p role="status" class="mt-2 inline-flex items-center gap-2 text-xs text-red-700 dark:text-red-300">응답 생성 실패 · 요청 결과 확인 중입니다.</p>
 {:else}
-<p role="status" class="mt-2 inline-flex items-center gap-2 text-xs text-neutral-700 dark:text-neutral-300"><span class="pending-dots" aria-hidden="true"><span></span><span></span><span></span></span>{operation.modelId} 모델로 AI 응답 생성 중입니다.</p>
+<p role="status" class="mt-2 inline-flex items-center gap-2 text-sm font-semibold text-neutral-700 dark:text-neutral-300"><span aria-hidden="true" class="size-3.5 rounded-full border-2 border-neutral-300 border-t-blue-700 motion-safe:animate-spin"></span>생각 중</p>
 {/if}
 </article>
 {/if}
@@ -945,6 +1132,7 @@ ui.drawerOpen = true;
 
 {#if history && composerMode?.kind !== 'edit'}
 <footer class="mx-auto w-full max-w-[808px] shrink-0 bg-white px-4 pb-3 pt-2 sm:px-6 dark:bg-neutral-950">
+{#if !followLatest}<div class="mb-3 flex justify-center"><button type="button" class="min-h-9 rounded-full border border-neutral-200 bg-white px-4 text-[13px] font-semibold shadow-lg focus-visible:outline-2 focus-visible:outline-sky-700 dark:border-neutral-700 dark:bg-neutral-900" onclick={() => void scrollToLatest(activeChatId, true)}>↓ {unreadAnswers ? `새 답변 · ${unreadAnswers}` : saving ? '답변 쓰는 중 · 맨 아래로' : '맨 아래로'}</button></div>{/if}
 {#if selectedLeafId}
 {@const selectedParent = history.messages.find((message) => message.messageId === selectedLeafId)}
 <div class="sr-only" aria-live="polite">
@@ -978,54 +1166,68 @@ ui.drawerOpen = true;
 <button type="button" class="min-h-11 shrink-0 rounded-lg px-3 font-medium hover:bg-white focus-visible:outline-2 focus-visible:outline-sky-700 dark:hover:bg-neutral-700" onclick={cancelComposerMode}>취소</button>
 </div>
 {/if}
-<form class="flex flex-col gap-1 rounded-[26px] border border-neutral-300 bg-white pb-[10px] pl-5 pr-[14px] pt-[14px] shadow-[0_2px_10px_rgba(20,20,30,0.06)] focus-within:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-900" onsubmit={sendMessage}>
+<form class="relative flex flex-col gap-1 rounded-[26px] border border-neutral-300 bg-white pb-[10px] pl-5 pr-[14px] pt-[14px] shadow-[0_2px_10px_rgba(20,20,30,0.06)] focus-within:border-neutral-500 dark:border-neutral-700 dark:bg-neutral-900" onsubmit={sendMessage}>
+{#if dragDepth > 0}<div class="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-1 rounded-[26px] border-2 border-dashed border-[#2b59c3] bg-blue-50/95 p-4 text-center text-sm font-semibold text-[#1f48a3] dark:bg-slate-900/95 dark:text-blue-200" role="status">{capabilities?.textAttachments?.supported && !saving && !readingFiles ? '여기에 놓으면 첨부돼요' : '지금은 파일을 첨부할 수 없어요'}<small class="text-xs font-normal">{CHAT_ATTACHMENT_HELP}</small></div>{/if}
+{#if textFiles.length}<AttachmentPreview items={textFiles.map((attachment) => ({ key: textFileKey(attachment), attachment: { kind: 'text', ...attachment }, size: new TextEncoder().encode(attachment.text).byteLength }))} removable={!saving && !readingFiles} onremove={removeTextFile} />{/if}
 <label for="chat-message" class="sr-only">메시지</label>
 <textarea
  id="chat-message"
+ onpaste={handlePaste}
  value={draft}
  oninput={updateDraft}
  onkeydown={onComposerKeydown}
- disabled={saving || selectedParentMissing}
+ disabled={selectedParentMissing}
  rows="2"
- placeholder={selectedParentMissing ? '선택한 부모 메시지를 불러온 뒤 작성할 수 있습니다.' : saving ? '저장 또는 응답 생성 중입니다…' : '메시지를 작성하세요. Enter 전송 · Shift+Enter 줄 바꿈'}
+ placeholder={selectedParentMissing ? '선택한 부모 메시지를 불러온 뒤 작성할 수 있습니다.' : readOnlyConnection ? '연결 확인 중 · 작성한 내용은 자동 전송하지 않아요' : saving ? '답변을 쓰는 중이에요 · 끝나면 이어서 보낼 수 있어요' : '메시지를 작성하세요. Enter 전송 · Shift+Enter 줄 바꿈'}
  class="max-h-48 w-full resize-none rounded-xl bg-transparent p-0 text-[15.5px] leading-[1.6] outline-none placeholder:text-neutral-600 dark:placeholder:text-neutral-300 disabled:opacity-60"
 ></textarea>
+{#if voicePreview.trim()}<p class="break-words border-l-2 border-blue-300 px-2 py-1 text-sm text-neutral-600 dark:text-neutral-300"><span class="mr-2 text-xs font-medium">음성 인식 중</span>{voicePreview}</p>{/if}
 
-{#if textFiles.length}<AttachmentPreview items={textFiles.map((attachment) => ({ key: textFileKey(attachment), attachment: { kind: 'text', ...attachment }, size: new TextEncoder().encode(attachment.text).byteLength }))} removable={!saving && !readingFiles} onremove={removeTextFile} />{/if}{#if readingFiles}<p role="status" class="px-1 text-xs">파일을 읽는 중입니다.</p>{/if}{#if fileError}<p role="alert" class="px-1 text-xs text-red-700">{fileError}</p>{/if}<div class="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
+{#if readingFiles}<p role="status" class="px-1 text-xs">파일을 읽는 중이에요. 다 읽은 뒤 보낼 수 있어요.</p>{/if}{#if fileError}<div role="alert" class="rounded-lg border border-red-200 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"><p>{fileError}</p><button type="button" class="mt-1 min-h-9 underline underline-offset-4" onclick={() => { fileError = ''; saveError = ''; }}>확인 · 실패한 파일은 제외하기</button></div>{/if}<div class="flex min-w-0 flex-wrap items-center justify-between gap-2 px-1">
 <div class="flex min-w-0 flex-1 items-center gap-2">
 <button type="button" aria-label="첨부 및 도구" aria-haspopup="dialog" aria-expanded={composerMenuOpen} bind:this={composerTrigger} popovertarget="chat-composer-menu" onkeydown={(event) => handleMenuKeydown(event, 'composer')} class="flex size-9 shrink-0 items-center justify-center rounded-full border border-neutral-200 text-lg hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:border-neutral-700 dark:hover:bg-neutral-800">+</button>
 <div id="chat-composer-menu" bind:this={composerMenu} popover="auto" role="dialog" tabindex="-1" aria-label="첨부 및 도구" onkeydown={(event) => handleMenuKeydown(event, 'composer')} ontoggle={(event) => handleMenuToggle('composer', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-72 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-3 text-sm shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" disabled={!capabilities?.textAttachments?.supported || saving || readingFiles} class="min-h-11 w-full text-left disabled:opacity-50" onclick={() => { closeMenu('composer'); fileInput?.click(); }}>파일 첨부</button><button type="button" disabled class="min-h-11 w-full text-left opacity-50">도구</button><p class="text-xs text-neutral-600 dark:text-neutral-300">{#if capabilities?.textAttachments?.supported}일반 채팅은 TXT/MD 파일만 지원합니다. 최대 10개, 전체 1 MiB까지 첨부할 수 있습니다. 이미지는 아직 지원하지 않습니다.{:else}현재 서버는 일반 채팅 첨부를 지원하지 않습니다. 서버 업데이트가 필요합니다.{/if}</p><input bind:this={fileInput} class="sr-only" type="file" accept=".txt,.md,text/plain,text/markdown" multiple disabled={!capabilities?.textAttachments?.supported || saving || readingFiles} onchange={readSelectedFiles} /></div>
-<div class="min-w-0 shrink-0"><ModelSelect id="chat-response-model" bind:value={modelId} label="응답 모델" compact modelOptions={fleet.models} onselect={() => (selectedAccount = '')} disabled={saving || fleetLoading} /></div>
+<div class="min-w-0"><ModelSelect id="chat-response-model" bind:value={modelId} label="응답 모델" compact modelOptions={fleet.models} onselect={() => (selectedAccount = '')} disabled={saving || fleetLoading}>
+{#snippet menuFooter()}
 {#if modelAccounts.length || selectedAccount}
-<select aria-label="채팅 응답 계정" title={chatAccount ? `${chatAccount.label} · ${chatAccount.host}` : '선택한 계정에 접속할 수 없습니다'} class="min-h-9 max-w-[8rem] truncate rounded-lg bg-transparent px-1 text-xs text-neutral-700 dark:text-neutral-200 sm:max-w-44" value={chatAccount?.key ?? ''} disabled={saving} onchange={(event) => (selectedAccount = event.currentTarget.value)}>
+<label class="block text-xs text-neutral-600 dark:text-neutral-300" for="chat-response-account">응답 계정</label>
+<select id="chat-response-account" aria-label="채팅 응답 계정" title={chatAccount ? `${chatAccount.label} · ${chatAccount.host}` : '선택한 계정에 접속할 수 없습니다'} class="min-h-8 w-full rounded-lg bg-transparent text-xs text-neutral-700 dark:text-neutral-200" value={chatAccount?.key ?? ''} disabled={saving} onchange={(event) => (selectedAccount = event.currentTarget.value)}>
 {#if !chatAccount}<option value="" disabled>계정에 연결할 수 없음</option>{/if}
 {#each modelAccounts as account (account.key)}<option value={account.key}>{account.label} · {account.host}</option>{/each}
 </select>
 {/if}
+{/snippet}
+</ModelSelect></div>
 {#if !fleetLoading && !fleet.models.length}<span class="text-xs text-neutral-500">{fleet.unreachable ? '접속 가능한 호스트에 연결된 계정이 없습니다.' : '설정에서 모델 계정을 연결해 주세요.'}</span>{/if}
 <button type="button" aria-label="메시지 작업" aria-haspopup="menu" aria-expanded={actionMenuOpen} bind:this={actionTrigger} popovertarget="chat-action-menu" class="flex size-9 shrink-0 items-center justify-center rounded-full hover:bg-neutral-100 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800">⋯</button>
-<div id="chat-action-menu" bind:this={actionMenu} popover="auto" role="menu" tabindex="-1" aria-label="메시지 작업" onkeydown={(event) => handleMenuKeydown(event, 'actions')} ontoggle={(event) => handleMenuToggle('actions', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-64 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" role="menuitem" disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length)} onclick={() => { closeMenu('actions', true); saveOnlyMessage(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800">메시지만 저장</button>{#if selectedLeafId}<button type="button" role="menuitem" onclick={() => { closeMenu('actions', true); clearParent(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800">새 시작 분기</button>{/if}</div>
+<div id="chat-action-menu" bind:this={actionMenu} popover="auto" role="menu" tabindex="-1" aria-label="메시지 작업" onkeydown={(event) => handleMenuKeydown(event, 'actions')} ontoggle={(event) => handleMenuToggle('actions', event)} class="fixed inset-auto m-0 max-h-[min(70vh,32rem)] overflow-y-auto left-0 top-0 z-50 w-64 max-w-[calc(100vw-2rem)] rounded-[14px] border border-neutral-200 bg-white p-1.5 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"><button type="button" role="menuitem" disabled={readOnlyConnection || !!fileError || saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length)} onclick={() => { closeMenu('actions', true); saveOnlyMessage(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 disabled:opacity-40 dark:hover:bg-neutral-800">메시지만 저장</button>{#if selectedLeafId}<button type="button" role="menuitem" onclick={() => { closeMenu('actions', true); clearParent(); }} class="min-h-11 w-full rounded-[10px] px-3 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800">새 시작 분기</button>{/if}</div>
 
 </div>
 <div class="flex items-center gap-2">
-<SpeechDictation id={`chat-speech-${encodeURIComponent(activeChatId)}`} disabled={saving || selectedParentMissing} onappend={appendDictation} />
+<SpeechDictation id={`chat-speech-${encodeURIComponent(activeChatId)}`} disabled={saving || selectedParentMissing} onappend={appendDictation} onpreview={(text) => (voicePreview = text)} />
+{#if saving && !draft.trim() && !textFiles.length}
+<button type="button" disabled aria-label="응답 생성 중 · 이 서버는 중지를 지원하지 않아요" title="이 서버는 응답 중지를 지원하지 않아요" class="flex size-9 items-center justify-center rounded-full bg-neutral-500 text-white"><span aria-hidden="true" class="size-4 rounded-full border-2 border-white/40 border-t-white motion-safe:animate-spin"></span></button>
+{:else}
 <button
  type="submit"
- disabled={saving || selectedParentMissing || readingFiles || (!draft.trim() && !textFiles.length) || !completionConfigured || !modelId || !chatAccount}
- class="flex size-9 items-center justify-center rounded-full bg-black text-sm font-medium text-white hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 disabled:opacity-40 dark:bg-white dark:text-black"
+ disabled={readOnlyConnection || !!fileError || saving || selectedParentMissing || readingFiles || !!voicePreview.trim() || (!draft.trim() && !textFiles.length) || !completionConfigured || !modelId || !chatAccount}
+ title={voicePreview.trim() ? '음성 입력을 마친 뒤 보내세요' : readOnlyConnection ? '연결 확인 후 보낼 수 있어요' : readingFiles ? '첨부를 읽는 중이에요' : fileError ? '첨부 오류를 확인해 주세요' : '전송'}
+ class="flex size-9 items-center justify-center rounded-full bg-black text-sm font-medium text-white enabled:hover:bg-neutral-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 disabled:bg-[#e6e6e8] disabled:text-neutral-500 dark:bg-white dark:text-black dark:disabled:bg-neutral-800 dark:disabled:text-neutral-400"
 >
 {#if saving}<span class="sr-only">생성 중</span>{:else if capabilityLoading}<span class="sr-only">상태 확인 중</span>{:else if capabilityError}<span class="sr-only">AI 상태 확인 필요</span>{:else if !completionConfigured}<span class="sr-only">AI 응답 사용 불가</span>{:else if !modelId || !chatAccount}<span class="sr-only">모델과 계정 선택 필요</span>{:else}<span class="sr-only">전송</span>{/if}<Icon name="chevron" class="size-4 -rotate-90" />
 </button>
+{/if}
 </div>
 </div>
-<p class="min-w-0 break-words text-xs text-neutral-500" class:sr-only={!saving && !capabilityLoading && !capabilityError && completionConfigured}>
-{#if saving}<span role="status">요청 처리 중입니다. 중복 전송은 막혀 있습니다. 중지 기능은 서버에서 지원하지 않습니다.</span>
-{:else if capabilityLoading}기능 상태 확인 중입니다. AI 요청은 상태 확인 뒤에 활성화됩니다.
+{#if !saving}
+<p class="min-w-0 break-words text-xs text-neutral-500" class:sr-only={!capabilityLoading && !capabilityError && completionConfigured}>
+{#if capabilityLoading}기능 상태 확인 중입니다. AI 요청은 상태 확인 뒤에 활성화됩니다.
 {:else if capabilityError}AI 상태를 확인할 수 없습니다. 저장만 하거나 상태를 다시 확인하세요.
 {:else if capabilities?.completion.configured}보내기는 메시지를 한 번 저장한 뒤 선택한 계정의 호스트에 AI 응답을 요청합니다.
 {:else}AI 응답을 사용할 수 없습니다. 저장만 하거나 서버 기능 상태를 다시 확인하세요.
 {/if}
 </p>
+{/if}
 </form>
 <p class="mt-2 text-center text-[12px] text-neutral-600 dark:text-neutral-300">AI는 실수할 수 있어요. 중요한 내용은 다시 확인하세요.</p>
 </footer>

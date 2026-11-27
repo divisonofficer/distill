@@ -74,6 +74,49 @@ test('keeps interim separate and commits each final result exactly once', () => 
   assert.equal(states.at(-1).interim, '');
 });
 
+test('finish uses the final transcript without also inserting the preview', () => {
+  const { controller, instances, commits, clock } = harness();
+  controller.start();
+  const recognition = instances[0];
+  recognition.stop = () => {};
+  recognition.onresult(recognitionEvent(result('미리보기 문장', false)));
+  controller.finish();
+  recognition.onresult(recognitionEvent(result('확정 문장', true)));
+  recognition.onend();
+  clock.tick(2000);
+  assert.deepEqual(commits, ['확정 문장']);
+  assert.equal(controller.state.requested, false);
+  assert.equal(instances.length, 1);
+});
+
+test('finish inserts a preview once if the browser never finalizes it', () => {
+  const { controller, instances, commits, clock } = harness();
+  controller.start();
+  const recognition = instances[0];
+  recognition.stop = () => {};
+  recognition.onresult(recognitionEvent(result('확정 구간', true), result(' 나머지', false)));
+  controller.finish();
+  clock.tick(1200);
+  recognition.onresult(recognitionEvent(result('확정 구간', true), result('늦은 결과', true)));
+  assert.deepEqual(commits, ['확정 구간', '나머지']);
+  assert.equal(controller.state.interim, '');
+  assert.equal(instances.length, 1);
+});
+
+test('a spontaneous service end preserves the last unfinalized words once', () => {
+  const { controller, instances, commits, clock } = harness();
+  controller.start();
+  const recognition = instances[0];
+  recognition.onresult(recognitionEvent(result('완료', true), result(' 마무리', false)));
+  recognition.onerror({ error: 'no-speech' });
+  recognition.onend();
+  recognition.onresult(recognitionEvent(result('완료', true), result('늦은 확정', true)));
+  assert.deepEqual(commits, ['완료', '마무리']);
+  assert.equal(controller.state.interim, '');
+  clock.tick(300);
+  assert.equal(instances.length, 2);
+});
+
 test('restarts after service end with delayed bounded backoff', () => {
   const { controller, instances, clock } = harness();
   controller.start();

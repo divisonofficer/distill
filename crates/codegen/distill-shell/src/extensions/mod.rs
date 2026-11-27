@@ -7,6 +7,7 @@ pub mod btw;
 pub mod bundle;
 pub(crate) mod chat_complete;
 pub(crate) mod chat_conversation_history;
+mod chat_tools;
 pub mod code_nav;
 pub mod consent;
 pub mod content;

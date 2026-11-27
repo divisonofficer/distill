@@ -2,16 +2,29 @@
 import Markdown from '$lib/components/Markdown.svelte';
 import type { ClientMsg, InteractionRequest, Question } from '$lib/types';
 
-let { request, connected, reply }: {
+let { request, connected, reply, retryKey = 0 }: {
 	request: InteractionRequest;
 	connected: boolean;
 	reply: (msg: ClientMsg) => boolean;
+ retryKey?: number;
 } = $props();
 
 let selected = $state<Record<string, string[]>>({});
 let freeText = $state<Record<string, string>>({});
 let feedback = $state('');
 let editingRequest = $state(false);
+let submitted = $state(false);
+let sendError = $state('');
+let feedbackInput = $state<HTMLTextAreaElement>();
+$effect(() => { void retryKey; submitted = false; });
+
+async function requestRevision() {
+ if (editingRequest) { planReply('cancelled'); return; }
+ editingRequest = true;
+ const { tick } = await import('svelte');
+ await tick();
+ feedbackInput?.focus();
+}
 
 const answers = $derived.by(() => {
 	if (request.t !== 'question.request') return {};
@@ -62,13 +75,14 @@ function submitQuestion() {
 }
 
 function planReply(outcome: 'approved' | 'cancelled' | 'abandoned') {
-	if (request.t !== 'plan.request') return;
+	if (request.t !== 'plan.request' || !connected || submitted || (outcome === 'cancelled' && !feedback.trim())) return;
 	const msg: ClientMsg = {
 		t: 'plan_reply', id: request.id, session_id: request.session_id,
 		tool_call_id: request.tool_call_id, outcome,
 		...(outcome === 'cancelled' ? { feedback: feedback.trim() } : {})
 	};
-	reply(msg);
+	if (reply(msg)) { submitted = true; sendError = ''; }
+	else sendError = '응답을 보내지 못했어요. 연결을 확인한 뒤 다시 시도해 주세요.';
 }
 </script>
 
@@ -119,19 +133,22 @@ function planReply(outcome: 'approved' | 'cancelled' | 'abandoned') {
 	</div>
 </section>
 {:else}
-<section class="rounded-xl border border-neutral-200 bg-white p-3 text-neutral-800 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-100" aria-label="계획 승인">
-	<h2 class="mb-2 flex items-center gap-2 text-sm font-semibold"><span aria-hidden="true">◆</span> 계획을 검토해주세요</h2>
+<section class="rounded-[14px] border border-[#d7e2fa] bg-white text-neutral-800 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-100" aria-label="계획 승인" aria-busy={submitted}>
+	<h2 class="mb-2 flex flex-wrap items-center gap-2 rounded-t-[13px] border-b border-[#d7e2fa] bg-[#f3f6fe] px-3.5 py-3 text-sm font-semibold dark:border-neutral-700 dark:bg-neutral-800"><span aria-hidden="true" class="text-[#1f48a3]">☷</span> 실행 계획 <span class="rounded-full border border-[#d7e2fa] bg-white px-2 py-0.5 text-xs text-[#1f48a3] dark:bg-neutral-900">{submitted ? '응답 전송됨 · 확인 대기' : '승인 대기'}</span></h2>
+ <div class="px-3.5 pb-3.5">
 	{#if request.plan_content}
 		<div class="mb-3 max-h-80 overflow-y-auto rounded-lg border border-neutral-200 p-3 text-sm dark:border-neutral-800"><Markdown text={request.plan_content} /></div>
 	{/if}
 	{#if editingRequest}
 		<label class="mb-2 block text-xs text-neutral-600 dark:text-neutral-300" for={`feedback-${request.id}`}>수정 의견</label>
-		<textarea id={`feedback-${request.id}`} bind:value={feedback} rows="2" class="mb-2 w-full resize-y rounded-lg border border-neutral-300 bg-white p-2 text-sm dark:border-neutral-700 dark:bg-neutral-950"></textarea>
+		<textarea bind:this={feedbackInput} id={`feedback-${request.id}`} bind:value={feedback} rows="2" class="mb-2 w-full resize-y rounded-lg border border-neutral-300 bg-white p-2 text-sm dark:border-neutral-700 dark:bg-neutral-950"></textarea>
 	{/if}
 	<div class="flex flex-wrap items-center gap-2">
-		<button type="button" disabled={!connected} class="h-9 min-w-0 rounded-lg bg-neutral-900 px-3 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={() => planReply('approved')}>계획대로 실행</button>
-		<button type="button" disabled={!connected || (editingRequest && !feedback.trim())} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => editingRequest ? planReply('cancelled') : (editingRequest = true)}>수정 요청</button>
-		<button type="button" disabled={!connected} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => planReply('abandoned')}>취소</button>
+		<button type="button" disabled={!connected || submitted} class="h-9 min-w-0 rounded-lg bg-neutral-900 px-3 text-sm font-medium text-white disabled:opacity-40 dark:bg-neutral-100 dark:text-neutral-900" onclick={() => planReply('approved')}>계획대로 실행</button>
+		<button type="button" disabled={!connected || submitted || (editingRequest && !feedback.trim())} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => void requestRevision()}>수정 요청</button>
+		<button type="button" disabled={!connected || submitted} class="h-9 min-w-0 rounded-lg border border-neutral-300 px-3 text-sm disabled:opacity-40 dark:border-neutral-700" onclick={() => planReply('abandoned')}>취소</button>
 	</div>
+ {#if sendError}<p role="alert" class="mt-2 text-xs text-red-700 dark:text-red-300">{sendError}</p>{/if}
+ </div>
 </section>
 {/if}

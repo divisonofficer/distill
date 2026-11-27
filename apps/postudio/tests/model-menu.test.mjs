@@ -119,7 +119,8 @@ test('picker keeps IME guard and exposes active descendants only for rendered me
 const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svelte'), 'utf8');
 assert.match(source, /async function onKeydown\(event: KeyboardEvent\) \{\s*if \(event\.isComposing \|\| event\.keyCode === 229\) return;/);
 assert.match(source, /aria-activedescendant=\{activeDescendant\}/);
-assert.match(source, /h-\[34px\] max-w-\[180px\]/);
+assert.match(source, /min-h-\[34px\] min-w-0/);
+assert.match(source, /\{compactName \?\?/);
 assert.match(source, /aria-label=\{`\$\{label\} · \$\{selectedModel\?\.name/);
 assert.match(source, /placeholder="모델 검색"/);
 assert.match(source, /popupWidth = Math\.min\(320, availableWidth\)/);
@@ -143,6 +144,16 @@ assert.match(source, /addEventListener\('pointerdown', dismissOutside, true\)/);
 assert.match(source, /opensUp = compact[\s\S]*?above >= Math\.min\(wantedHeight, 180\)/);
 assert.match(source, /@media \(prefers-reduced-motion: reduce\)/);
 assert.match(source, /onselect\?\.\(modelId\)/);
+});
+
+test('shared model guide keeps shortened chip, raw-ID tooltip, and account slot only in current provider stage', async () => {
+const source = await readFile(resolve(root, 'src/lib/components/ModelSelect.svelte'), 'utf8');
+assert.match(source, /let compactName = \$derived/);
+assert.match(source, /style:max-width=\{compact \? '180px'/);
+assert.match(source, /title=\{selectedModel \? `\$\{selectedModel.name\} · \$\{value\}`/);
+assert.match(source, /menuFooter && submenuProvider === selectedProvider/);
+assert.match(source, /\$\{selectedModel.name\} 사용 중/);
+assert.match(source, /size-\[18px\]/);
 });
 
 test('authenticated providers alone expose models', () => {
